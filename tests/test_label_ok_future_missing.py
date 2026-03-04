@@ -18,13 +18,14 @@ def _base_df(calendar: list[str]) -> pd.DataFrame:
             "close": close,
             "volume": np.full(n, 1000.0),
             "vwap": close,
+            "adj_factor": 1.0 + 0.001 * np.arange(n),
         }
     )
 
 
 def test_label_ok_false_when_future_prices_missing() -> None:
-    calendar = [d.date().isoformat() for d in pd.date_range("2024-01-01", periods=40, freq="D")]
-    asof_idx = 34
+    calendar = [d.date().isoformat() for d in pd.date_range("2023-01-01", periods=320, freq="D")]
+    asof_idx = 290
     asof = calendar[asof_idx]
 
     full = _base_df(calendar)
