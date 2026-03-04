@@ -14,7 +14,13 @@ L_MICRO = 48
 L_MEZZO = 40
 L_MACRO = 30
 C = 7
-WARMUP = 20
+RAW_WARMUP = 20
+EPS = 1e-8
+TANH_K = 5.0
+
+W_MICRO = 240
+W_MEZZO = 80
+W_MACRO = 60
 
 DATE_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{8})")
 
@@ -111,7 +117,7 @@ def load_daily_data(data_dir: str | Path, code: str) -> pd.DataFrame:
     if not rows:
         return pd.DataFrame()
     out = pd.concat(rows, ignore_index=True)
-    required = {"trade_date", "open", "high", "low", "close", "volume", "vwap"}
+    required = {"trade_date", "open", "high", "low", "close", "volume", "vwap", "adj_factor"}
     if not required.issubset(set(out.columns)):
         return pd.DataFrame()
     out["trade_date"] = pd.to_datetime(out["trade_date"]).dt.date
@@ -177,31 +183,96 @@ def _validate_raw(df: pd.DataFrame) -> bool:
     return True
 
 
+def _build_adj_factor_map(df_daily: pd.DataFrame) -> tuple[Optional[pd.Series], str]:
+    if "adj_factor" not in df_daily.columns:
+        return None, "daily missing adj_factor"
+    s = df_daily.set_index("trade_date")["adj_factor"].astype(float)
+    if s.isna().any():
+        return None, "daily adj_factor NaN"
+    if (~np.isfinite(s.to_numpy()) | (s.to_numpy() <= 0)).any():
+        return None, "daily adj_factor invalid"
+    return s, ""
+
+
+def _apply_asof_price_adjustment(
+    df: pd.DataFrame,
+    asof_date: date,
+    adj_factor_by_date: pd.Series,
+) -> tuple[Optional[pd.DataFrame], str]:
+    if asof_date not in adj_factor_by_date.index:
+        return None, "missing adj_factor on asof date"
+    asof_factor = float(adj_factor_by_date.loc[asof_date])
+    if (not np.isfinite(asof_factor)) or asof_factor <= 0:
+        return None, "invalid adj_factor on asof date"
+
+    trade_dates = df["trade_date"]
+    mapped = trade_dates.map(adj_factor_by_date)
+    if mapped.isna().any():
+        return None, "missing adj_factor in required history"
+    factors = mapped.astype(float).to_numpy() / asof_factor
+    if (~np.isfinite(factors) | (factors <= 0)).any():
+        return None, "invalid adj_factor ratio"
+
+    out = df.copy()
+    for col in ["open", "high", "low", "close", "vwap"]:
+        out[col] = out[col].astype(float) * factors
+    return out, ""
+
+
 def _extract_tail_tensor(
     df: pd.DataFrame,
     L: int,
     asof_date: date,
     by_daily: bool,
+    z_window: int,
     expected_daily_dates: Optional[list[date]] = None,
 ) -> tuple[Optional[np.ndarray], str]:
     if by_daily:
         hist = df[df["trade_date"] <= asof_date].copy()
     else:
         hist = df[df["dt"] <= pd.Timestamp(str(asof_date) + " 23:59:59")].copy()
-    req = L + WARMUP
-    if len(hist) < req:
-        return None, f"insufficient warmup/history: need {req}, got {len(hist)}"
+
+    req_raw = L + RAW_WARMUP
+    if len(hist) < req_raw:
+        return None, f"insufficient raw warmup/history: need {req_raw}, got {len(hist)}"
+
+    req_z = L + z_window + RAW_WARMUP
+    if len(hist) < req_z:
+        return None, f"insufficient zscore warmup/history: need {req_z}, got {len(hist)}"
+
     if by_daily:
         dates = hist["trade_date"].tolist()
-        if expected_daily_dates is not None and dates[-req:] != expected_daily_dates:
+        if expected_daily_dates is not None and dates[-req_z:] != expected_daily_dates:
             return None, "missing daily bar in required history"
+
     work = _compute_features(hist)
-    tail = work.iloc[-L:]
-    if tail[["C1", "C2", "C3", "C4", "C5", "C6", "C7"]].isna().any().any():
+    cols = ["C1", "C2", "C3", "C4", "C5", "C6", "C7"]
+
+    raw_region = work.iloc[-(L + z_window) :][cols]
+    if raw_region.isna().any().any():
         return None, "feature NaN from strict rolling"
-    if not np.isfinite(tail[["C1", "C2", "C3", "C4", "C5", "C6", "C7"]].to_numpy()).all():
+    if not np.isfinite(raw_region.to_numpy()).all():
         return None, "feature inf/non-finite"
-    return tail[["C1", "C2", "C3", "C4", "C5", "C6", "C7"]].to_numpy(dtype=np.float32), ""
+
+    raw = work[cols]
+    past_only = raw.shift(1)
+    mu = past_only.rolling(window=z_window, min_periods=z_window).mean()
+    sd = past_only.rolling(window=z_window, min_periods=z_window).std(ddof=0)
+
+    sd_tail = sd.iloc[-L:]
+    if (~np.isfinite(sd_tail.to_numpy()) | (sd_tail.to_numpy() <= 0)).any():
+        return None, "zscore sd invalid (<=0 or non-finite)"
+
+    z = (raw - mu) / sd.clip(lower=EPS)
+    z = TANH_K * np.tanh(z / TANH_K)
+
+    tail = z.iloc[-L:]
+    if tail.isna().any().any():
+        return None, "zscore NaN from strict rolling"
+    if not np.isfinite(tail.to_numpy()).all():
+        return None, "zscore inf/non-finite"
+
+    return tail.to_numpy(dtype=np.float32), ""
 
 
 def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) -> DPResult:
@@ -213,19 +284,27 @@ def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) ->
     if not _validate_raw(d1):
         return empty_result(code, asof_date, "missing/invalid daily raw schema")
 
+    adj_factor_by_date, adj_err = _build_adj_factor_map(d1)
+    if adj_factor_by_date is None:
+        return empty_result(code, asof_date, adj_err)
+
     m5_asof = m5[m5["trade_date"] == asof]
     if len(m5_asof) != 48:
         return empty_result(code, asof_date, "micro day must have exactly 48 bars")
 
-    m30 = aggregate_30m_from_5m(m5)
+    m5_adj, err = _apply_asof_price_adjustment(m5, asof, adj_factor_by_date)
+    if m5_adj is None:
+        return empty_result(code, asof_date, f"micro: {err}")
+
+    m30 = aggregate_30m_from_5m(m5_adj)
     if m30.empty:
         return empty_result(code, asof_date, "30m aggregation failure")
 
-    X_micro, err = _extract_tail_tensor(m5, L_MICRO, asof, by_daily=False)
+    X_micro, err = _extract_tail_tensor(m5_adj, L_MICRO, asof, by_daily=False, z_window=W_MICRO)
     if X_micro is None:
         return empty_result(code, asof_date, f"micro: {err}")
 
-    X_mezzo, err = _extract_tail_tensor(m30, L_MEZZO, asof, by_daily=False)
+    X_mezzo, err = _extract_tail_tensor(m30, L_MEZZO, asof, by_daily=False, z_window=W_MEZZO)
     if X_mezzo is None:
         return empty_result(code, asof_date, f"mezzo: {err}")
 
@@ -233,16 +312,21 @@ def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) ->
     if asof not in calendar:
         return empty_result(code, asof_date, "asof date not in calendar")
     idx = calendar.index(asof)
-    req = L_MACRO + WARMUP
+    req = L_MACRO + W_MACRO + RAW_WARMUP
     if idx + 1 < req:
-        return empty_result(code, asof_date, "macro: insufficient calendar history")
+        return empty_result(code, asof_date, "macro: insufficient zscore warmup/history")
     expected_daily_dates = calendar[idx + 1 - req : idx + 1]
 
+    d1_adj, err = _apply_asof_price_adjustment(d1, asof, adj_factor_by_date)
+    if d1_adj is None:
+        return empty_result(code, asof_date, f"macro: {err}")
+
     X_macro, err = _extract_tail_tensor(
-        d1,
+        d1_adj,
         L_MACRO,
         asof,
         by_daily=True,
+        z_window=W_MACRO,
         expected_daily_dates=expected_daily_dates,
     )
     if X_macro is None:
