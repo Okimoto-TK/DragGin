@@ -188,6 +188,7 @@ def _apply_asof_price_adjustment(
     df: pd.DataFrame,
     asof_date: date,
     adj_factor_by_date: pd.Series,
+    drop_rows_without_factor: bool = False,
 ) -> tuple[Optional[pd.DataFrame], str]:
     if asof_date not in adj_factor_by_date.index:
         return None, "missing adj_factor on asof date"
@@ -198,7 +199,13 @@ def _apply_asof_price_adjustment(
     trade_dates = df["trade_date"]
     mapped = trade_dates.map(adj_factor_by_date)
     if mapped.isna().any():
-        return None, "missing adj_factor in required history"
+        if not drop_rows_without_factor:
+            return None, "missing adj_factor in required history"
+        keep_mask = mapped.notna()
+        df = df.loc[keep_mask].copy()
+        if df.empty:
+            return None, "missing adj_factor in required history"
+        mapped = mapped.loc[keep_mask]
     factors = mapped.astype(float).to_numpy() / asof_factor
     if (~np.isfinite(factors) | (factors <= 0)).any():
         return None, "invalid adj_factor ratio"
@@ -282,7 +289,7 @@ def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) ->
     if len(m5_asof) != 48:
         return empty_result(code, asof_date, "micro day must have exactly 48 bars")
 
-    m5_adj, err = _apply_asof_price_adjustment(m5, asof, adj_factor_by_date)
+    m5_adj, err = _apply_asof_price_adjustment(m5, asof, adj_factor_by_date, drop_rows_without_factor=True)
     if m5_adj is None:
         return empty_result(code, asof_date, f"micro: {err}")
 
