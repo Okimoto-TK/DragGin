@@ -17,7 +17,6 @@ def _base_df(calendar: list[str]) -> pd.DataFrame:
             "low": close - 0.5,
             "close": close,
             "volume": np.full(n, 1000.0),
-            "vwap": close,
             "adj_factor": 1.0 + 0.001 * np.arange(n),
         }
     )

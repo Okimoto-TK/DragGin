@@ -6,9 +6,18 @@ import pandas as pd
 from src.feat.build_multiscale_tensor import build_multiscale_tensors
 
 
-def _write_data(root: Path, code: str, days: int, missing_5m: bool = False, missing_daily_date: str | None = None, missing_daily_for_code_date: str | None = None, flat: bool = False) -> str:
+def _write_data(
+    root: Path,
+    code: str,
+    days: int,
+    missing_5m: bool = False,
+    missing_daily_date: str | None = None,
+    missing_daily_for_code_date: str | None = None,
+    flat: bool = False,
+) -> str:
     start = pd.Timestamp("2024-01-01")
     dates = [start + pd.Timedelta(days=i) for i in range(days)]
+
     rows_5m = []
     for d in dates:
         for i in range(48):
@@ -27,33 +36,35 @@ def _write_data(root: Path, code: str, days: int, missing_5m: bool = False, miss
                     "low": px - (0.4 if flat else 0.4 + 0.05 * np.cos(base_idx / 9)),
                     "close": px + (0.05 if flat else 0.05 * np.sin(base_idx / 5)),
                     "volume": 100 if flat else 100 + (base_idx % 13),
-                    "vwap": px + (0.02 if flat else 0.02 * np.cos(base_idx / 6)),
                 }
             )
-    pd.DataFrame(rows_5m).to_csv(root / f"{code}_5m.csv", index=False)
 
+    code_dir = root / code
+    code_dir.mkdir(parents=True, exist_ok=True)
+    pd.DataFrame(rows_5m).to_parquet(code_dir / "5min.parquet", index=False)
+
+    rows_daily = []
     for d in dates:
         if missing_daily_date and d.date().isoformat() == missing_daily_date:
             continue
+        if missing_daily_for_code_date and d.date().isoformat() == missing_daily_for_code_date:
+            continue
         day_idx = (d - dates[0]).days
         px = 100.0 if flat else 100 + day_idx * 0.2 + 0.6 * np.sin(day_idx / 6)
-        rows = []
-        if not (missing_daily_for_code_date and d.date().isoformat() == missing_daily_for_code_date):
-            rows.append(
-                {
-                    "code": code,
-                    "trade_date": d.date().isoformat(),
-                    "open": px,
-                    "high": px + (1 if flat else 1 + 0.2 * np.sin(day_idx / 4)),
-                    "low": px - (1 if flat else 1 + 0.2 * np.cos(day_idx / 5)),
-                    "close": px + (0.3 if flat else 0.3 * np.sin(day_idx / 3)),
-                    "volume": 1000 if flat else 1000 + (day_idx % 17) * 10,
-                    "vwap": px + (0.1 if flat else 0.1 * np.cos(day_idx / 2)),
-                    "adj_factor": 1.0 + 0.0005 * day_idx,
-                }
-            )
-        pd.DataFrame(rows).to_parquet(root / f"{code}_{d.date().isoformat()}.parquet", index=False)
+        rows_daily.append(
+            {
+                "code": code,
+                "trade_date": d.date().isoformat(),
+                "open": px,
+                "high": px + (1 if flat else 1 + 0.2 * np.sin(day_idx / 4)),
+                "low": px - (1 if flat else 1 + 0.2 * np.cos(day_idx / 5)),
+                "close": px + (0.3 if flat else 0.3 * np.sin(day_idx / 3)),
+                "volume": 1000 if flat else 1000 + (day_idx % 17) * 10,
+                "adj_factor": 1.0 + 0.0005 * day_idx,
+            }
+        )
 
+    pd.DataFrame(rows_daily).to_parquet(code_dir / "daily.parquet", index=False)
     return dates[-1].date().isoformat()
 
 
@@ -69,9 +80,9 @@ def test_strict_c5_c6_warmup(tmp_path: Path) -> None:
     asof2 = _write_data(tmp2, code=code, days=130)
     ok = build_multiscale_tensors(tmp2, code, asof2)
     assert ok.dp_ok
-    assert ok.X_micro.shape == (48, 7)
-    assert ok.X_mezzo.shape == (40, 7)
-    assert ok.X_macro.shape == (30, 7)
+    assert ok.X_micro.shape == (48, 6)
+    assert ok.X_mezzo.shape == (40, 6)
+    assert ok.X_macro.shape == (30, 6)
     assert np.all(ok.mask_micro == 1)
     assert np.all(ok.mask_mezzo == 1)
     assert np.all(ok.mask_macro == 1)

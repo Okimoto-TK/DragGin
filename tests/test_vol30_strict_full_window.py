@@ -17,7 +17,6 @@ def _daily_df(dates: list[str]) -> pd.DataFrame:
             "low": close - 0.5,
             "close": close,
             "volume": np.full(n, 1000.0),
-            "vwap": close - 0.1,
             "adj_factor": 1.0 + 0.001 * np.arange(n),
         }
     )
