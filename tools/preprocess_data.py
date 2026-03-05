@@ -2,9 +2,17 @@ from __future__ import annotations
 
 import argparse
 from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Iterable
 
 import pandas as pd
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    def tqdm(iterable: Iterable, **_: object) -> Iterable:
+        return iterable
 
 
 def _normalize_trade_date(series: pd.Series) -> pd.Series:
@@ -86,35 +94,60 @@ def _normalize_daily(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def preprocess(raw_dir: Path, out_dir: Path) -> None:
+def _process_5min_file(csv_file: Path) -> dict[str, list[pd.DataFrame]]:
+    try:
+        df = pd.read_csv(csv_file)
+    except Exception:
+        return {}
+    if "code" not in df.columns:
+        return {}
+    norm = _normalize_5min(df)
+    if norm.empty:
+        return {}
+
+    out: dict[str, list[pd.DataFrame]] = defaultdict(list)
+    for code, g in norm.groupby("code", sort=False):
+        out[code].append(g.drop(columns=["code"]).reset_index(drop=True))
+    return out
+
+
+def _process_daily_file(pq_file: Path) -> dict[str, list[pd.DataFrame]]:
+    try:
+        df = pd.read_parquet(pq_file)
+    except Exception:
+        return {}
+    if "code" not in df.columns:
+        return {}
+    norm = _normalize_daily(df)
+    if norm.empty:
+        return {}
+
+    out: dict[str, list[pd.DataFrame]] = defaultdict(list)
+    for code, g in norm.groupby("code", sort=False):
+        out[code].append(g.drop(columns=["code"]).reset_index(drop=True))
+    return out
+
+
+def _extend_chunks(dst: dict[str, list[pd.DataFrame]], src: dict[str, list[pd.DataFrame]]) -> None:
+    for code, chunks in src.items():
+        dst[code].extend(chunks)
+
+
+def preprocess(raw_dir: Path, out_dir: Path, max_workers: int = 4) -> None:
     per_code_5min: dict[str, list[pd.DataFrame]] = defaultdict(list)
     per_code_daily: dict[str, list[pd.DataFrame]] = defaultdict(list)
 
-    for csv_file in raw_dir.glob("*.csv"):
-        try:
-            df = pd.read_csv(csv_file)
-        except Exception:
-            continue
-        if "code" not in df.columns:
-            continue
-        norm = _normalize_5min(df)
-        if norm.empty:
-            continue
-        for code, g in norm.groupby("code", sort=False):
-            per_code_5min[code].append(g.drop(columns=["code"]).reset_index(drop=True))
+    csv_files = sorted(raw_dir.glob("*.csv"))
+    pq_files = sorted(raw_dir.glob("*.parquet"))
 
-    for pq_file in raw_dir.glob("*.parquet"):
-        try:
-            df = pd.read_parquet(pq_file)
-        except Exception:
-            continue
-        if "code" not in df.columns:
-            continue
-        norm = _normalize_daily(df)
-        if norm.empty:
-            continue
-        for code, g in norm.groupby("code", sort=False):
-            per_code_daily[code].append(g.drop(columns=["code"]).reset_index(drop=True))
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_process_5min_file, csv_file) for csv_file in csv_files]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing 5min CSV"):
+            _extend_chunks(per_code_5min, future.result())
+
+        futures = [executor.submit(_process_daily_file, pq_file) for pq_file in pq_files]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing daily parquet"):
+            _extend_chunks(per_code_daily, future.result())
 
     all_codes = sorted(set(per_code_5min) | set(per_code_daily))
     all_calendar_dates: set = set()
@@ -145,5 +178,6 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser()
     parser.add_argument("--raw-data-dir", default="./data")
     parser.add_argument("--out-dir", default="./data")
+    parser.add_argument("--max-workers", type=int, default=4)
     args = parser.parse_args()
-    preprocess(Path(args.raw_data_dir), Path(args.out_dir))
+    preprocess(Path(args.raw_data_dir), Path(args.out_dir), max_workers=max(1, args.max_workers))
