@@ -157,11 +157,31 @@ def _split_by_code(norm: pd.DataFrame) -> dict[str, list[pd.DataFrame]]:
     return out
 
 
+
+
+_DAILY_PARQUET_COLUMNS = [
+    "code",
+    "trade_date",
+    "date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "adj_factor",
+    "volume",
+    "vol",
+    "pct_chg",
+]
+
+
 def _process_daily_file(pq_file: Path) -> dict[str, list[pd.DataFrame]]:
     try:
-        df = pd.read_parquet(pq_file)
+        df = pd.read_parquet(pq_file, columns=_DAILY_PARQUET_COLUMNS)
     except Exception:
-        return {}
+        try:
+            df = pd.read_parquet(pq_file)
+        except Exception:
+            return {}
     if "code" not in df.columns:
         return {}
     norm = _normalize_daily(df)
@@ -238,6 +258,26 @@ def _write_st_files(st_df: pd.DataFrame, out_dir: Path) -> None:
         g.reset_index(drop=True).to_parquet(code_dir / "st.parquet", index=False)
 
 
+def _write_code_files(code: str, out_dir: Path, chunks_5m: list[pd.DataFrame], chunks_daily: list[pd.DataFrame]) -> list[pd.Timestamp]:
+    code_dir = out_dir / code
+    code_dir.mkdir(parents=True, exist_ok=True)
+
+    calendar_dates: list[pd.Timestamp] = []
+
+    if chunks_5m:
+        m5 = pd.concat(chunks_5m, ignore_index=True)
+        m5 = m5.sort_values("dt").reset_index(drop=True)
+        m5.to_parquet(code_dir / "5min.parquet", index=False)
+
+    if chunks_daily:
+        d1 = pd.concat(chunks_daily, ignore_index=True)
+        d1 = d1.sort_values("trade_date").drop_duplicates(subset=["trade_date"], keep="last").reset_index(drop=True)
+        d1.to_parquet(code_dir / "daily.parquet", index=False)
+        calendar_dates = d1["trade_date"].tolist()
+
+    return calendar_dates
+
+
 def preprocess(raw_dir: Path, out_dir: Path, max_workers: int = 4) -> None:
     per_code_5min: dict[str, list[pd.DataFrame]] = defaultdict(list)
     per_code_daily: dict[str, list[pd.DataFrame]] = defaultdict(list)
@@ -255,24 +295,21 @@ def preprocess(raw_dir: Path, out_dir: Path, max_workers: int = 4) -> None:
             _extend_chunks(per_code_daily, future.result())
 
     all_codes = sorted(set(per_code_5min) | set(per_code_daily))
-    all_calendar_dates: set = set()
+    all_calendar_dates: set[pd.Timestamp] = set()
 
-    for code in all_codes:
-        code_dir = out_dir / code
-        code_dir.mkdir(parents=True, exist_ok=True)
-
-        chunks_5m = per_code_5min.get(code, [])
-        if chunks_5m:
-            m5 = pd.concat(chunks_5m, ignore_index=True)
-            m5 = m5.sort_values("dt").reset_index(drop=True)
-            m5.to_parquet(code_dir / "5min.parquet", index=False)
-
-        chunks_daily = per_code_daily.get(code, [])
-        if chunks_daily:
-            d1 = pd.concat(chunks_daily, ignore_index=True)
-            d1 = d1.sort_values("trade_date").drop_duplicates(subset=["trade_date"], keep="last").reset_index(drop=True)
-            d1.to_parquet(code_dir / "daily.parquet", index=False)
-            all_calendar_dates.update(d1["trade_date"].tolist())
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                _write_code_files,
+                code,
+                out_dir,
+                per_code_5min.get(code, []),
+                per_code_daily.get(code, []),
+            )
+            for code in all_codes
+        ]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Writing per-code parquet"):
+            all_calendar_dates.update(future.result())
 
     if all_calendar_dates:
         calendar = pd.DataFrame({"trade_date": sorted(all_calendar_dates)})
