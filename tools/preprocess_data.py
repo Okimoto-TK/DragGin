@@ -6,6 +6,7 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable
 
+import numpy as np
 import pandas as pd
 
 try:
@@ -52,6 +53,8 @@ def _normalize_5min(df: pd.DataFrame) -> pd.DataFrame:
     out["time"] = out["time"].astype(str)
     out["time"] = out["time"].str.extract(r"(\d{2}:\d{2})", expand=False).fillna(out["time"])
     out = out.dropna(subset=["code", "trade_date", "time"]).reset_index(drop=True)
+    # 09:30 bar includes opening auction data; exclude it from intraday bars.
+    out = out[out["time"] != "09:30"].reset_index(drop=True)
     out["dt"] = pd.to_datetime(out["trade_date"].astype(str) + " " + out["time"].astype(str), errors="coerce")
     out = out.dropna(subset=["dt"]).sort_values("dt").reset_index(drop=True)
     return out
@@ -105,9 +108,30 @@ def _process_5min_file(csv_file: Path) -> dict[str, list[pd.DataFrame]]:
     if norm.empty:
         return {}
 
+    return _split_by_code(norm)
+
+
+def _split_by_code(norm: pd.DataFrame) -> dict[str, list[pd.DataFrame]]:
     out: dict[str, list[pd.DataFrame]] = defaultdict(list)
-    for code, g in norm.groupby("code", sort=False):
-        out[code].append(g.drop(columns=["code"]).reset_index(drop=True))
+    codes = norm["code"].to_numpy()
+    values = norm.drop(columns=["code"])
+
+    if len(codes) == 0:
+        return out
+
+    # Fast-path for files that only contain one code.
+    first_code = codes[0]
+    if np.all(codes == first_code):
+        out[str(first_code)].append(values.reset_index(drop=True))
+        return out
+
+    labels, uniques = pd.factorize(codes, sort=False)
+    order = labels.argsort(kind="mergesort")
+    sorted_labels = labels[order]
+    split_at = np.flatnonzero(np.diff(sorted_labels)) + 1
+
+    for code, idx in zip(uniques.tolist(), np.split(order, split_at)):
+        out[str(code)].append(values.iloc[idx].reset_index(drop=True))
     return out
 
 
@@ -122,10 +146,7 @@ def _process_daily_file(pq_file: Path) -> dict[str, list[pd.DataFrame]]:
     if norm.empty:
         return {}
 
-    out: dict[str, list[pd.DataFrame]] = defaultdict(list)
-    for code, g in norm.groupby("code", sort=False):
-        out[code].append(g.drop(columns=["code"]).reset_index(drop=True))
-    return out
+    return _split_by_code(norm)
 
 
 def _extend_chunks(dst: dict[str, list[pd.DataFrame]], src: dict[str, list[pd.DataFrame]]) -> None:
