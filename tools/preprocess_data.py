@@ -194,8 +194,9 @@ def _build_st_markers(namechange: pd.DataFrame) -> pd.DataFrame:
     df["end_date"] = _normalize_trade_date(df["end_date"])
     df = df.dropna(subset=["code", "start_date"]).reset_index(drop=True)
 
-    is_star_st = df["name"].str.contains(r"\*ST", regex=True, na=False)
-    is_st = df["name"].str.contains(r"ST", regex=False, na=False)
+    normalized_name = df["name"].str.strip()
+    is_star_st = normalized_name.str.startswith("*ST", na=False)
+    is_st = normalized_name.str.startswith("ST", na=False) | is_star_st
     st_df = df[is_st].copy()
     if st_df.empty:
         return pd.DataFrame()

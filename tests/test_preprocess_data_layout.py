@@ -101,7 +101,7 @@ def test_preprocess_writes_st_parquet_from_namechange(tmp_path: Path, monkeypatc
         return pd.DataFrame(
             {
                 "ts_code": ["AAA", "AAA", "BBB"],
-                "name": ["AAA*ST", "AAA", "BBBST"],
+                "name": ["*STAAA", "AAA", "BBBST"],
                 "start_date": ["20240102", "20240201", "20240103"],
                 "end_date": ["20240110", None, "20240105"],
             }
