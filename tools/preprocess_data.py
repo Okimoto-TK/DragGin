@@ -3,10 +3,8 @@ from __future__ import annotations
 import argparse
 import csv
 import os
-import time
 from collections import defaultdict
-from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor, as_completed
-from contextlib import contextmanager
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable
 
@@ -107,16 +105,22 @@ def _normalize_5min(df: pd.DataFrame) -> pd.DataFrame:
     if code_col is None or vol_col is None or not required_price.issubset(df.columns):
         return pd.DataFrame()
 
-    # Fast path: if we have full datetime strings in trade_time, parse dt directly.
+    # Fast path: parse full datetime strings in trade_time when available.
     dt = None
     if "trade_time" in df.columns:
         dt = pd.to_datetime(df["trade_time"], errors="coerce")
-    elif time_col is not None and date_col is not None and time_col == "trade_time":
-        dt = pd.to_datetime(df[time_col], errors="coerce")
 
     if dt is not None and dt.notna().any():
         trade_date = dt.dt.normalize()
         minutes = (dt.dt.hour.astype("Int32") * 60 + dt.dt.minute.astype("Int32")).astype("Int32")
+
+        # Fallback for non-datetime rows (e.g., "935") when date/time columns are available.
+        missing = dt.isna()
+        if missing.any() and date_col is not None and time_col is not None:
+            trade_date_fallback = _normalize_trade_date(df.loc[missing, date_col])
+            minutes_fallback = _time_series_to_minutes(df.loc[missing, time_col])
+            trade_date.loc[missing] = trade_date_fallback
+            minutes.loc[missing] = minutes_fallback
     else:
         if date_col is None or time_col is None:
             return pd.DataFrame()
@@ -392,92 +396,51 @@ def _write_code_files(code: str, out_dir: Path, chunks_5m: list[pd.DataFrame], c
     return calendar_dates
 
 
-class SyncTimer:
-    def __init__(self, enabled: bool = True) -> None:
-        self.enabled = enabled
-        self._records: list[tuple[str, float]] = []
-
-    @contextmanager
-    def section(self, name: str) -> Iterable[None]:
-        if not self.enabled:
-            yield
-            return
-
-        started_at = time.perf_counter()
-        try:
-            yield
-        finally:
-            elapsed = time.perf_counter() - started_at
-            self._records.append((name, elapsed))
-            print(f"[timer] {name}: {elapsed:.3f}s")
-
-    def summary(self) -> None:
-        if not self.enabled or not self._records:
-            return
-
-        total = sum(elapsed for _, elapsed in self._records)
-        print("[timer] ==== preprocess timing summary ====")
-        for name, elapsed in sorted(self._records, key=lambda x: x[1], reverse=True):
-            ratio = (elapsed / total * 100.0) if total > 0 else 0.0
-            print(f"[timer] {name:<28} {elapsed:>8.3f}s  ({ratio:>5.1f}%)")
-        print(f"[timer] {'TOTAL':<28} {total:>8.3f}s")
-
-
-def preprocess(raw_dir: Path, out_dir: Path, max_workers: int = 4, enable_timer: bool = True) -> None:
-    timer = SyncTimer(enabled=enable_timer)
+def preprocess(raw_dir: Path, out_dir: Path, max_workers: int = 4) -> None:
     per_code_5min: dict[str, list[pd.DataFrame]] = defaultdict(list)
     per_code_daily: dict[str, list[pd.DataFrame]] = defaultdict(list)
 
-    with timer.section("discover raw files"):
-        csv_files = sorted(raw_dir.glob("*.csv"))
-        pq_files = sorted(raw_dir.glob("*.parquet"))
+    csv_files = sorted(raw_dir.glob("*.csv"))
+    pq_files = sorted(raw_dir.glob("*.parquet"))
 
-    with timer.section("process 5min CSV"):
-        # 5m CSV parsing is CPU+GIL heavy in Python space (strings) and benefits from multiprocessing.
-        # Using processes also isolates pandas parser state and avoids thread contention.
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(_process_5min_file, csv_file) for csv_file in csv_files]
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Processing 5min CSV"):
-                _extend_chunks(per_code_5min, future.result())
+    # 5m CSV parsing is CPU+GIL heavy in Python space (strings) and benefits from multiprocessing.
+    # Using processes also isolates pandas parser state and avoids thread contention.
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_process_5min_file, csv_file) for csv_file in csv_files]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing 5min CSV"):
+            _extend_chunks(per_code_5min, future.result())
 
-    with timer.section("process daily parquet"):
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = [executor.submit(_process_daily_file, pq_file) for pq_file in pq_files]
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Processing daily parquet"):
-                _extend_chunks(per_code_daily, future.result())
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [executor.submit(_process_daily_file, pq_file) for pq_file in pq_files]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing daily parquet"):
+            _extend_chunks(per_code_daily, future.result())
 
-    with timer.section("build code list"):
-        all_codes = sorted(set(per_code_5min) | set(per_code_daily))
+    all_codes = sorted(set(per_code_5min) | set(per_code_daily))
     all_calendar_dates: set[pd.Timestamp] = set()
 
-    with timer.section("write per-code parquet"):
-        with ProcessPoolExecutor(max_workers=max_workers) as executor:
-            futures = [
-                executor.submit(
-                    _write_code_files,
-                    code,
-                    out_dir,
-                    per_code_5min.get(code, []),
-                    per_code_daily.get(code, []),
-                )
-                for code in all_codes
-            ]
-            for future in tqdm(as_completed(futures), total=len(futures), desc="Writing per-code parquet"):
-                all_calendar_dates.update(future.result())
+    with ProcessPoolExecutor(max_workers=max_workers) as executor:
+        futures = [
+            executor.submit(
+                _write_code_files,
+                code,
+                out_dir,
+                per_code_5min.get(code, []),
+                per_code_daily.get(code, []),
+            )
+            for code in all_codes
+        ]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Writing per-code parquet"):
+            all_calendar_dates.update(future.result())
 
     if all_calendar_dates:
-        with timer.section("write calendar parquet"):
-            calendar = pd.DataFrame({"trade_date": sorted(all_calendar_dates)})
-            calendar.to_parquet(out_dir / "calendar.parquet", index=False)
+        calendar = pd.DataFrame({"trade_date": sorted(all_calendar_dates)})
+        calendar.to_parquet(out_dir / "calendar.parquet", index=False)
 
-        with timer.section("fetch and write ST markers"):
-            min_trade_date = pd.to_datetime(calendar["trade_date"].min())
-            max_trade_date = pd.to_datetime(calendar["trade_date"].max())
-            namechange = _fetch_namechange(min_trade_date, max_trade_date)
-            st_df = _build_st_markers(namechange)
-            _write_st_files(st_df, out_dir)
-
-    timer.summary()
+        min_trade_date = pd.to_datetime(calendar["trade_date"].min())
+        max_trade_date = pd.to_datetime(calendar["trade_date"].max())
+        namechange = _fetch_namechange(min_trade_date, max_trade_date)
+        st_df = _build_st_markers(namechange)
+        _write_st_files(st_df, out_dir)
 
 
 if __name__ == "__main__":
@@ -485,11 +448,9 @@ if __name__ == "__main__":
     parser.add_argument("--raw-data-dir", default="./data")
     parser.add_argument("--out-dir", default="./data")
     parser.add_argument("--max-workers", type=int, default=4)
-    parser.add_argument("--disable-timer", action="store_true")
     args = parser.parse_args()
     preprocess(
         Path(args.raw_data_dir),
         Path(args.out_dir),
         max_workers=max(1, args.max_workers),
-        enable_timer=not args.disable_timer,
     )
