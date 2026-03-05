@@ -18,7 +18,23 @@ except ImportError:  # pragma: no cover
 
 
 def _normalize_trade_date(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, format="%Y%m%d", errors="coerce").dt.date
+    # Keep datetime64 dtype (instead of Python date objects) for faster vectorized ops.
+    return pd.to_datetime(series, format="%Y%m%d", errors="coerce")
+
+
+def _normalize_time_str(series: pd.Series) -> pd.Series:
+    time_str = series.astype(str).str.strip()
+    hhmm = time_str.str.slice(0, 5)
+    valid_mask = (
+        (hhmm.str.len() == 5)
+        & (hhmm.str.get(2) == ":")
+        & hhmm.str.slice(0, 2).str.isdigit()
+        & hhmm.str.slice(3, 5).str.isdigit()
+    )
+    if valid_mask.all():
+        return hhmm
+    fallback = time_str.str.extract(r"(\d{2}:\d{2})", expand=False)
+    return hhmm.where(valid_mask, fallback)
 
 
 def _pick_column(df: pd.DataFrame, names: list[str]) -> str | None:
@@ -51,12 +67,11 @@ def _normalize_5min(df: pd.DataFrame) -> pd.DataFrame:
     )
     out["code"] = out["code"].astype(str)
     out["trade_date"] = _normalize_trade_date(out["trade_date"])
-    out["time"] = out["time"].astype(str)
-    out["time"] = out["time"].str.extract(r"(\d{2}:\d{2})", expand=False).fillna(out["time"])
+    out["time"] = _normalize_time_str(out["time"])
     out = out.dropna(subset=["code", "trade_date", "time"]).reset_index(drop=True)
     # 09:30 bar includes opening auction data; exclude it from intraday bars.
     out = out[out["time"] != "09:30"].reset_index(drop=True)
-    out["dt"] = pd.to_datetime(out["trade_date"].astype(str) + " " + out["time"].astype(str), errors="coerce")
+    out["dt"] = out["trade_date"] + pd.to_timedelta(out["time"] + ":00")
     out = out.dropna(subset=["dt"]).sort_values("dt").reset_index(drop=True)
     return out
 
@@ -99,8 +114,25 @@ def _normalize_daily(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _process_5min_file(csv_file: Path) -> dict[str, list[pd.DataFrame]]:
+    usecols = {
+        "code",
+        "trade_date",
+        "date",
+        "time",
+        "trade_time",
+        "open",
+        "high",
+        "low",
+        "close",
+        "volume",
+        "vol",
+    }
     try:
-        df = pd.read_csv(csv_file)
+        df = pd.read_csv(
+            csv_file,
+            usecols=lambda c: c in usecols,
+            dtype={"code": "string", "trade_date": "string", "date": "string", "time": "string", "trade_time": "string"},
+        )
     except Exception:
         return {}
     if "code" not in df.columns:
