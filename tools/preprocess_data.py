@@ -267,13 +267,13 @@ def _split_by_code(norm: pd.DataFrame) -> dict[str, list[pd.DataFrame]]:
         out[str(first_code)].append(values.reset_index(drop=True))
         return out
 
-    labels, uniques = pd.factorize(codes, sort=False)
-    order = labels.argsort(kind="mergesort")
-    sorted_labels = labels[order]
-    split_at = np.flatnonzero(np.diff(sorted_labels)) + 1
+    # Keep this O(n) by splitting contiguous runs instead of doing a global
+    # argsort/factorize pass, which was the hottest CPU path for large files.
+    run_starts = np.r_[0, np.flatnonzero(codes[1:] != codes[:-1]) + 1]
+    run_ends = np.r_[run_starts[1:], len(codes)]
 
-    for code, idx in zip(uniques.tolist(), np.split(order, split_at)):
-        out[str(code)].append(values.iloc[idx].reset_index(drop=True))
+    for start, end in zip(run_starts, run_ends):
+        out[str(codes[start])].append(values.iloc[start:end].reset_index(drop=True))
     return out
 
 
