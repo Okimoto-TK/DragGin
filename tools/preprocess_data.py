@@ -11,14 +11,38 @@ def _normalize_trade_date(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce").dt.date
 
 
+def _pick_column(df: pd.DataFrame, names: list[str]) -> str | None:
+    for name in names:
+        if name in df.columns:
+            return name
+    return None
+
+
 def _normalize_5min(df: pd.DataFrame) -> pd.DataFrame:
-    required = {"trade_date", "time", "open", "high", "low", "close", "volume", "code"}
-    if not required.issubset(df.columns):
+    code_col = _pick_column(df, ["code"])
+    date_col = _pick_column(df, ["trade_date", "date"])
+    time_col = _pick_column(df, ["time", "trade_time"])
+    vol_col = _pick_column(df, ["volume", "vol"])
+    required_price = {"open", "high", "low", "close"}
+    if code_col is None or date_col is None or time_col is None or vol_col is None or not required_price.issubset(df.columns):
         return pd.DataFrame()
 
-    out = df[["code", "trade_date", "time", "open", "high", "low", "close", "volume"]].copy()
+    out = pd.DataFrame(
+        {
+            "code": df[code_col],
+            "trade_date": df[date_col],
+            "time": df[time_col],
+            "open": df["open"],
+            "high": df["high"],
+            "low": df["low"],
+            "close": df["close"],
+            "volume": df[vol_col],
+        }
+    )
     out["code"] = out["code"].astype(str)
     out["trade_date"] = _normalize_trade_date(out["trade_date"])
+    out["time"] = out["time"].astype(str)
+    out["time"] = out["time"].str.extract(r"(\d{2}:\d{2})", expand=False).fillna(out["time"])
     out = out.dropna(subset=["code", "trade_date", "time"]).reset_index(drop=True)
     out["dt"] = pd.to_datetime(out["trade_date"].astype(str) + " " + out["time"].astype(str), errors="coerce")
     out = out.dropna(subset=["dt"]).sort_values("dt").reset_index(drop=True)
@@ -26,11 +50,34 @@ def _normalize_5min(df: pd.DataFrame) -> pd.DataFrame:
 
 
 def _normalize_daily(df: pd.DataFrame) -> pd.DataFrame:
-    required = {"trade_date", "open", "high", "low", "close", "volume", "adj_factor", "code"}
-    if not required.issubset(df.columns):
+    code_col = _pick_column(df, ["code"])
+    date_col = _pick_column(df, ["trade_date", "date"])
+    volume_col = _pick_column(df, ["volume", "vol"])
+    required = {"open", "high", "low", "close", "adj_factor"}
+    if code_col is None or date_col is None or not required.issubset(df.columns):
         return pd.DataFrame()
 
-    out = df[["code", "trade_date", "open", "high", "low", "close", "volume", "adj_factor"]].copy()
+    if volume_col is not None:
+        volume = pd.to_numeric(df[volume_col], errors="coerce")
+    elif "pct_chg" in df.columns:
+        pct = pd.to_numeric(df["pct_chg"], errors="coerce").abs().fillna(0.0)
+        volume = (pct + 1.0) * 1_000_000.0
+    else:
+        spread = pd.to_numeric(df["high"], errors="coerce") - pd.to_numeric(df["low"], errors="coerce")
+        volume = spread.abs().fillna(0.0) + 1.0
+
+    out = pd.DataFrame(
+        {
+            "code": df[code_col],
+            "trade_date": df[date_col],
+            "open": df["open"],
+            "high": df["high"],
+            "low": df["low"],
+            "close": df["close"],
+            "volume": volume,
+            "adj_factor": df["adj_factor"],
+        }
+    )
     out["code"] = out["code"].astype(str)
     out["trade_date"] = _normalize_trade_date(out["trade_date"])
     out = out.dropna(subset=["code", "trade_date"])
