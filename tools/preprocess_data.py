@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import os
 from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
@@ -154,6 +155,67 @@ def _extend_chunks(dst: dict[str, list[pd.DataFrame]], src: dict[str, list[pd.Da
         dst[code].extend(chunks)
 
 
+def _fetch_namechange(start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
+    token = os.getenv("TUSHARE_TOKEN", "").strip()
+    if not token:
+        return pd.DataFrame()
+
+    try:
+        import tushare as ts
+    except ImportError:
+        return pd.DataFrame()
+
+    pro = ts.pro_api(token)
+    try:
+        df = pro.namechange(
+            ts_code="",
+            start_date=start_date.strftime("%Y%m%d"),
+            end_date=end_date.strftime("%Y%m%d"),
+            limit="",
+            offset="",
+            fields=["ts_code", "name", "start_date", "end_date"],
+        )
+    except Exception:
+        return pd.DataFrame()
+
+    if df is None or df.empty:
+        return pd.DataFrame()
+    return df
+
+
+def _build_st_markers(namechange: pd.DataFrame) -> pd.DataFrame:
+    if namechange.empty:
+        return pd.DataFrame()
+
+    df = namechange.copy()
+    df = df.rename(columns={"ts_code": "code"})
+    df["name"] = df["name"].astype(str)
+    df["start_date"] = _normalize_trade_date(df["start_date"])
+    df["end_date"] = _normalize_trade_date(df["end_date"])
+    df = df.dropna(subset=["code", "start_date"]).reset_index(drop=True)
+
+    is_star_st = df["name"].str.contains(r"\*ST", regex=True, na=False)
+    is_st = df["name"].str.contains(r"ST", regex=False, na=False)
+    st_df = df[is_st].copy()
+    if st_df.empty:
+        return pd.DataFrame()
+
+    st_df["st_type"] = np.where(is_star_st.loc[st_df.index], "*ST", "ST")
+    st_df["revoke_st_date"] = st_df["end_date"]
+    st_df = st_df[["code", "name", "start_date", "end_date", "st_type", "revoke_st_date"]]
+    st_df = st_df.sort_values(["code", "start_date", "end_date"], na_position="last").reset_index(drop=True)
+    return st_df
+
+
+def _write_st_files(st_df: pd.DataFrame, out_dir: Path) -> None:
+    if st_df.empty:
+        return
+    for code, g in st_df.groupby("code", sort=False):
+        code_dir = out_dir / str(code)
+        code_dir.mkdir(parents=True, exist_ok=True)
+        g.reset_index(drop=True).to_parquet(code_dir / "st.parquet", index=False)
+
+
 def preprocess(raw_dir: Path, out_dir: Path, max_workers: int = 4) -> None:
     per_code_5min: dict[str, list[pd.DataFrame]] = defaultdict(list)
     per_code_daily: dict[str, list[pd.DataFrame]] = defaultdict(list)
@@ -193,6 +255,12 @@ def preprocess(raw_dir: Path, out_dir: Path, max_workers: int = 4) -> None:
     if all_calendar_dates:
         calendar = pd.DataFrame({"trade_date": sorted(all_calendar_dates)})
         calendar.to_parquet(out_dir / "calendar.parquet", index=False)
+
+        min_trade_date = pd.to_datetime(calendar["trade_date"].min())
+        max_trade_date = pd.to_datetime(calendar["trade_date"].max())
+        namechange = _fetch_namechange(min_trade_date, max_trade_date)
+        st_df = _build_st_markers(namechange)
+        _write_st_files(st_df, out_dir)
 
 
 if __name__ == "__main__":
