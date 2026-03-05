@@ -68,6 +68,15 @@ def parse_date_from_filename(path: Path) -> Optional[date]:
 
 def build_calendar_from_daily_filenames(data_dir: str | Path) -> list[str]:
     root = Path(data_dir)
+    calendar_file = root / "calendar.parquet"
+    if calendar_file.exists():
+        try:
+            cal = pd.read_parquet(calendar_file, columns=["trade_date"])
+            parsed = pd.to_datetime(cal["trade_date"], errors="coerce").dropna()
+            return [d.isoformat() for d in sorted(set(parsed.dt.date.tolist()))]
+        except Exception:
+            pass
+
     dates: set[date] = set()
     for daily_file in root.glob("*/daily.parquet"):
         try:

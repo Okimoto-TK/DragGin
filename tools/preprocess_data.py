@@ -1,110 +1,97 @@
 from __future__ import annotations
 
 import argparse
+from collections import defaultdict
 from pathlib import Path
 
 import pandas as pd
-
-
-DATE_PATTERN = r"(\d{4}-\d{2}-\d{2}|\d{8})"
 
 
 def _normalize_trade_date(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce").dt.date
 
 
-def build_5min(raw_dir: Path, code: str) -> pd.DataFrame:
-    rows: list[pd.DataFrame] = []
-    for csv_file in raw_dir.glob("*.csv"):
-        df = pd.read_csv(csv_file)
-        if "code" in df.columns:
-            df = df[df["code"] == code]
-        elif code not in csv_file.stem:
-            continue
-        if df.empty:
-            continue
-        rows.append(df)
-
-    if not rows:
+def _normalize_5min(df: pd.DataFrame) -> pd.DataFrame:
+    required = {"trade_date", "time", "open", "high", "low", "close", "volume", "code"}
+    if not required.issubset(df.columns):
         return pd.DataFrame()
 
-    out = pd.concat(rows, ignore_index=True)
-    required = {"trade_date", "time", "open", "high", "low", "close", "volume"}
-    if not required.issubset(out.columns):
-        return pd.DataFrame()
-
-    out = out[["trade_date", "time", "open", "high", "low", "close", "volume"]].copy()
+    out = df[["code", "trade_date", "time", "open", "high", "low", "close", "volume"]].copy()
+    out["code"] = out["code"].astype(str)
     out["trade_date"] = _normalize_trade_date(out["trade_date"])
-    out = out.dropna(subset=["trade_date", "time"]).reset_index(drop=True)
+    out = out.dropna(subset=["code", "trade_date", "time"]).reset_index(drop=True)
     out["dt"] = pd.to_datetime(out["trade_date"].astype(str) + " " + out["time"].astype(str), errors="coerce")
     out = out.dropna(subset=["dt"]).sort_values("dt").reset_index(drop=True)
     return out
 
 
-def build_daily(raw_dir: Path, code: str) -> pd.DataFrame:
-    rows: list[pd.DataFrame] = []
-    for pq_file in raw_dir.glob("*.parquet"):
-        df = pd.read_parquet(pq_file)
-        if "code" in df.columns:
-            df = df[df["code"] == code]
-        elif code not in pq_file.stem:
-            continue
-        if df.empty:
-            continue
-        rows.append(df)
-
-    if not rows:
+def _normalize_daily(df: pd.DataFrame) -> pd.DataFrame:
+    required = {"trade_date", "open", "high", "low", "close", "volume", "adj_factor", "code"}
+    if not required.issubset(df.columns):
         return pd.DataFrame()
 
-    out = pd.concat(rows, ignore_index=True)
-    required = {"trade_date", "open", "high", "low", "close", "volume", "adj_factor"}
-    if not required.issubset(out.columns):
-        return pd.DataFrame()
-
-    out = out[["trade_date", "open", "high", "low", "close", "volume", "adj_factor"]].copy()
+    out = df[["code", "trade_date", "open", "high", "low", "close", "volume", "adj_factor"]].copy()
+    out["code"] = out["code"].astype(str)
     out["trade_date"] = _normalize_trade_date(out["trade_date"])
-    out = out.dropna(subset=["trade_date"]).drop_duplicates(subset=["trade_date"], keep="last")
-    out = out.sort_values("trade_date").reset_index(drop=True)
+    out = out.dropna(subset=["code", "trade_date"])
+    out = out.sort_values(["code", "trade_date"]).drop_duplicates(subset=["code", "trade_date"], keep="last")
+    out = out.reset_index(drop=True)
     return out
 
 
 def preprocess(raw_dir: Path, out_dir: Path) -> None:
-    codes: set[str] = set()
+    per_code_5min: dict[str, list[pd.DataFrame]] = defaultdict(list)
+    per_code_daily: dict[str, list[pd.DataFrame]] = defaultdict(list)
+
     for csv_file in raw_dir.glob("*.csv"):
         try:
-            df = pd.read_csv(csv_file, usecols=["code"])
+            df = pd.read_csv(csv_file)
         except Exception:
             continue
-        if "code" in df.columns:
-            codes.update(df["code"].dropna().astype(str).unique().tolist())
-        else:
-            parts = csv_file.stem.split("_")
-            if parts:
-                codes.add(parts[0])
+        if "code" not in df.columns:
+            continue
+        norm = _normalize_5min(df)
+        if norm.empty:
+            continue
+        for code, g in norm.groupby("code", sort=False):
+            per_code_5min[code].append(g.drop(columns=["code"]).reset_index(drop=True))
 
     for pq_file in raw_dir.glob("*.parquet"):
         try:
-            df = pd.read_parquet(pq_file, columns=["code"])
+            df = pd.read_parquet(pq_file)
         except Exception:
-            df = pd.DataFrame()
-        if "code" in df.columns and not df.empty:
-            codes.update(df["code"].dropna().astype(str).unique().tolist())
-        else:
-            parts = pq_file.stem.split("_")
-            if parts:
-                codes.add(parts[0])
-
-    for code in sorted(codes):
-        m5 = build_5min(raw_dir, code)
-        d1 = build_daily(raw_dir, code)
-        if m5.empty and d1.empty:
             continue
+        if "code" not in df.columns:
+            continue
+        norm = _normalize_daily(df)
+        if norm.empty:
+            continue
+        for code, g in norm.groupby("code", sort=False):
+            per_code_daily[code].append(g.drop(columns=["code"]).reset_index(drop=True))
+
+    all_codes = sorted(set(per_code_5min) | set(per_code_daily))
+    all_calendar_dates: set = set()
+
+    for code in all_codes:
         code_dir = out_dir / code
         code_dir.mkdir(parents=True, exist_ok=True)
-        if not m5.empty:
+
+        chunks_5m = per_code_5min.get(code, [])
+        if chunks_5m:
+            m5 = pd.concat(chunks_5m, ignore_index=True)
+            m5 = m5.sort_values("dt").reset_index(drop=True)
             m5.to_parquet(code_dir / "5min.parquet", index=False)
-        if not d1.empty:
+
+        chunks_daily = per_code_daily.get(code, [])
+        if chunks_daily:
+            d1 = pd.concat(chunks_daily, ignore_index=True)
+            d1 = d1.sort_values("trade_date").drop_duplicates(subset=["trade_date"], keep="last").reset_index(drop=True)
             d1.to_parquet(code_dir / "daily.parquet", index=False)
+            all_calendar_dates.update(d1["trade_date"].tolist())
+
+    if all_calendar_dates:
+        calendar = pd.DataFrame({"trade_date": sorted(all_calendar_dates)})
+        calendar.to_parquet(out_dir / "calendar.parquet", index=False)
 
 
 if __name__ == "__main__":
