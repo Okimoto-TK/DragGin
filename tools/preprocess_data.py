@@ -23,8 +23,7 @@ def _normalize_trade_date(series: pd.Series) -> pd.Series:
 
 
 def _normalize_time_str(series: pd.Series) -> pd.Series:
-    # Fast-path: most sources are already HH:MM or HH:MM:SS.
-    # Slice avoids expensive regex / per-field validation passes.
+    # Fast path: trim + first 5 chars covers HH:MM and HH:MM:SS.
     return series.astype(str).str.strip().str.slice(0, 5)
 
 
@@ -62,7 +61,7 @@ def _normalize_5min(df: pd.DataFrame) -> pd.DataFrame:
     out = out.dropna(subset=["code", "trade_date", "time"]).reset_index(drop=True)
     # 09:30 bar includes opening auction data; exclude it from intraday bars.
     out = out[out["time"] != "09:30"].reset_index(drop=True)
-    out["dt"] = out["trade_date"] + pd.to_timedelta(out["time"] + ":00")
+    out["dt"] = out["trade_date"] + pd.to_timedelta(out["time"] + ":00", errors="coerce")
     out = out.dropna(subset=["dt"]).sort_values("dt").reset_index(drop=True)
     return out
 

@@ -138,3 +138,29 @@ def test_build_st_markers_handles_st_starst_transitions() -> None:
     assert st_df["revoke_st_date"].astype(str).tolist() == ["2024-02-29", "2024-04-30", "2024-05-31"]
     # 非前缀名称不应被误判为ST
     assert "CCC" not in st_df["code"].tolist()
+
+
+def test_preprocess_handles_non_hhmm_time_without_crash(tmp_path: Path) -> None:
+    raw = tmp_path / "raw"
+    out = tmp_path / "out"
+    raw.mkdir()
+    out.mkdir()
+
+    pd.DataFrame(
+        {
+            "code": ["AAA", "AAA", "AAA"],
+            "trade_time": ["9:35", "935", "bad-time"],
+            "close": [1.2, 1.3, 1.4],
+            "open": [1.1, 1.2, 1.3],
+            "high": [1.3, 1.4, 1.5],
+            "low": [1.0, 1.1, 1.2],
+            "vol": [110, 120, 130],
+            "date": ["20240102", "20240102", "20240102"],
+        }
+    ).to_csv(raw / "bars.csv", index=False)
+
+    preprocess(raw, out)
+
+    m5 = pd.read_parquet(out / "AAA" / "5min.parquet")
+    assert m5["time"].tolist() == ["9:35"]
+    assert len(m5) == 1
