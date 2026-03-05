@@ -348,7 +348,7 @@ def print_calendar_summary(data_dir: str | Path) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--data-dir", default="./data")
+    parser.add_argument("--data-dir", default="../data")
     parser.add_argument("--code", required=True)
     parser.add_argument("--asof", required=True)
     parser.add_argument("--print-calendar", action="store_true")

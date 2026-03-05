@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import csv
 import os
+import shutil
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
@@ -19,12 +20,10 @@ except ImportError:  # pragma: no cover
 
 
 def _normalize_trade_date(series: pd.Series) -> pd.Series:
-    # Keep datetime64 dtype (instead of Python date objects) for faster vectorized ops.
     return pd.to_datetime(series, format="%Y%m%d", errors="coerce")
 
 
 def _detect_csv_sep(path: Path) -> str:
-    # Fast delimiter detection (comma vs tab vs pipe). Read a small sample only.
     try:
         with path.open("r", encoding="utf-8", errors="ignore") as f:
             sample = f.read(4096)
@@ -33,7 +32,6 @@ def _detect_csv_sep(path: Path) -> str:
         try:
             return csv.Sniffer().sniff(sample, delimiters=[",", "\t", "|", ";"]).delimiter
         except Exception:
-            # Heuristic: choose the most frequent delimiter in the sample.
             counts = {d: sample.count(d) for d in [",", "\t", "|", ";"]}
             return max(counts, key=counts.get) if max(counts.values()) > 0 else ","
     except Exception:
@@ -41,18 +39,15 @@ def _detect_csv_sep(path: Path) -> str:
 
 
 def _time_series_to_minutes(series: pd.Series) -> pd.Series:
-    """Convert a variety of time representations to minutes-from-midnight (Int32 with NA)."""
     s = series.astype("string").str.strip().str.replace("：", ":", regex=False)
-
-    # Case A: datetime-like strings (e.g., '2026/2/13 9:30' or '2026-02-13 09:30:00')
     has_date = s.str.contains(r"[/-]", regex=True, na=False)
     minutes = pd.Series(pd.NA, index=s.index, dtype="Int32")
+
     if has_date.any():
         dt = pd.to_datetime(s[has_date], errors="coerce")
         mins = (dt.dt.hour.astype("Int32") * 60 + dt.dt.minute.astype("Int32")).astype("Int32")
         minutes.loc[has_date] = mins
 
-    # Case B: 'H:MM' / 'HH:MM' / 'HH:MM:SS'
     remain = minutes.isna()
     if remain.any():
         ss = s[remain]
@@ -65,7 +60,6 @@ def _time_series_to_minutes(series: pd.Series) -> pd.Series:
             mins = (hh[ok].astype("int32") * 60 + mm[ok].astype("int32")).astype("int32")
             minutes.loc[mins.index] = mins.astype("Int32")
 
-        # Case C: compact digits '935' / '0935'
         remain2 = minutes.isna() & remain
         if remain2.any():
             ss2 = s[remain2]
@@ -105,7 +99,6 @@ def _normalize_5min(df: pd.DataFrame) -> pd.DataFrame:
     if code_col is None or vol_col is None or not required_price.issubset(df.columns):
         return pd.DataFrame()
 
-    # Fast path: parse full datetime strings in trade_time when available.
     dt = None
     if "trade_time" in df.columns:
         dt = pd.to_datetime(df["trade_time"], errors="coerce")
@@ -114,7 +107,6 @@ def _normalize_5min(df: pd.DataFrame) -> pd.DataFrame:
         trade_date = dt.dt.normalize()
         minutes = (dt.dt.hour.astype("Int32") * 60 + dt.dt.minute.astype("Int32")).astype("Int32")
 
-        # Fallback for non-datetime rows (e.g., "935") when date/time columns are available.
         missing = dt.isna()
         if missing.any() and date_col is not None and time_col is not None:
             trade_date_fallback = _normalize_trade_date(df.loc[missing, date_col])
@@ -142,8 +134,6 @@ def _normalize_5min(df: pd.DataFrame) -> pd.DataFrame:
 
     out = out.dropna(subset=["code", "trade_date", "minutes"]).reset_index(drop=True)
     out["minutes"] = out["minutes"].astype("int32")
-
-    # 09:30 bar includes opening auction data; exclude it from intraday bars.
     out = out[out["minutes"] != 9 * 60 + 30].reset_index(drop=True)
 
     out["dt"] = out["trade_date"] + pd.to_timedelta(out["minutes"], unit="m")
@@ -190,25 +180,19 @@ def _normalize_daily(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
-def _process_5min_file(csv_file: Path) -> dict[str, list[pd.DataFrame]]:
-    # NOTE: This path is extremely hot; keep it in C-engine and avoid Python regex-heavy parsing.
-    wanted = {
-        "code",
-        "trade_date",
-        "date",
-        "time",
-        "trade_time",
-        "open",
-        "high",
-        "low",
-        "close",
-        "volume",
-        "vol",
-    }
+def _split_by_code(norm: pd.DataFrame) -> dict[str, list[pd.DataFrame]]:
+    out = defaultdict(list)
+    if norm.empty:
+        return out
+    for code, group in norm.groupby("code", sort=False):
+        out[str(code)].append(group)
+    return out
 
+
+def _process_5min_file(csv_file: Path) -> dict[str, list[pd.DataFrame]]:
+    wanted = {"code", "trade_date", "date", "time", "trade_time", "open", "high", "low", "close", "volume", "vol"}
     sep = _detect_csv_sep(csv_file)
 
-    # Read header only to compute concrete usecols list (avoid python-side per-column lambda).
     try:
         header = pd.read_csv(csv_file, sep=sep, engine="c", nrows=0)
         usecols = [c for c in header.columns if c in wanted]
@@ -216,19 +200,11 @@ def _process_5min_file(csv_file: Path) -> dict[str, list[pd.DataFrame]]:
         usecols = list(wanted)
 
     if not usecols or "code" not in usecols:
-        # If header read failed, we still attempt full read; some files may have BOM/oddities.
         usecols = list(wanted)
 
     try:
-        df = pd.read_csv(
-            csv_file,
-            sep=sep,
-            engine="c",
-            usecols=usecols,
-            low_memory=False,
-        )
+        df = pd.read_csv(csv_file, sep=sep, engine="c", usecols=usecols, low_memory=False)
     except Exception:
-        # Fallback: try common separators explicitly.
         df = None
         for sep2 in [",", "\t", "|", ";"]:
             try:
@@ -240,55 +216,15 @@ def _process_5min_file(csv_file: Path) -> dict[str, list[pd.DataFrame]]:
                 break
             except Exception:
                 continue
-        if df is None:
-            return {}
+        if df is None: return {}
 
-    if "code" not in df.columns:
-        return {}
-
+    if "code" not in df.columns: return {}
     norm = _normalize_5min(df)
-    if norm.empty:
-        return {}
-
     return _split_by_code(norm)
 
 
-def _split_by_code(norm: pd.DataFrame) -> dict[str, list[pd.DataFrame]]:
-    out: dict[str, list[pd.DataFrame]] = defaultdict(list)
-    codes = norm["code"].to_numpy()
-    values = norm.drop(columns=["code"])
-
-    if len(codes) == 0:
-        return out
-
-    # Fast-path for files that only contain one code.
-    first_code = codes[0]
-    if np.all(codes == first_code):
-        out[str(first_code)].append(values.reset_index(drop=True))
-        return out
-
-    labels, uniques = pd.factorize(codes, sort=False)
-    order = labels.argsort(kind="mergesort")
-    sorted_labels = labels[order]
-    split_at = np.flatnonzero(np.diff(sorted_labels)) + 1
-
-    for code, idx in zip(uniques.tolist(), np.split(order, split_at)):
-        out[str(code)].append(values.iloc[idx].reset_index(drop=True))
-    return out
-
-
 _DAILY_PARQUET_COLUMNS = [
-    "code",
-    "trade_date",
-    "date",
-    "open",
-    "high",
-    "low",
-    "close",
-    "adj_factor",
-    "volume",
-    "vol",
-    "pct_chg",
+    "code", "trade_date", "date", "open", "high", "low", "close", "adj_factor", "volume", "vol", "pct_chg",
 ]
 
 
@@ -300,32 +236,93 @@ def _process_daily_file(pq_file: Path) -> dict[str, list[pd.DataFrame]]:
             df = pd.read_parquet(pq_file)
         except Exception:
             return {}
-    if "code" not in df.columns:
-        return {}
+    if "code" not in df.columns: return {}
     norm = _normalize_daily(df)
-    if norm.empty:
-        return {}
-
     return _split_by_code(norm)
 
 
-def _extend_chunks(dst: dict[str, list[pd.DataFrame]], src: dict[str, list[pd.DataFrame]]) -> None:
-    for code, chunks in src.items():
-        dst[code].extend(chunks)
+# =====================================================================
+# Phase 1: 进程内部切块 (Map) - 无IPC通讯，无临时巨无霸文件
+# =====================================================================
+def _process_csv_chunk(chunk_files: list[Path], chunk_id: int, out_dir: Path) -> list[str]:
+    per_code_5m = defaultdict(list)
+    for f in chunk_files:
+        out = _process_5min_file(f)
+        for code, dfs in out.items():
+            per_code_5m[code].extend(dfs)
+
+    processed_codes = []
+    # 写出本批次的切片小文件，写完自动释放内存
+    for code, dfs in per_code_5m.items():
+        if dfs:
+            code_dir = out_dir / str(code)
+            code_dir.mkdir(parents=True, exist_ok=True)
+            m5 = pd.concat(dfs, ignore_index=True)
+            m5.to_parquet(code_dir / f"5m_part_{chunk_id}.parquet", index=False)
+            processed_codes.append(code)
+
+    return processed_codes
+
+
+def _process_daily_chunk(chunk_files: list[Path], chunk_id: int, out_dir: Path) -> list[str]:
+    per_code_1d = defaultdict(list)
+    for f in chunk_files:
+        out = _process_daily_file(f)
+        for code, dfs in out.items():
+            per_code_1d[code].extend(dfs)
+
+    processed_codes = []
+    for code, dfs in per_code_1d.items():
+        if dfs:
+            code_dir = out_dir / str(code)
+            code_dir.mkdir(parents=True, exist_ok=True)
+            d1 = pd.concat(dfs, ignore_index=True)
+            d1.to_parquet(code_dir / f"1d_part_{chunk_id}.parquet", index=False)
+            processed_codes.append(code)
+
+    return processed_codes
+
+
+# =====================================================================
+# Phase 2: 直接合并各股票目录内的切片小文件 (Reduce)
+# =====================================================================
+def _combine_and_write_code(code: str, out_dir: Path) -> set[pd.Timestamp]:
+    code_dir = out_dir / str(code)
+    cal_dates = set()
+
+    parts_5m = list(code_dir.glob("5m_part_*.parquet"))
+    if parts_5m:
+        dfs = [pd.read_parquet(p) for p in parts_5m]
+        if dfs:
+            m5 = pd.concat(dfs, ignore_index=True)
+            m5 = m5.sort_values("dt").reset_index(drop=True)
+            m5.to_parquet(code_dir / "5min.parquet", index=False)
+        # 销毁碎片
+        for p in parts_5m:
+            try: p.unlink()
+            except OSError: pass
+
+    parts_1d = list(code_dir.glob("1d_part_*.parquet"))
+    if parts_1d:
+        dfs = [pd.read_parquet(p) for p in parts_1d]
+        if dfs:
+            d1 = pd.concat(dfs, ignore_index=True)
+            d1 = d1.sort_values("trade_date").drop_duplicates(subset=["trade_date"], keep="last").reset_index(drop=True)
+            d1.to_parquet(code_dir / "daily.parquet", index=False)
+            cal_dates.update(d1["trade_date"].tolist())
+        for p in parts_1d:
+            try: p.unlink()
+            except OSError: pass
+
+    return cal_dates
 
 
 def _fetch_namechange(start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
     token = os.getenv("TUSHARE_TOKEN", "").strip()
-    if not token:
-        return pd.DataFrame()
-
+    if not token: return pd.DataFrame()
     try:
         import tushare as ts
-    except ImportError:
-        return pd.DataFrame()
-
-    pro = ts.pro_api(token)
-    try:
+        pro = ts.pro_api(token)
         df = pro.namechange(
             ts_code="",
             start_date=start_date.strftime("%Y%m%d"),
@@ -334,20 +331,14 @@ def _fetch_namechange(start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.Da
             offset="",
             fields=["ts_code", "name", "start_date", "end_date"],
         )
+        return df if df is not None else pd.DataFrame()
     except Exception:
         return pd.DataFrame()
 
-    if df is None or df.empty:
-        return pd.DataFrame()
-    return df
-
 
 def _build_st_markers(namechange: pd.DataFrame) -> pd.DataFrame:
-    if namechange.empty:
-        return pd.DataFrame()
-
-    df = namechange.copy()
-    df = df.rename(columns={"ts_code": "code"})
+    if namechange.empty: return pd.DataFrame()
+    df = namechange.copy().rename(columns={"ts_code": "code"})
     df["name"] = df["name"].astype(str)
     df["start_date"] = _normalize_trade_date(df["start_date"])
     df["end_date"] = _normalize_trade_date(df["end_date"])
@@ -357,80 +348,54 @@ def _build_st_markers(namechange: pd.DataFrame) -> pd.DataFrame:
     is_star_st = normalized_name.str.startswith("*ST", na=False)
     is_st = normalized_name.str.startswith("ST", na=False) | is_star_st
     st_df = df[is_st].copy()
-    if st_df.empty:
-        return pd.DataFrame()
+    if st_df.empty: return pd.DataFrame()
 
     st_df["st_type"] = np.where(is_star_st.loc[st_df.index], "*ST", "ST")
     st_df["revoke_st_date"] = st_df["end_date"]
-    st_df = st_df[["code", "name", "start_date", "end_date", "st_type", "revoke_st_date"]]
-    st_df = st_df.sort_values(["code", "start_date", "end_date"], na_position="last").reset_index(drop=True)
-    return st_df
+    return st_df[["code", "name", "start_date", "end_date", "st_type", "revoke_st_date"]].sort_values(
+        ["code", "start_date", "end_date"], na_position="last").reset_index(drop=True)
 
 
 def _write_st_files(st_df: pd.DataFrame, out_dir: Path) -> None:
-    if st_df.empty:
-        return
+    if st_df.empty: return
     for code, g in st_df.groupby("code", sort=False):
         code_dir = out_dir / str(code)
         code_dir.mkdir(parents=True, exist_ok=True)
         g.reset_index(drop=True).to_parquet(code_dir / "st.parquet", index=False)
 
 
-def _write_code_files(code: str, out_dir: Path, chunks_5m: list[pd.DataFrame], chunks_daily: list[pd.DataFrame]) -> list[pd.Timestamp]:
-    code_dir = out_dir / code
-    code_dir.mkdir(parents=True, exist_ok=True)
-
-    calendar_dates: list[pd.Timestamp] = []
-
-    if chunks_5m:
-        m5 = pd.concat(chunks_5m, ignore_index=True)
-        m5 = m5.sort_values("dt").reset_index(drop=True)
-        m5.to_parquet(code_dir / "5min.parquet", index=False)
-
-    if chunks_daily:
-        d1 = pd.concat(chunks_daily, ignore_index=True)
-        d1 = d1.sort_values("trade_date").drop_duplicates(subset=["trade_date"], keep="last").reset_index(drop=True)
-        d1.to_parquet(code_dir / "daily.parquet", index=False)
-        calendar_dates = d1["trade_date"].tolist()
-
-    return calendar_dates
-
-
 def preprocess(raw_dir: Path, out_dir: Path, max_workers: int = 4) -> None:
-    per_code_5min: dict[str, list[pd.DataFrame]] = defaultdict(list)
-    per_code_daily: dict[str, list[pd.DataFrame]] = defaultdict(list)
-
     csv_files = sorted(raw_dir.glob("*.csv"))
     pq_files = sorted(raw_dir.glob("*.parquet"))
 
-    # 5m CSV parsing is CPU+GIL heavy in Python space (strings) and benefits from multiprocessing.
-    # Using processes also isolates pandas parser state and avoids thread contention.
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_process_5min_file, csv_file) for csv_file in csv_files]
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing 5min CSV"):
-            _extend_chunks(per_code_5min, future.result())
+    all_codes: set[str] = set()
 
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = [executor.submit(_process_daily_file, pq_file) for pq_file in pq_files]
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Processing daily parquet"):
-            _extend_chunks(per_code_daily, future.result())
+    # 1. Map 阶段：每次处理 100 天，原地合并为本地切片碎片，极度省内存且避开了跨进程数据传输
+    chunk_size_5m = 100
+    csv_chunks = [csv_files[i:i + chunk_size_5m] for i in range(0, len(csv_files), chunk_size_5m)]
+    if csv_chunks:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_process_csv_chunk, chunk, i, out_dir) for i, chunk in enumerate(csv_chunks)]
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Phase 1: Parsing 5min CSV chunks"):
+                all_codes.update(future.result())
 
-    all_codes = sorted(set(per_code_5min) | set(per_code_daily))
+    chunk_size_1d = 200
+    pq_chunks = [pq_files[i:i + chunk_size_1d] for i in range(0, len(pq_files), chunk_size_1d)]
+    if pq_chunks:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_process_daily_chunk, chunk, i, out_dir) for i, chunk in enumerate(pq_chunks)]
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Phase 1: Parsing Daily chunks"):
+                all_codes.update(future.result())
+
+    # 2. Reduce 阶段：每只股票只要读取自身目录下的数十个切片即可 (抛弃全局跨文件搜寻，速度起飞)
+    codes_list = sorted(list(all_codes))
     all_calendar_dates: set[pd.Timestamp] = set()
 
-    with ProcessPoolExecutor(max_workers=max_workers) as executor:
-        futures = [
-            executor.submit(
-                _write_code_files,
-                code,
-                out_dir,
-                per_code_5min.get(code, []),
-                per_code_daily.get(code, []),
-            )
-            for code in all_codes
-        ]
-        for future in tqdm(as_completed(futures), total=len(futures), desc="Writing per-code parquet"):
-            all_calendar_dates.update(future.result())
+    if codes_list:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_combine_and_write_code, code, out_dir) for code in codes_list]
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Phase 2: Writing final parquets"):
+                all_calendar_dates.update(future.result())
 
     if all_calendar_dates:
         calendar = pd.DataFrame({"trade_date": sorted(all_calendar_dates)})
@@ -445,8 +410,8 @@ def preprocess(raw_dir: Path, out_dir: Path, max_workers: int = 4) -> None:
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
-    parser.add_argument("--raw-data-dir", default="./data")
-    parser.add_argument("--out-dir", default="./data")
+    parser.add_argument("--raw-data-dir", default="./raw_data")
+    parser.add_argument("--out-dir", default="../data")
     parser.add_argument("--max-workers", type=int, default=4)
     args = parser.parse_args()
     preprocess(
