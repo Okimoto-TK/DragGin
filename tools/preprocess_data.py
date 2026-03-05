@@ -53,6 +53,8 @@ def _normalize_5min(df: pd.DataFrame) -> pd.DataFrame:
     out["time"] = out["time"].astype(str)
     out["time"] = out["time"].str.extract(r"(\d{2}:\d{2})", expand=False).fillna(out["time"])
     out = out.dropna(subset=["code", "trade_date", "time"]).reset_index(drop=True)
+    # 09:30 bar includes opening auction data; exclude it from intraday bars.
+    out = out[out["time"] != "09:30"].reset_index(drop=True)
     out["dt"] = pd.to_datetime(out["trade_date"].astype(str) + " " + out["time"].astype(str), errors="coerce")
     out = out.dropna(subset=["dt"]).sort_values("dt").reset_index(drop=True)
     return out
