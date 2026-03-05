@@ -16,7 +16,7 @@ except ImportError:  # pragma: no cover
 
 
 def _normalize_trade_date(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, errors="coerce").dt.date
+    return pd.to_datetime(series, format="%Y%m%d", errors="coerce").dt.date
 
 
 def _pick_column(df: pd.DataFrame, names: list[str]) -> str | None:
