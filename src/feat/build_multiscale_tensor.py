@@ -13,7 +13,7 @@ import pandas as pd
 L_MICRO = 48
 L_MEZZO = 40
 L_MACRO = 30
-C = 7
+C = 6
 RAW_WARMUP = 20
 EPS = 1e-8
 TANH_K = 5.0
@@ -68,28 +68,34 @@ def parse_date_from_filename(path: Path) -> Optional[date]:
 
 def build_calendar_from_daily_filenames(data_dir: str | Path) -> list[str]:
     root = Path(data_dir)
+    calendar_file = root / "calendar.parquet"
+    if calendar_file.exists():
+        try:
+            cal = pd.read_parquet(calendar_file, columns=["trade_date"])
+            parsed = pd.to_datetime(cal["trade_date"], errors="coerce").dropna()
+            return [d.isoformat() for d in sorted(set(parsed.dt.date.tolist()))]
+        except Exception:
+            pass
+
     dates: set[date] = set()
-    for f in root.glob("*.parquet"):
-        dt = parse_date_from_filename(f)
-        if dt is not None:
-            dates.add(dt)
+    for daily_file in root.glob("*/daily.parquet"):
+        try:
+            df = pd.read_parquet(daily_file, columns=["trade_date"])
+        except Exception:
+            continue
+        if "trade_date" not in df.columns:
+            continue
+        parsed = pd.to_datetime(df["trade_date"], errors="coerce").dropna()
+        dates.update(parsed.dt.date.tolist())
     return [d.isoformat() for d in sorted(dates)]
 
 
 def load_5m_data(data_dir: str | Path, code: str) -> pd.DataFrame:
-    rows = []
-    for csv_file in Path(data_dir).glob("*.csv"):
-        df = pd.read_csv(csv_file)
-        if "code" in df.columns:
-            df = df[df["code"] == code]
-        elif code not in csv_file.stem:
-            continue
-        if not df.empty:
-            rows.append(df)
-    if not rows:
+    file_path = Path(data_dir) / code / "5min.parquet"
+    if not file_path.exists():
         return pd.DataFrame()
-    out = pd.concat(rows, ignore_index=True)
-    required = {"trade_date", "time", "open", "high", "low", "close", "volume", "vwap"}
+    out = pd.read_parquet(file_path)
+    required = {"trade_date", "time", "open", "high", "low", "close", "volume"}
     if not required.issubset(set(out.columns)):
         return pd.DataFrame()
     out["trade_date"] = pd.to_datetime(out["trade_date"]).dt.date
@@ -99,25 +105,11 @@ def load_5m_data(data_dir: str | Path, code: str) -> pd.DataFrame:
 
 
 def load_daily_data(data_dir: str | Path, code: str) -> pd.DataFrame:
-    rows = []
-    for pq_file in Path(data_dir).glob("*.parquet"):
-        dt = parse_date_from_filename(pq_file)
-        if dt is None:
-            continue
-        df = pd.read_parquet(pq_file)
-        if "code" in df.columns:
-            df = df[df["code"] == code]
-        elif code not in pq_file.stem:
-            continue
-        if df.empty:
-            continue
-        if "trade_date" not in df.columns:
-            df["trade_date"] = pd.Timestamp(dt)
-        rows.append(df)
-    if not rows:
+    file_path = Path(data_dir) / code / "daily.parquet"
+    if not file_path.exists():
         return pd.DataFrame()
-    out = pd.concat(rows, ignore_index=True)
-    required = {"trade_date", "open", "high", "low", "close", "volume", "vwap", "adj_factor"}
+    out = pd.read_parquet(file_path)
+    required = {"trade_date", "open", "high", "low", "close", "volume", "adj_factor"}
     if not required.issubset(set(out.columns)):
         return pd.DataFrame()
     out["trade_date"] = pd.to_datetime(out["trade_date"]).dt.date
@@ -148,7 +140,6 @@ def aggregate_30m_from_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
                     "low": chunk["low"].min(),
                     "close": chunk.iloc[-1]["close"],
                     "volume": vol_sum,
-                    "vwap": (chunk["vwap"] * chunk["volume"]).sum() / vol_sum,
                 }
             )
     if not agg_rows:
@@ -168,17 +159,16 @@ def _compute_features(df: pd.DataFrame) -> pd.DataFrame:
     z["C5"] = z["volume"] / z["vol_mean20"]
     z["ret_std5"] = z["ret"].rolling(5, min_periods=5).std().shift(1)
     z["C6"] = z["ret_std5"]
-    z["C7"] = z["vwap"] / z["close"]
     return z
 
 
 def _validate_raw(df: pd.DataFrame) -> bool:
-    needed = ["open", "high", "low", "close", "volume", "vwap"]
+    needed = ["open", "high", "low", "close", "volume"]
     if df.empty:
         return False
     if df[needed].isna().any().any():
         return False
-    if (df[["open", "high", "low", "close", "vwap"]] <= 0).any().any():
+    if (df[["open", "high", "low", "close"]] <= 0).any().any():
         return False
     return True
 
@@ -214,7 +204,7 @@ def _apply_asof_price_adjustment(
         return None, "invalid adj_factor ratio"
 
     out = df.copy()
-    for col in ["open", "high", "low", "close", "vwap"]:
+    for col in ["open", "high", "low", "close"]:
         out[col] = out[col].astype(float) * factors
     return out, ""
 
@@ -246,7 +236,7 @@ def _extract_tail_tensor(
             return None, "missing daily bar in required history"
 
     work = _compute_features(hist)
-    cols = ["C1", "C2", "C3", "C4", "C5", "C6", "C7"]
+    cols = ["C1", "C2", "C3", "C4", "C5", "C6"]
 
     raw_region = work.iloc[-(L + z_window) :][cols]
     if raw_region.isna().any().any():
@@ -347,7 +337,7 @@ def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) ->
 
 
 def print_calendar_summary(data_dir: str | Path) -> None:
-    files = list(Path(data_dir).glob("*.parquet"))
+    files = list(Path(data_dir).glob("*/daily.parquet"))
     cal = build_calendar_from_daily_filenames(data_dir)
     print(f"total files scanned: {len(files)}")
     print(f"total valid dates: {len(cal)}")

@@ -19,7 +19,6 @@ def test_label_alignment_open_t1_close_t3() -> None:
             "low": close - 1.0,
             "close": close,
             "volume": np.full(320, 1000.0),
-            "vwap": close - 0.1,
             "adj_factor": 1.0 + 0.001 * np.arange(n),
         }
     )

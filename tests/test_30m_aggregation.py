@@ -1,4 +1,3 @@
-import numpy as np
 import pandas as pd
 
 from src.feat.build_multiscale_tensor import aggregate_30m_from_5m
@@ -18,7 +17,6 @@ def test_30m_aggregation() -> None:
                 "low": p - 1,
                 "close": p + 1,
                 "volume": 10,
-                "vwap": p + 0.5,
             }
         )
     df = pd.DataFrame(rows)
@@ -30,4 +28,3 @@ def test_30m_aggregation() -> None:
     assert first["high"] == 107
     assert first["low"] == 99
     assert first["volume"] == 60
-    assert np.isclose(first["vwap"], np.mean([100.5, 101.5, 102.5, 103.5, 104.5, 105.5]))
