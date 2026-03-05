@@ -23,18 +23,9 @@ def _normalize_trade_date(series: pd.Series) -> pd.Series:
 
 
 def _normalize_time_str(series: pd.Series) -> pd.Series:
-    time_str = series.astype(str).str.strip()
-    hhmm = time_str.str.slice(0, 5)
-    valid_mask = (
-        (hhmm.str.len() == 5)
-        & (hhmm.str.get(2) == ":")
-        & hhmm.str.slice(0, 2).str.isdigit()
-        & hhmm.str.slice(3, 5).str.isdigit()
-    )
-    if valid_mask.all():
-        return hhmm
-    fallback = time_str.str.extract(r"(\d{2}:\d{2})", expand=False)
-    return hhmm.where(valid_mask, fallback)
+    # Fast-path: most sources are already HH:MM or HH:MM:SS.
+    # Slice avoids expensive regex / per-field validation passes.
+    return series.astype(str).str.strip().str.slice(0, 5)
 
 
 def _pick_column(df: pd.DataFrame, names: list[str]) -> str | None:
@@ -131,7 +122,6 @@ def _process_5min_file(csv_file: Path) -> dict[str, list[pd.DataFrame]]:
         df = pd.read_csv(
             csv_file,
             usecols=lambda c: c in usecols,
-            dtype={"code": "string", "trade_date": "string", "date": "string", "time": "string", "trade_time": "string"},
         )
     except Exception:
         return {}
