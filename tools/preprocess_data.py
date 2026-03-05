@@ -23,8 +23,29 @@ def _normalize_trade_date(series: pd.Series) -> pd.Series:
 
 
 def _normalize_time_str(series: pd.Series) -> pd.Series:
-    # Fast path: trim + first 5 chars covers HH:MM and HH:MM:SS.
-    return series.astype(str).str.strip().str.slice(0, 5)
+    s = series.astype(str).str.strip().str.replace("：", ":", regex=False)
+    out = pd.Series(pd.NA, index=s.index, dtype="string")
+
+    # Handles HH:MM, H:MM, HH:MM:SS, and datetime strings like YYYY/M/D HH:MM.
+    hhmm = s.str.extract(r"(?<!\d)(\d{1,2}):(\d{2})(?!\d)")
+    hh = pd.to_numeric(hhmm[0], errors="coerce")
+    mm = pd.to_numeric(hhmm[1], errors="coerce")
+    valid_hhmm = hh.notna() & mm.notna() & hh.between(0, 23) & mm.between(0, 59)
+    if valid_hhmm.any():
+        out.loc[valid_hhmm] = hh.loc[valid_hhmm].astype(int).astype(str).str.zfill(2) + ":" + mm.loc[valid_hhmm].astype(int).astype(str).str.zfill(2)
+
+    # Handles compact forms such as 935 / 0935.
+    compact = s.str.extract(r"^(\d{3,4})$")[0]
+    remain = out.isna() & compact.notna()
+    if remain.any():
+        compact_valid = compact.loc[remain].str.zfill(4)
+        chh = pd.to_numeric(compact_valid.str.slice(0, 2), errors="coerce")
+        cmm = pd.to_numeric(compact_valid.str.slice(2, 4), errors="coerce")
+        valid_compact = chh.notna() & cmm.notna() & chh.between(0, 23) & cmm.between(0, 59)
+        if valid_compact.any():
+            out.loc[compact_valid.index[valid_compact]] = compact_valid.loc[valid_compact].str.slice(0, 2) + ":" + compact_valid.loc[valid_compact].str.slice(2, 4)
+
+    return out
 
 
 def _pick_column(df: pd.DataFrame, names: list[str]) -> str | None:
@@ -120,6 +141,8 @@ def _process_5min_file(csv_file: Path) -> dict[str, list[pd.DataFrame]]:
     try:
         df = pd.read_csv(
             csv_file,
+            sep=None,
+            engine="python",
             usecols=lambda c: c in usecols,
         )
     except Exception:

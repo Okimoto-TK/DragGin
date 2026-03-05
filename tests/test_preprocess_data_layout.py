@@ -162,5 +162,31 @@ def test_preprocess_handles_non_hhmm_time_without_crash(tmp_path: Path) -> None:
     preprocess(raw, out)
 
     m5 = pd.read_parquet(out / "AAA" / "5min.parquet")
-    assert m5["time"].tolist() == ["9:35"]
-    assert len(m5) == 1
+    assert m5["time"].tolist() == ["09:35", "09:35"]
+    assert len(m5) == 2
+
+def test_preprocess_accepts_datetime_trade_time(tmp_path: Path) -> None:
+    raw = tmp_path / "raw"
+    out = tmp_path / "out"
+    raw.mkdir()
+    out.mkdir()
+
+    pd.DataFrame(
+        {
+            "code": ["000001.SZ"],
+            "trade_time": ["2026/1/5 9:35"],
+            "close": [11.45],
+            "open": [11.44],
+            "high": [11.47],
+            "low": [11.42],
+            "vol": [5309408],
+            "date": ["20260105"],
+        }
+    ).to_csv(raw / "bars.csv", index=False, sep="\t")
+
+    preprocess(raw, out)
+
+    m5 = pd.read_parquet(out / "000001.SZ" / "5min.parquet")
+    assert m5["time"].tolist() == ["09:35"]
+    assert m5["open"].tolist() == [11.44]
+
