@@ -116,3 +116,25 @@ def test_preprocess_writes_st_parquet_from_namechange(tmp_path: Path, monkeypatc
     assert st["start_date"].astype(str).tolist() == ["2024-01-02"]
     assert st["revoke_st_date"].astype(str).tolist() == ["2024-01-10"]
     assert not (out / "BBB" / "st.parquet").exists()
+
+
+
+def test_build_st_markers_handles_st_starst_transitions() -> None:
+    namechange = pd.DataFrame(
+        {
+            "ts_code": ["AAA", "AAA", "AAA", "BBB", "BBB", "CCC"],
+            "name": ["STAAA", "*STAAA", "AAA", "*STBBB", "BBB", "BBBST"],
+            "start_date": ["20240101", "20240301", "20240501", "20240201", "20240601", "20240102"],
+            "end_date": ["20240229", "20240430", None, "20240531", None, "20240110"],
+        }
+    )
+
+    st_df = preprocess_data._build_st_markers(namechange)
+
+    assert st_df["code"].tolist() == ["AAA", "AAA", "BBB"]
+    assert st_df["st_type"].tolist() == ["ST", "*ST", "*ST"]
+    assert st_df["start_date"].astype(str).tolist() == ["2024-01-01", "2024-03-01", "2024-02-01"]
+    # ST撤销、*ST撤销时间来自对应记录的end_date
+    assert st_df["revoke_st_date"].astype(str).tolist() == ["2024-02-29", "2024-04-30", "2024-05-31"]
+    # 非前缀名称不应被误判为ST
+    assert "CCC" not in st_df["code"].tolist()
