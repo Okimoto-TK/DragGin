@@ -19,7 +19,13 @@ except ImportError:  # pragma: no cover
 
 
 def _normalize_trade_date(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, format="%Y%m%d", errors="coerce")
+    s = series.astype("string").str.strip()
+    dt = pd.to_datetime(s, format="%Y%m%d", errors="coerce")
+    missing = dt.isna()
+    if missing.any():
+        dt2 = pd.to_datetime(s[missing], errors="coerce")
+        dt.loc[missing] = dt2
+    return dt
 
 
 def _detect_csv_sep(path: Path) -> str:
