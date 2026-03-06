@@ -213,12 +213,14 @@ def build_train_dataset(
     include_invalid: bool = False,
     num_workers: int = 1,
     show_progress: bool = True,
+    shard_tmp_dir: str | Path | None = None,
 ) -> TrainDatasetBundle:
     selected_codes = resolve_codes(data_dir, codes)
     selected_asof_dates = resolve_asof_dates(data_dir, asof_dates)
 
     asof_tuple = tuple(selected_asof_dates)
-    with tempfile.TemporaryDirectory(prefix="train_dataset_shards_") as shard_dir:
+    tmp_root = None if shard_tmp_dir is None else str(Path(shard_tmp_dir))
+    with tempfile.TemporaryDirectory(prefix="train_dataset_shards_", dir=tmp_root) as shard_dir:
         shard_infos: list[dict] = []
         if num_workers <= 1:
             iterator = _iter_progress(selected_codes, total=len(selected_codes), show_progress=show_progress, desc="building train dataset")

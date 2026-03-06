@@ -19,6 +19,7 @@ def main() -> None:
     parser.add_argument("--include-invalid", type=int, choices=[0, 1], default=0)
     parser.add_argument("--num-workers", type=int, default=1, help="number of worker processes")
     parser.add_argument("--show-progress", type=int, choices=[0, 1], default=1, help="show progress bar")
+    parser.add_argument("--shard-tmp-dir", default="", help="temporary directory for per-code shard files; empty uses system default")
     args = parser.parse_args()
 
     raw_codes = _split_csv(args.codes)
@@ -32,6 +33,7 @@ def main() -> None:
         include_invalid=bool(args.include_invalid),
         num_workers=max(1, int(args.num_workers)),
         show_progress=bool(args.show_progress),
+        shard_tmp_dir=(args.shard_tmp_dir or None),
     )
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -46,6 +48,7 @@ def main() -> None:
     print(f"X_mezzo: {bundle.X_mezzo.shape}")
     print(f"X_macro: {bundle.X_macro.shape}")
     print(f"y: {bundle.y.shape}, loss_mask_true: {int(bundle.loss_mask.sum())}")
+    print(f"shard_tmp_dir: {args.shard_tmp_dir or '<system_temp>'}")
 
 
 if __name__ == "__main__":
