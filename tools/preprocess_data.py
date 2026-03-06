@@ -19,7 +19,13 @@ except ImportError:  # pragma: no cover
 
 
 def _normalize_trade_date(series: pd.Series) -> pd.Series:
-    return pd.to_datetime(series, format="%Y%m%d", errors="coerce")
+    s = series.astype("string").str.strip()
+    dt = pd.to_datetime(s, format="%Y%m%d", errors="coerce")
+    missing = dt.isna()
+    if missing.any():
+        dt2 = pd.to_datetime(s[missing], errors="coerce")
+        dt.loc[missing] = dt2
+    return dt
 
 
 def _detect_csv_sep(path: Path) -> str:
@@ -421,6 +427,12 @@ def preprocess(raw_dir: Path, out_dir: Path, max_workers: int = 4) -> None:
     if all_calendar_dates:
         calendar = pd.DataFrame({"trade_date": sorted(all_calendar_dates)})
         calendar.to_parquet(out_dir / "calendar.parquet", index=False)
+
+        min_trade_date = pd.to_datetime(calendar["trade_date"].min())
+        max_trade_date = pd.to_datetime(calendar["trade_date"].max())
+        namechange = _fetch_namechange(min_trade_date, max_trade_date)
+        breakpoints = _build_st_breakpoints(namechange)
+        _write_breakpoint_files(breakpoints, out_dir)
 
 
 if __name__ == "__main__":
