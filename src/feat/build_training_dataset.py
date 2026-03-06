@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from concurrent.futures import ProcessPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 import tempfile
@@ -79,6 +79,15 @@ def _iter_progress(iterable, total: int, show_progress: bool, desc: str):
     return iterable
 
 
+INNER_BUILD_THREADS = 64
+
+
+def _build_one_asof(data_dir: str | Path, code: str, asof: str) -> tuple[str, object, object]:
+    dp = build_multiscale_tensors(data_dir, code, asof)
+    lb = build_label_from_data_dir(data_dir, code, asof, dp_ok=dp.dp_ok)
+    return asof, dp, lb
+
+
 def _rows_from_code_task(
     data_dir: str | Path,
     code: str,
@@ -102,10 +111,16 @@ def _rows_from_code_task(
     label_ok = np.zeros((n,), dtype=np.bool_)
     loss_mask = np.zeros((n,), dtype=np.bool_)
 
+    build_results: dict[str, tuple[object, object]] = {}
+    with ThreadPoolExecutor(max_workers=INNER_BUILD_THREADS) as executor:
+        futures = [executor.submit(_build_one_asof, data_dir, code, asof) for asof in selected_asof_dates]
+        for fut in as_completed(futures):
+            asof, dp, lb = fut.result()
+            build_results[asof] = (dp, lb)
+
     write_idx = 0
     for asof in selected_asof_dates:
-        dp = build_multiscale_tensors(data_dir, code, asof)
-        lb = build_label_from_data_dir(data_dir, code, asof, dp_ok=dp.dp_ok)
+        dp, lb = build_results[asof]
         if (not include_invalid) and (not lb.loss_mask):
             continue
 

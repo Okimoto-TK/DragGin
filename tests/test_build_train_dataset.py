@@ -155,3 +155,51 @@ def test_progress_wrapper_uses_tqdm(monkeypatch):
         show_progress=True,
     )
     assert called["v"]
+
+
+def test_rows_from_code_task_uses_fixed_inner_threads(monkeypatch, tmp_path):
+    from src.feat import build_training_dataset as btd
+
+    captured = {"max_workers": None}
+
+    class FakeFuture:
+        def __init__(self, value):
+            self._value = value
+
+        def result(self):
+            return self._value
+
+    class FakeThreadExecutor:
+        def __init__(self, max_workers):
+            captured["max_workers"] = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            return FakeFuture(fn(*args, **kwargs))
+
+    def fake_build_multiscale_tensors(data_dir, code, asof):
+        return _dp(dp_ok=True)
+
+    def fake_build_label_from_data_dir(data_dir, code, asof_date, dp_ok=True):
+        return _lb(label_ok=True, loss_mask=True)
+
+    monkeypatch.setattr(btd, "build_multiscale_tensors", fake_build_multiscale_tensors)
+    monkeypatch.setattr(btd, "build_label_from_data_dir", fake_build_label_from_data_dir)
+    monkeypatch.setattr(btd, "ThreadPoolExecutor", FakeThreadExecutor)
+    monkeypatch.setattr(btd, "as_completed", lambda futures: futures)
+
+    out = btd._rows_from_code_task(
+        data_dir=".",
+        code="AAA",
+        selected_asof_dates=("2024-01-02", "2024-01-03"),
+        include_invalid=False,
+        shard_dir=str(tmp_path),
+    )
+
+    assert out["rows"] == 2
+    assert captured["max_workers"] == 64
