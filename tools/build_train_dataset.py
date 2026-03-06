@@ -29,10 +29,12 @@ def main() -> None:
     codes = resolve_codes(args.data_dir, raw_codes or None)
     asof_dates = resolve_asof_dates(args.data_dir, raw_asof_dates or None)
     selected_codes = codes
+    num_workers = max(1, int(args.num_workers))
     if args.benchmark:
         build_multiscale_tensor.enable_benchmark()
         labels_risk_adj.enable_benchmark()
         selected_codes = codes[:1]
+        num_workers = 1
         print(f"benchmark mode enabled: running only first code: {selected_codes[0] if selected_codes else '<none>'}")
 
     bundle = build_train_dataset(
@@ -40,7 +42,7 @@ def main() -> None:
         codes=selected_codes,
         asof_dates=asof_dates,
         include_invalid=bool(args.include_invalid),
-        num_workers=max(1, int(args.num_workers)),
+        num_workers=num_workers,
         show_progress=bool(args.show_progress),
         shard_tmp_dir=(args.shard_tmp_dir or None),
     )
@@ -51,7 +53,7 @@ def main() -> None:
     print(f"saved: {out}")
     print(f"codes: {len(selected_codes)}")
     print(f"asof_dates: {len(asof_dates)}")
-    print(f"workers: {max(1, int(args.num_workers))}")
+    print(f"workers: {num_workers}")
     print(f"samples: {len(bundle.y)}")
     print(f"X_micro: {bundle.X_micro.shape}")
     print(f"X_mezzo: {bundle.X_mezzo.shape}")
@@ -61,13 +63,19 @@ def main() -> None:
 
     if args.benchmark:
         print("benchmark summary (build_multiscale_tensor):")
-        for row in build_multiscale_tensor.get_benchmark_report():
+        tensor_rows = build_multiscale_tensor.get_benchmark_report()
+        if not tensor_rows:
+            print("  <no benchmark data collected>")
+        for row in tensor_rows:
             print(
                 f"  {row['function']}: count={int(row['count'])}, total={row['total_ms']:.3f}ms, "
                 f"avg={row['avg_ms']:.3f}ms, min={row['min_ms']:.3f}ms, max={row['max_ms']:.3f}ms"
             )
         print("benchmark summary (labels_risk_adj):")
-        for row in labels_risk_adj.get_benchmark_report():
+        label_rows = labels_risk_adj.get_benchmark_report()
+        if not label_rows:
+            print("  <no benchmark data collected>")
+        for row in label_rows:
             print(
                 f"  {row['function']}: count={int(row['count'])}, total={row['total_ms']:.3f}ms, "
                 f"avg={row['avg_ms']:.3f}ms, min={row['min_ms']:.3f}ms, max={row['max_ms']:.3f}ms"
