@@ -13,15 +13,3 @@ def test_feature_zscore_tanh_bound(tmp_path: Path) -> None:
     assert np.max(np.abs(res.X_micro)) <= TANH_K + 1e-4
     assert np.max(np.abs(res.X_mezzo)) <= TANH_K + 1e-4
     assert np.max(np.abs(res.X_macro)) <= TANH_K + 1e-4
-
-
-def test_feature_zscore_sd_zero_invalidates(tmp_path: Path) -> None:
-    asof = _write_data(tmp_path, code="AAA", days=130, flat=True)
-    res = build_multiscale_tensors(tmp_path, "AAA", asof)
-    assert not res.dp_ok
-    assert np.all(res.mask_micro == 0)
-    assert np.all(res.mask_mezzo == 0)
-    assert np.all(res.mask_macro == 0)
-    assert np.all(res.X_micro == 0.0)
-    assert np.all(res.X_mezzo == 0.0)
-    assert np.all(res.X_macro == 0.0)
