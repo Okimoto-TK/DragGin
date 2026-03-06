@@ -114,7 +114,7 @@ def load_daily_data(data_dir: str | Path, code: str) -> pd.DataFrame:
         return pd.DataFrame()
     out["trade_date"] = pd.to_datetime(out["trade_date"]).dt.date
     out["volume"] = pd.to_numeric(out["volume"], errors="coerce")
-    out = out[(out["volume"] > 0) & np.isfinite(out["volume"])]
+    out = out[np.isfinite(out["volume"])]
     out = out.drop_duplicates(subset=["trade_date"], keep="last").sort_values("trade_date").reset_index(drop=True)
     return out
 
@@ -275,6 +275,11 @@ def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) ->
         return empty_result(code, asof_date, "missing/invalid 5m raw schema")
     if not _validate_raw(d1):
         return empty_result(code, asof_date, "missing/invalid daily raw schema")
+
+    trade_dates = set(d1["trade_date"].tolist())
+    m5 = m5[m5["trade_date"].isin(trade_dates)].copy()
+    if not _validate_raw(m5):
+        return empty_result(code, asof_date, "missing/invalid 5m raw schema")
 
     adj_factor_by_date, adj_err = _build_adj_factor_map(d1)
     if adj_factor_by_date is None:

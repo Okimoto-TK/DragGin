@@ -152,13 +152,15 @@ def build_label_for_sample(
 
     daily = daily.copy()
     daily["trade_date"] = pd.to_datetime(daily["trade_date"]).dt.date
+    suspended_dates: set[pd.Timestamp | object] = set()
     if "volume" in daily.columns:
         daily["volume"] = pd.to_numeric(daily["volume"], errors="coerce")
+        suspended_dates = set(daily.loc[(daily["volume"] <= 0) | (~np.isfinite(daily["volume"])), "trade_date"].tolist())
         daily = daily[(daily["volume"] > 0) & np.isfinite(daily["volume"])]
     daily = daily.drop_duplicates(subset=["trade_date"], keep="last").sort_values("trade_date")
     by_date = daily.set_index("trade_date")
 
-    trading_calendar_dates = [d for d in calendar_dates if d in by_date.index]
+    trading_calendar_dates = [d for d in calendar_dates if d not in suspended_dates]
     if asof not in trading_calendar_dates:
         return _fail(code, asof_date, dp_ok, "asof date not in trading calendar")
 
