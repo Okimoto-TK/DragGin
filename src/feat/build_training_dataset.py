@@ -35,6 +35,25 @@ class TrainDatasetBundle:
     loss_mask: np.ndarray
 
 
+def _empty_bundle() -> TrainDatasetBundle:
+    return TrainDatasetBundle(
+        codes=np.asarray([], dtype=object),
+        asof_dates=np.asarray([], dtype=object),
+        X_micro=np.zeros((0, 48, 6), dtype=np.float32),
+        X_mezzo=np.zeros((0, 40, 6), dtype=np.float32),
+        X_macro=np.zeros((0, 30, 6), dtype=np.float32),
+        mask_micro=np.zeros((0, 48), dtype=np.uint8),
+        mask_mezzo=np.zeros((0, 40), dtype=np.uint8),
+        mask_macro=np.zeros((0, 30), dtype=np.uint8),
+        y=np.zeros((0,), dtype=np.float32),
+        y_raw=np.zeros((0,), dtype=np.float32),
+        y_z=np.zeros((0,), dtype=np.float32),
+        dp_ok=np.zeros((0,), dtype=np.bool_),
+        label_ok=np.zeros((0,), dtype=np.bool_),
+        loss_mask=np.zeros((0,), dtype=np.bool_),
+    )
+
+
 def resolve_codes(data_dir: str | Path, codes: list[str] | None = None) -> list[str]:
     if codes:
         return [c for c in codes if c]
@@ -54,68 +73,10 @@ def resolve_asof_dates(data_dir: str | Path, asof_dates: list[str] | None = None
     return build_calendar_from_daily_filenames(data_dir)
 
 
-def _row_from_task(data_dir: str | Path, code: str, asof: str, include_invalid: bool) -> dict | None:
-    dp = build_multiscale_tensors(data_dir, code, asof)
-    lb = build_label_from_data_dir(data_dir, code, asof, dp_ok=dp.dp_ok)
-    if (not include_invalid) and (not lb.loss_mask):
-        return None
-    return {
-        "code": code,
-        "asof": asof,
-        "X_micro": dp.X_micro.astype(np.float32),
-        "X_mezzo": dp.X_mezzo.astype(np.float32),
-        "X_macro": dp.X_macro.astype(np.float32),
-        "mask_micro": dp.mask_micro.astype(np.uint8),
-        "mask_mezzo": dp.mask_mezzo.astype(np.uint8),
-        "mask_macro": dp.mask_macro.astype(np.uint8),
-        "y": np.float32(lb.y),
-        "y_raw": np.float32(lb.y_raw),
-        "y_z": np.float32(lb.y_z),
-        "dp_ok": bool(dp.dp_ok),
-        "label_ok": bool(lb.label_ok),
-        "loss_mask": bool(lb.loss_mask),
-    }
-
-
-def _save_rows_to_shard(rows: list[dict], shard_path: Path) -> str:
-    if not rows:
-        np.savez_compressed(
-            shard_path,
-            codes=np.asarray([], dtype=object),
-            asof_dates=np.asarray([], dtype=object),
-            X_micro=np.zeros((0, 48, 6), dtype=np.float32),
-            X_mezzo=np.zeros((0, 40, 6), dtype=np.float32),
-            X_macro=np.zeros((0, 30, 6), dtype=np.float32),
-            mask_micro=np.zeros((0, 48), dtype=np.uint8),
-            mask_mezzo=np.zeros((0, 40), dtype=np.uint8),
-            mask_macro=np.zeros((0, 30), dtype=np.uint8),
-            y=np.zeros((0,), dtype=np.float32),
-            y_raw=np.zeros((0,), dtype=np.float32),
-            y_z=np.zeros((0,), dtype=np.float32),
-            dp_ok=np.zeros((0,), dtype=np.bool_),
-            label_ok=np.zeros((0,), dtype=np.bool_),
-            loss_mask=np.zeros((0,), dtype=np.bool_),
-        )
-        return str(shard_path)
-
-    np.savez_compressed(
-        shard_path,
-        codes=np.asarray([r["code"] for r in rows], dtype=object),
-        asof_dates=np.asarray([r["asof"] for r in rows], dtype=object),
-        X_micro=np.stack([r["X_micro"] for r in rows], axis=0),
-        X_mezzo=np.stack([r["X_mezzo"] for r in rows], axis=0),
-        X_macro=np.stack([r["X_macro"] for r in rows], axis=0),
-        mask_micro=np.stack([r["mask_micro"] for r in rows], axis=0),
-        mask_mezzo=np.stack([r["mask_mezzo"] for r in rows], axis=0),
-        mask_macro=np.stack([r["mask_macro"] for r in rows], axis=0),
-        y=np.asarray([r["y"] for r in rows], dtype=np.float32),
-        y_raw=np.asarray([r["y_raw"] for r in rows], dtype=np.float32),
-        y_z=np.asarray([r["y_z"] for r in rows], dtype=np.float32),
-        dp_ok=np.asarray([r["dp_ok"] for r in rows], dtype=np.bool_),
-        label_ok=np.asarray([r["label_ok"] for r in rows], dtype=np.bool_),
-        loss_mask=np.asarray([r["loss_mask"] for r in rows], dtype=np.bool_),
-    )
-    return str(shard_path)
+def _iter_progress(iterable, total: int, show_progress: bool, desc: str):
+    if show_progress and tqdm is not None:
+        return tqdm(iterable, total=total, desc=desc)
+    return iterable
 
 
 def _rows_from_code_task(
@@ -124,7 +85,7 @@ def _rows_from_code_task(
     selected_asof_dates: tuple[str, ...],
     include_invalid: bool,
     shard_dir: str,
-) -> str:
+) -> dict:
     data_dir_key = str(Path(data_dir).resolve())
     filtered_asofs = selected_asof_dates
     if not include_invalid:
@@ -134,67 +95,98 @@ def _rows_from_code_task(
         if both_valid:
             filtered_asofs = tuple(a for a in selected_asof_dates if a in both_valid)
 
-    rows: list[dict] = []
+    n = len(filtered_asofs)
+    codes = np.empty((n,), dtype=object)
+    asof_dates = np.empty((n,), dtype=object)
+    X_micro = np.zeros((n, 48, 6), dtype=np.float32)
+    X_mezzo = np.zeros((n, 40, 6), dtype=np.float32)
+    X_macro = np.zeros((n, 30, 6), dtype=np.float32)
+    mask_micro = np.zeros((n, 48), dtype=np.uint8)
+    mask_mezzo = np.zeros((n, 40), dtype=np.uint8)
+    mask_macro = np.zeros((n, 30), dtype=np.uint8)
+    y = np.zeros((n,), dtype=np.float32)
+    y_raw = np.zeros((n,), dtype=np.float32)
+    y_z = np.zeros((n,), dtype=np.float32)
+    dp_ok = np.zeros((n,), dtype=np.bool_)
+    label_ok = np.zeros((n,), dtype=np.bool_)
+    loss_mask = np.zeros((n,), dtype=np.bool_)
+
+    write_idx = 0
     for asof in filtered_asofs:
-        row = _row_from_task(data_dir, code, asof, include_invalid)
-        if row is not None:
-            rows.append(row)
+        dp = build_multiscale_tensors(data_dir, code, asof)
+        lb = build_label_from_data_dir(data_dir, code, asof, dp_ok=dp.dp_ok)
+        if (not include_invalid) and (not lb.loss_mask):
+            continue
+
+        codes[write_idx] = code
+        asof_dates[write_idx] = asof
+        X_micro[write_idx] = dp.X_micro.astype(np.float32)
+        X_mezzo[write_idx] = dp.X_mezzo.astype(np.float32)
+        X_macro[write_idx] = dp.X_macro.astype(np.float32)
+        mask_micro[write_idx] = dp.mask_micro.astype(np.uint8)
+        mask_mezzo[write_idx] = dp.mask_mezzo.astype(np.uint8)
+        mask_macro[write_idx] = dp.mask_macro.astype(np.uint8)
+        y[write_idx] = np.float32(lb.y)
+        y_raw[write_idx] = np.float32(lb.y_raw)
+        y_z[write_idx] = np.float32(lb.y_z)
+        dp_ok[write_idx] = bool(dp.dp_ok)
+        label_ok[write_idx] = bool(lb.label_ok)
+        loss_mask[write_idx] = bool(lb.loss_mask)
+        write_idx += 1
+
     shard_path = Path(shard_dir) / f"{code}.npz"
-    return _save_rows_to_shard(rows, shard_path)
+    np.savez(
+        shard_path,
+        codes=codes[:write_idx],
+        asof_dates=asof_dates[:write_idx],
+        X_micro=X_micro[:write_idx],
+        X_mezzo=X_mezzo[:write_idx],
+        X_macro=X_macro[:write_idx],
+        mask_micro=mask_micro[:write_idx],
+        mask_mezzo=mask_mezzo[:write_idx],
+        mask_macro=mask_macro[:write_idx],
+        y=y[:write_idx],
+        y_raw=y_raw[:write_idx],
+        y_z=y_z[:write_idx],
+        dp_ok=dp_ok[:write_idx],
+        label_ok=label_ok[:write_idx],
+        loss_mask=loss_mask[:write_idx],
+    )
+    return {"path": str(shard_path), "rows": int(write_idx)}
 
 
-def _iter_progress(iterable, total: int, show_progress: bool, desc: str):
-    if show_progress and tqdm is not None:
-        return tqdm(iterable, total=total, desc=desc)
-    return iterable
+def _merge_shards(shard_infos: list[dict]) -> TrainDatasetBundle:
+    if not shard_infos:
+        return _empty_bundle()
 
-
-def _merge_shards(shard_paths: list[str]) -> TrainDatasetBundle:
-    if not shard_paths:
-        return TrainDatasetBundle(
-            codes=np.asarray([], dtype=object),
-            asof_dates=np.asarray([], dtype=object),
-            X_micro=np.zeros((0, 48, 6), dtype=np.float32),
-            X_mezzo=np.zeros((0, 40, 6), dtype=np.float32),
-            X_macro=np.zeros((0, 30, 6), dtype=np.float32),
-            mask_micro=np.zeros((0, 48), dtype=np.uint8),
-            mask_mezzo=np.zeros((0, 40), dtype=np.uint8),
-            mask_macro=np.zeros((0, 30), dtype=np.uint8),
-            y=np.zeros((0,), dtype=np.float32),
-            y_raw=np.zeros((0,), dtype=np.float32),
-            y_z=np.zeros((0,), dtype=np.float32),
-            dp_ok=np.zeros((0,), dtype=np.bool_),
-            label_ok=np.zeros((0,), dtype=np.bool_),
-            loss_mask=np.zeros((0,), dtype=np.bool_),
-        )
+    if sum(int(x.get("rows", 0)) for x in shard_infos) == 0:
+        return _empty_bundle()
 
     parts: dict[str, list[np.ndarray]] = {
-        "codes": [], "asof_dates": [], "X_micro": [], "X_mezzo": [], "X_macro": [],
-        "mask_micro": [], "mask_mezzo": [], "mask_macro": [], "y": [], "y_raw": [],
-        "y_z": [], "dp_ok": [], "label_ok": [], "loss_mask": [],
+        "codes": [],
+        "asof_dates": [],
+        "X_micro": [],
+        "X_mezzo": [],
+        "X_macro": [],
+        "mask_micro": [],
+        "mask_mezzo": [],
+        "mask_macro": [],
+        "y": [],
+        "y_raw": [],
+        "y_z": [],
+        "dp_ok": [],
+        "label_ok": [],
+        "loss_mask": [],
     }
-    for p in shard_paths:
-        with np.load(p, allow_pickle=True) as d:
+    for info in shard_infos:
+        if int(info.get("rows", 0)) <= 0:
+            continue
+        with np.load(info["path"], allow_pickle=True) as d:
             for k in parts:
                 parts[k].append(d[k])
 
-    if sum(arr.shape[0] for arr in parts["y"]) == 0:
-        return TrainDatasetBundle(
-            codes=np.asarray([], dtype=object),
-            asof_dates=np.asarray([], dtype=object),
-            X_micro=np.zeros((0, 48, 6), dtype=np.float32),
-            X_mezzo=np.zeros((0, 40, 6), dtype=np.float32),
-            X_macro=np.zeros((0, 30, 6), dtype=np.float32),
-            mask_micro=np.zeros((0, 48), dtype=np.uint8),
-            mask_mezzo=np.zeros((0, 40), dtype=np.uint8),
-            mask_macro=np.zeros((0, 30), dtype=np.uint8),
-            y=np.zeros((0,), dtype=np.float32),
-            y_raw=np.zeros((0,), dtype=np.float32),
-            y_z=np.zeros((0,), dtype=np.float32),
-            dp_ok=np.zeros((0,), dtype=np.bool_),
-            label_ok=np.zeros((0,), dtype=np.bool_),
-            loss_mask=np.zeros((0,), dtype=np.bool_),
-        )
+    if not parts["y"]:
+        return _empty_bundle()
 
     return TrainDatasetBundle(
         codes=np.concatenate(parts["codes"]).astype(object),
@@ -227,11 +219,11 @@ def build_train_dataset(
 
     asof_tuple = tuple(selected_asof_dates)
     with tempfile.TemporaryDirectory(prefix="train_dataset_shards_") as shard_dir:
-        shard_paths: list[str] = []
+        shard_infos: list[dict] = []
         if num_workers <= 1:
             iterator = _iter_progress(selected_codes, total=len(selected_codes), show_progress=show_progress, desc="building train dataset")
             for code in iterator:
-                shard_paths.append(_rows_from_code_task(data_dir, code, asof_tuple, include_invalid, shard_dir))
+                shard_infos.append(_rows_from_code_task(data_dir, code, asof_tuple, include_invalid, shard_dir))
         else:
             with ProcessPoolExecutor(max_workers=num_workers) as executor:
                 futures = [
@@ -240,9 +232,9 @@ def build_train_dataset(
                 ]
                 progress_iter = _iter_progress(as_completed(futures), total=len(futures), show_progress=show_progress, desc="building train dataset")
                 for fut in progress_iter:
-                    shard_paths.append(fut.result())
+                    shard_infos.append(fut.result())
 
-        return _merge_shards(shard_paths)
+        return _merge_shards(shard_infos)
 
 
 def save_train_dataset(bundle: TrainDatasetBundle, out_npz: str | Path) -> None:
