@@ -47,6 +47,15 @@ def _record_timing(timings: TimingStats | None, name: str, elapsed: float) -> No
     stat["count"] += 1.0
 
 
+def _merge_timing_stats(dst: TimingStats | None, src: TimingStats | None) -> None:
+    if dst is None or src is None:
+        return
+    for name, stat in src.items():
+        dst_stat = dst.setdefault(name, {"total": 0.0, "count": 0.0})
+        dst_stat["total"] += float(stat.get("total", 0.0))
+        dst_stat["count"] += float(stat.get("count", 0.0))
+
+
 def _timed_call(timings: TimingStats | None, name: str, fn, *args, **kwargs):
     t0 = time.perf_counter()
     out = fn(*args, **kwargs)
@@ -104,8 +113,9 @@ def _rows_from_code_task(
     selected_asof_dates: tuple[str, ...],
     include_invalid: bool,
     shard_dir: str,
-    timings: TimingStats | None = None,
+    benchmark: bool = False,
 ) -> dict:
+    local_timings: TimingStats | None = {} if benchmark else None
     n = len(selected_asof_dates)
     codes = np.empty((n,), dtype=object)
     asof_dates = np.empty((n,), dtype=object)
@@ -123,9 +133,11 @@ def _rows_from_code_task(
     loss_mask = np.zeros((n,), dtype=np.bool_)
 
     write_idx = 0
+    row_task_t0 = time.perf_counter()
     for asof in selected_asof_dates:
-        dp = _timed_call(timings, "build_multiscale_tensors", build_multiscale_tensors, data_dir, code, asof)
-        lb = _timed_call(timings, "build_label_from_data_dir", build_label_from_data_dir, data_dir, code, asof, dp_ok=dp.dp_ok)
+        _record_timing(local_timings, "_rows_from_code_task.iter_asof", 0.0)
+        dp = _timed_call(local_timings, "build_multiscale_tensors", build_multiscale_tensors, data_dir, code, asof)
+        lb = _timed_call(local_timings, "build_label_from_data_dir", build_label_from_data_dir, data_dir, code, asof, dp_ok=dp.dp_ok)
         if (not include_invalid) and (not lb.loss_mask):
             continue
 
@@ -146,7 +158,10 @@ def _rows_from_code_task(
         write_idx += 1
 
     shard_path = Path(shard_dir) / f"{code}.npz"
-    np.savez(
+    _timed_call(
+        local_timings,
+        "np.savez(shard)",
+        np.savez,
         shard_path,
         codes=codes[:write_idx],
         asof_dates=asof_dates[:write_idx],
@@ -163,15 +178,16 @@ def _rows_from_code_task(
         label_ok=label_ok[:write_idx],
         loss_mask=loss_mask[:write_idx],
     )
-    return {"path": str(shard_path), "rows": int(write_idx)}
+    _record_timing(local_timings, "_rows_from_code_task", time.perf_counter() - row_task_t0)
+    return {"path": str(shard_path), "rows": int(write_idx), "timings": local_timings}
 
 
-def _merge_shards(shard_infos: list[dict]) -> TrainDatasetBundle:
+def _merge_shards(shard_infos: list[dict], timings: TimingStats | None = None) -> TrainDatasetBundle:
     if not shard_infos:
-        return _empty_bundle()
+        return _timed_call(timings, "_empty_bundle", _empty_bundle)
 
     if sum(int(x.get("rows", 0)) for x in shard_infos) == 0:
-        return _empty_bundle()
+        return _timed_call(timings, "_empty_bundle", _empty_bundle)
 
     parts: dict[str, list[np.ndarray]] = {
         "codes": [],
@@ -192,14 +208,17 @@ def _merge_shards(shard_infos: list[dict]) -> TrainDatasetBundle:
     for info in shard_infos:
         if int(info.get("rows", 0)) <= 0:
             continue
-        with np.load(info["path"], allow_pickle=True) as d:
+        with _timed_call(timings, "np.load(shard)", np.load, info["path"], allow_pickle=True) as d:
             for k in parts:
                 parts[k].append(d[k])
 
     if not parts["y"]:
-        return _empty_bundle()
+        return _timed_call(timings, "_empty_bundle", _empty_bundle)
 
-    return TrainDatasetBundle(
+    return _timed_call(
+        timings,
+        "concat_bundle_arrays",
+        TrainDatasetBundle,
         codes=np.concatenate(parts["codes"]).astype(object),
         asof_dates=np.concatenate(parts["asof_dates"]).astype(object),
         X_micro=np.concatenate(parts["X_micro"], axis=0).astype(np.float32),
@@ -228,6 +247,7 @@ def build_train_dataset(
     benchmark: bool = False,
     timings: TimingStats | None = None,
 ) -> TrainDatasetBundle:
+    build_t0 = time.perf_counter()
     selected_codes = _timed_call(timings, "resolve_codes", resolve_codes, data_dir, codes)
     selected_asof_dates = _timed_call(timings, "resolve_asof_dates", resolve_asof_dates, data_dir, asof_dates)
 
@@ -237,23 +257,29 @@ def build_train_dataset(
 
     asof_tuple = tuple(selected_asof_dates)
     tmp_root = None if shard_tmp_dir is None else str(Path(shard_tmp_dir))
-    with tempfile.TemporaryDirectory(prefix="train_dataset_shards_", dir=tmp_root) as shard_dir:
+    with _timed_call(timings, "tempfile.TemporaryDirectory", tempfile.TemporaryDirectory, prefix="train_dataset_shards_", dir=tmp_root) as shard_dir:
         shard_infos: list[dict] = []
         if num_workers <= 1:
-            iterator = _iter_progress(selected_codes, total=len(selected_codes), show_progress=show_progress, desc="building train dataset")
+            iterator = _timed_call(timings, "_iter_progress", _iter_progress, selected_codes, len(selected_codes), show_progress, "building train dataset")
             for code in iterator:
-                shard_infos.append(_timed_call(timings, "_rows_from_code_task", _rows_from_code_task, data_dir, code, asof_tuple, include_invalid, shard_dir, timings))
+                shard_info = _rows_from_code_task(data_dir, code, asof_tuple, include_invalid, shard_dir, benchmark=benchmark)
+                shard_infos.append(shard_info)
+                _merge_timing_stats(timings, shard_info.get("timings"))
         else:
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            with _timed_call(timings, "ProcessPoolExecutor", ProcessPoolExecutor, max_workers=num_workers) as executor:
                 futures = [
-                    executor.submit(_rows_from_code_task, data_dir, code, asof_tuple, include_invalid, shard_dir)
+                    _timed_call(timings, "executor.submit(_rows_from_code_task)", executor.submit, _rows_from_code_task, data_dir, code, asof_tuple, include_invalid, shard_dir, benchmark)
                     for code in selected_codes
                 ]
-                progress_iter = _iter_progress(as_completed(futures), total=len(futures), show_progress=show_progress, desc="building train dataset")
+                progress_iter = _timed_call(timings, "_iter_progress", _iter_progress, as_completed(futures), len(futures), show_progress, "building train dataset")
                 for fut in progress_iter:
-                    shard_infos.append(fut.result())
+                    shard_info = _timed_call(timings, "future.result", fut.result)
+                    shard_infos.append(shard_info)
+                    _merge_timing_stats(timings, shard_info.get("timings"))
 
-        return _timed_call(timings, "_merge_shards", _merge_shards, shard_infos)
+        out = _timed_call(timings, "_merge_shards", _merge_shards, shard_infos, timings)
+        _record_timing(timings, "build_train_dataset", time.perf_counter() - build_t0)
+        return out
 
 
 def save_train_dataset(bundle: TrainDatasetBundle, out_npz: str | Path) -> None:
