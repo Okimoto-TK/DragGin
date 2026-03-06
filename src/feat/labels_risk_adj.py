@@ -84,6 +84,11 @@ def _compute_raw_label_for_idx(
     idx: int,
     calendar_dates: list,
     by_date: pd.DataFrame,
+    adj_open_np: np.ndarray,
+    adj_close_np: np.ndarray,
+    daily_log_ret: np.ndarray,
+    vol30_by_idx: np.ndarray,
+    date_to_pos: dict,
 ) -> tuple[bool, float | None, dict, str | None]:
     if idx + 3 >= len(calendar_dates):
         return False, None, {}, "future calendar coverage missing for T+3"
@@ -94,48 +99,30 @@ def _compute_raw_label_for_idx(
     exit_d = calendar_dates[idx + 3]
     asof_d = calendar_dates[idx]
 
-    if "adj_factor" not in by_date.columns:
-        return False, None, {}, "daily missing adj_factor"
-    if asof_d not in by_date.index:
+    asof_pos = date_to_pos.get(asof_d)
+    if asof_pos is None:
         return False, None, {}, f"missing asof daily row on {asof_d.isoformat()}"
-    asof_factor = float(by_date.at[asof_d, "adj_factor"])
-    if not np.isfinite(asof_factor) or asof_factor <= 0:
-        return False, None, {}, f"invalid asof adj_factor on {asof_d.isoformat()}"
 
-    required_close_dates = calendar_dates[idx - VOL_WINDOW : idx + 1]
-    for d in required_close_dates:
-        if d not in by_date.index:
+    for d in calendar_dates[idx - VOL_WINDOW : idx + 1]:
+        if date_to_pos.get(d) is None:
             return False, None, {}, f"missing close for vol30 date {d.isoformat()}"
-        f = float(by_date.at[d, "adj_factor"])
-        if not np.isfinite(f) or f <= 0:
-            return False, None, {}, f"invalid adj_factor for vol30 date {d.isoformat()}"
-        c = by_date.at[d, "close"]
-        if not np.isfinite(c) or c <= 0:
-            return False, None, {}, f"invalid close for vol30 date {d.isoformat()}"
 
-    if entry_d not in by_date.index:
+    entry_pos = date_to_pos.get(entry_d)
+    if entry_pos is None:
         return False, None, {}, f"missing entry open on {entry_d.isoformat()}"
-    entry_factor = float(by_date.at[entry_d, "adj_factor"])
-    if not np.isfinite(entry_factor) or entry_factor <= 0:
-        return False, None, {}, f"invalid entry adj_factor on {entry_d.isoformat()}"
-    entry_open = float(by_date.at[entry_d, "open"]) * (entry_factor / asof_factor)
+    entry_open = float(adj_open_np[entry_pos])
     if not np.isfinite(entry_open) or entry_open <= 0:
         return False, None, {}, f"invalid entry open on {entry_d.isoformat()}"
 
-    if exit_d not in by_date.index:
+    exit_pos = date_to_pos.get(exit_d)
+    if exit_pos is None:
         return False, None, {}, f"missing exit close on {exit_d.isoformat()}"
-    exit_factor = float(by_date.at[exit_d, "adj_factor"])
-    if not np.isfinite(exit_factor) or exit_factor <= 0:
-        return False, None, {}, f"invalid exit adj_factor on {exit_d.isoformat()}"
-    exit_close = float(by_date.at[exit_d, "close"]) * (exit_factor / asof_factor)
+    exit_close = float(adj_close_np[exit_pos])
     if not np.isfinite(exit_close) or exit_close <= 0:
         return False, None, {}, f"invalid exit close on {exit_d.isoformat()}"
 
-    closes = by_date.loc[required_close_dates, ["close", "adj_factor"]].reset_index()
-    closes["close"] = closes["close"].astype(float) * (closes["adj_factor"].astype(float) / asof_factor)
-    closes = closes[["trade_date", "close"]]
-    returns = compute_daily_log_returns(closes)
-    vol30 = float(rolling_std_last_n(returns, n=VOL_WINDOW).iloc[-1])
+    _ = daily_log_ret  # precomputed in context for consistency and future reuse
+    vol30 = float(vol30_by_idx[idx])
     if not np.isfinite(vol30) or vol30 <= 0:
         return False, None, {}, "vol30 unavailable/invalid"
 
@@ -150,6 +137,40 @@ def _compute_raw_label_for_idx(
         "ret_log": ret_log,
     }
     return True, y_raw, details, None
+
+
+def _precompute_label_arrays(calendar_dates: list, by_date: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
+    n = len(calendar_dates)
+    adj_open_np = np.full((n,), np.nan, dtype=np.float64)
+    adj_close_np = np.full((n,), np.nan, dtype=np.float64)
+    date_to_pos = {d: i for i, d in enumerate(calendar_dates)}
+
+    if "adj_factor" not in by_date.columns:
+        return adj_open_np, adj_close_np, np.full((n,), np.nan, dtype=np.float64), np.full((n,), np.nan, dtype=np.float64), date_to_pos
+
+    for i, d in enumerate(calendar_dates):
+        if d not in by_date.index:
+            continue
+        row = by_date.loc[d]
+        adj_factor = float(row["adj_factor"])
+        if not np.isfinite(adj_factor) or adj_factor <= 0:
+            continue
+        open_v = float(row["open"])
+        close_v = float(row["close"])
+        if np.isfinite(open_v) and open_v > 0:
+            adj_open_np[i] = open_v * adj_factor
+        if np.isfinite(close_v) and close_v > 0:
+            adj_close_np[i] = close_v * adj_factor
+
+    daily_log_ret = np.full((n,), np.nan, dtype=np.float64)
+    if n > 1:
+        prev = adj_close_np[:-1]
+        curr = adj_close_np[1:]
+        valid = np.isfinite(prev) & np.isfinite(curr) & (prev > 0) & (curr > 0)
+        daily_log_ret[1:] = np.where(valid, np.log(curr / prev), np.nan)
+    vol30_by_idx = rolling_std_last_n(pd.Series(daily_log_ret), n=VOL_WINDOW).to_numpy(dtype=np.float64)
+
+    return adj_open_np, adj_close_np, daily_log_ret, vol30_by_idx, date_to_pos
 
 
 
@@ -208,13 +229,23 @@ def _build_label_context(data_dir: str, code: str) -> _LabelContext | None:
     by_date = daily.set_index("trade_date")
 
     trading_calendar_dates = tuple(d for d in calendar_dates if d not in suspended_dates)
+    adj_open_np, adj_close_np, daily_log_ret, vol30_by_idx, date_to_pos = _precompute_label_arrays(list(trading_calendar_dates), by_date)
 
     valid_raw_indices: list[int] = []
     valid_raw_values: list[float] = []
     raw_details_by_index: dict[int, dict] = {}
     raw_fail_by_index: dict[int, str] = {}
     for idx in range(len(trading_calendar_dates)):
-        ok_raw, y_raw_val, details, fail_reason = _compute_raw_label_for_idx(idx, trading_calendar_dates, by_date)
+        ok_raw, y_raw_val, details, fail_reason = _compute_raw_label_for_idx(
+            idx,
+            trading_calendar_dates,
+            by_date,
+            adj_open_np,
+            adj_close_np,
+            daily_log_ret,
+            vol30_by_idx,
+            date_to_pos,
+        )
         if ok_raw and y_raw_val is not None and np.isfinite(y_raw_val):
             valid_raw_indices.append(idx)
             valid_raw_values.append(float(y_raw_val))
@@ -307,6 +338,7 @@ def build_label_for_sample(
     by_date = daily.set_index("trade_date")
 
     trading_calendar_dates = [d for d in calendar_dates if d not in suspended_dates]
+    adj_open_np, adj_close_np, daily_log_ret, vol30_by_idx, date_to_pos = _precompute_label_arrays(trading_calendar_dates, by_date)
     if asof not in trading_calendar_dates:
         return _fail(code, asof_date, dp_ok, "asof date not in trading calendar")
 
@@ -316,13 +348,31 @@ def build_label_for_sample(
     if _has_breakpoint_crossing(trading_calendar_dates, window_start_idx, idx + 3, effective_breakpoints):
         return _fail(code, asof_date, dp_ok, "label window crosses st breakpoint")
 
-    ok_raw, y_raw_val, details, fail_reason = _compute_raw_label_for_idx(idx, trading_calendar_dates, by_date)
+    ok_raw, y_raw_val, details, fail_reason = _compute_raw_label_for_idx(
+        idx,
+        trading_calendar_dates,
+        by_date,
+        adj_open_np,
+        adj_close_np,
+        daily_log_ret,
+        vol30_by_idx,
+        date_to_pos,
+    )
     if not ok_raw or y_raw_val is None:
         return _fail(code, asof_date, dp_ok, fail_reason or "raw label build failed")
 
     past_raw_values: list[float] = []
     for pidx in range(idx):
-        ok_past, y_past, _, _ = _compute_raw_label_for_idx(pidx, trading_calendar_dates, by_date)
+        ok_past, y_past, _, _ = _compute_raw_label_for_idx(
+            pidx,
+            trading_calendar_dates,
+            by_date,
+            adj_open_np,
+            adj_close_np,
+            daily_log_ret,
+            vol30_by_idx,
+            date_to_pos,
+        )
         if ok_past and y_past is not None and np.isfinite(y_past):
             past_raw_values.append(float(y_past))
 

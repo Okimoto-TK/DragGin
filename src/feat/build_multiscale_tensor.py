@@ -167,30 +167,43 @@ def _load_market_calendar_dates(data_dir: str) -> tuple[date, ...]:
 
 
 def aggregate_30m_from_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
-    agg_rows = []
-    for d, g in df_5m.groupby("trade_date"):
-        g = g.sort_values("dt")
-        if len(g) != 48:
-            return pd.DataFrame()
-        if g["dt"].duplicated().any():
-            return pd.DataFrame()
-        for i in range(8):
-            chunk = g.iloc[i * 6 : (i + 1) * 6]
-            agg_rows.append(
-                {
-                    "trade_date": d,
-                    "bucket": i,
-                    "dt": chunk.iloc[0]["dt"],
-                    "open": chunk.iloc[0]["open"],
-                    "high": chunk["high"].max(),
-                    "low": chunk["low"].min(),
-                    "close": chunk.iloc[-1]["close"],
-                    "volume": chunk["volume"].sum(),
-                }
-            )
-    if not agg_rows:
+    if df_5m.empty:
         return pd.DataFrame()
-    return pd.DataFrame(agg_rows).sort_values("dt").reset_index(drop=True)
+
+    sorted_df = df_5m.sort_values(["trade_date", "dt"]).reset_index(drop=True)
+    counts = sorted_df.groupby("trade_date", sort=False).size().to_numpy()
+    if len(counts) == 0 or np.any(counts != 48):
+        return pd.DataFrame()
+    if sorted_df.duplicated(subset=["trade_date", "dt"]).any():
+        return pd.DataFrame()
+
+    num_days = len(counts)
+    buckets_per_day = 8
+    bars_per_bucket = 6
+
+    trade_dates = sorted_df["trade_date"].to_numpy().reshape(num_days, 48)[:, 0]
+    dt_arr = sorted_df["dt"].to_numpy().reshape(num_days, buckets_per_day, bars_per_bucket)
+    open_arr = sorted_df["open"].to_numpy(dtype=np.float64).reshape(num_days, buckets_per_day, bars_per_bucket)
+    high_arr = sorted_df["high"].to_numpy(dtype=np.float64).reshape(num_days, buckets_per_day, bars_per_bucket)
+    low_arr = sorted_df["low"].to_numpy(dtype=np.float64).reshape(num_days, buckets_per_day, bars_per_bucket)
+    close_arr = sorted_df["close"].to_numpy(dtype=np.float64).reshape(num_days, buckets_per_day, bars_per_bucket)
+    volume_arr = sorted_df["volume"].to_numpy(dtype=np.float64).reshape(num_days, buckets_per_day, bars_per_bucket)
+
+    out_dict = {
+        "trade_date": np.repeat(trade_dates, buckets_per_day),
+        "bucket": np.tile(np.arange(buckets_per_day, dtype=np.int64), num_days),
+        "dt": dt_arr[:, :, 0].reshape(-1),
+        "open": open_arr[:, :, 0].reshape(-1),
+        "high": high_arr.max(axis=2).reshape(-1),
+        "low": low_arr.min(axis=2).reshape(-1),
+        "close": close_arr[:, :, -1].reshape(-1),
+        "volume": volume_arr.sum(axis=2).reshape(-1),
+    }
+    if "amount" in sorted_df.columns:
+        amount_arr = sorted_df["amount"].to_numpy(dtype=np.float64).reshape(num_days, buckets_per_day, bars_per_bucket)
+        out_dict["amount"] = amount_arr.sum(axis=2).reshape(-1)
+
+    return pd.DataFrame(out_dict).sort_values("dt").reset_index(drop=True)
 
 
 def _compute_features(df: pd.DataFrame) -> pd.DataFrame:
