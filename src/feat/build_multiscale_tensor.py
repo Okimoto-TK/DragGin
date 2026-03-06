@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import re
+from bisect import bisect_left
 from functools import lru_cache
 from dataclasses import dataclass
 from datetime import date
@@ -38,6 +39,16 @@ class DPResult:
     mask_micro: np.ndarray
     mask_mezzo: np.ndarray
     mask_macro: np.ndarray
+
+
+@dataclass
+class _TensorContext:
+    m5: pd.DataFrame
+    m30: pd.DataFrame
+    d1: pd.DataFrame
+    adj_factor_by_date: pd.Series
+    stock_calendar: tuple[date, ...]
+    breakpoints: frozenset[date]
 
 
 def empty_result(code: str, asof_date: str, reason: str) -> DPResult:
@@ -152,6 +163,65 @@ def _load_breakpoints_cached(data_dir: str, code: str) -> tuple[date, ...]:
 @lru_cache(maxsize=16)
 def _load_market_calendar_dates(data_dir: str) -> tuple[date, ...]:
     return tuple(pd.to_datetime(x).date() for x in build_calendar_from_daily_filenames(data_dir))
+
+
+def _apply_base_price_adjustment(
+    df: pd.DataFrame,
+    adj_factor_by_date: pd.Series,
+) -> tuple[Optional[pd.DataFrame], str]:
+    trade_dates = df["trade_date"]
+    mapped = trade_dates.map(adj_factor_by_date)
+    if mapped.isna().any():
+        return None, "missing adj_factor in required history"
+    factors = mapped.astype(float).to_numpy()
+    if (~np.isfinite(factors) | (factors <= 0)).any():
+        return None, "invalid adj_factor ratio"
+
+    out = df.copy()
+    for col in ["open", "high", "low", "close"]:
+        out[col] = out[col].astype(float) * factors
+    return out, ""
+
+
+@lru_cache(maxsize=512)
+def _build_tensor_context(data_dir: str, code: str) -> _TensorContext | None:
+    m5 = _load_5m_data_cached(data_dir, code).copy()
+    d1 = _load_daily_data_cached(data_dir, code).copy()
+    if not _validate_raw(m5) or not _validate_raw(d1):
+        return None
+
+    trade_dates = set(d1["trade_date"].tolist())
+    m5 = m5[m5["trade_date"].isin(trade_dates)].copy()
+    if not _validate_raw(m5):
+        return None
+
+    adj_factor_by_date, _ = _build_adj_factor_map(d1)
+    if adj_factor_by_date is None:
+        return None
+
+    m5_adj, err = _apply_base_price_adjustment(m5, adj_factor_by_date)
+    if m5_adj is None:
+        return None
+    m30 = aggregate_30m_from_5m(m5_adj)
+    if m30.empty:
+        return None
+
+    d1_adj, err = _apply_base_price_adjustment(d1, adj_factor_by_date)
+    if d1_adj is None:
+        return None
+
+    market_calendar = _load_market_calendar_dates(data_dir)
+    stock_trade_dates = set(d1["trade_date"].tolist())
+    stock_calendar = tuple(d for d in market_calendar if d in stock_trade_dates)
+
+    return _TensorContext(
+        m5=m5_adj,
+        m30=m30,
+        d1=d1_adj,
+        adj_factor_by_date=adj_factor_by_date,
+        stock_calendar=stock_calendar,
+        breakpoints=frozenset(_load_breakpoints_cached(data_dir, code)),
+    )
 
 
 def aggregate_30m_from_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
@@ -312,62 +382,54 @@ def _has_breakpoint_crossing(dates: list[date], start_idx: int, end_idx: int, br
 def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) -> DPResult:
     data_dir_key = str(Path(data_dir).resolve())
     asof = pd.to_datetime(asof_date).date()
-    m5 = _load_5m_data_cached(data_dir_key, code).copy()
-    d1 = _load_daily_data_cached(data_dir_key, code).copy()
-    if not _validate_raw(m5):
-        return empty_result(code, asof_date, "missing/invalid 5m raw schema")
-    if not _validate_raw(d1):
-        return empty_result(code, asof_date, "missing/invalid daily raw schema")
+    context = _build_tensor_context(data_dir_key, code)
+    if context is None:
+        m5 = _load_5m_data_cached(data_dir_key, code).copy()
+        d1 = _load_daily_data_cached(data_dir_key, code).copy()
+        if not _validate_raw(m5):
+            return empty_result(code, asof_date, "missing/invalid 5m raw schema")
+        if not _validate_raw(d1):
+            return empty_result(code, asof_date, "missing/invalid daily raw schema")
+        adj_factor_by_date, adj_err = _build_adj_factor_map(d1)
+        if adj_factor_by_date is None:
+            return empty_result(code, asof_date, adj_err)
+        m5_asof = m5[m5["trade_date"] == asof]
+        if len(m5_asof) != 48:
+            return empty_result(code, asof_date, "micro day must have exactly 48 bars")
+        return empty_result(code, asof_date, "30m aggregation failure")
 
-    trade_dates = set(d1["trade_date"].tolist())
-    m5 = m5[m5["trade_date"].isin(trade_dates)].copy()
-    if not _validate_raw(m5):
-        return empty_result(code, asof_date, "missing/invalid 5m raw schema")
+    if asof not in context.adj_factor_by_date.index:
+        return empty_result(code, asof_date, "missing adj_factor on asof date")
+    asof_factor = float(context.adj_factor_by_date.loc[asof])
+    if (not np.isfinite(asof_factor)) or asof_factor <= 0:
+        return empty_result(code, asof_date, "invalid adj_factor on asof date")
 
-    adj_factor_by_date, adj_err = _build_adj_factor_map(d1)
-    if adj_factor_by_date is None:
-        return empty_result(code, asof_date, adj_err)
-
-    m5_asof = m5[m5["trade_date"] == asof]
+    m5_asof = context.m5[context.m5["trade_date"] == asof]
     if len(m5_asof) != 48:
         return empty_result(code, asof_date, "micro day must have exactly 48 bars")
 
-    m5_adj, err = _apply_asof_price_adjustment(m5, asof, adj_factor_by_date)
-    if m5_adj is None:
-        return empty_result(code, asof_date, f"micro: {err}")
-
-    m30 = aggregate_30m_from_5m(m5_adj)
-    if m30.empty:
-        return empty_result(code, asof_date, "30m aggregation failure")
-
-    X_micro, err = _extract_tail_tensor(m5_adj, L_MICRO, asof, by_daily=False, z_window=W_MICRO)
+    X_micro, err = _extract_tail_tensor(context.m5, L_MICRO, asof, by_daily=False, z_window=W_MICRO)
     if X_micro is None:
         return empty_result(code, asof_date, f"micro: {err}")
 
-    X_mezzo, err = _extract_tail_tensor(m30, L_MEZZO, asof, by_daily=False, z_window=W_MEZZO)
+    X_mezzo, err = _extract_tail_tensor(context.m30, L_MEZZO, asof, by_daily=False, z_window=W_MEZZO)
     if X_mezzo is None:
         return empty_result(code, asof_date, f"mezzo: {err}")
 
-    market_calendar = _load_market_calendar_dates(data_dir_key)
-    stock_trade_dates = set(d1["trade_date"].tolist())
-    stock_calendar = [d for d in market_calendar if d in stock_trade_dates]
-    if asof not in stock_calendar:
+    stock_calendar = context.stock_calendar
+    idx = bisect_left(stock_calendar, asof)
+    if idx >= len(stock_calendar) or stock_calendar[idx] != asof:
         return empty_result(code, asof_date, "asof date not in calendar")
-    idx = stock_calendar.index(asof)
-    breakpoints = set(_load_breakpoints_cached(data_dir_key, code))
+
     req = L_MACRO + W_MACRO + RAW_WARMUP
     if idx + 1 < req:
         return empty_result(code, asof_date, "macro: insufficient zscore warmup/history")
-    expected_daily_dates = stock_calendar[idx + 1 - req : idx + 1]
-    if _has_breakpoint_crossing(stock_calendar, idx + 1 - req, idx, breakpoints):
+    expected_daily_dates = list(stock_calendar[idx + 1 - req : idx + 1])
+    if _has_breakpoint_crossing(list(stock_calendar), idx + 1 - req, idx, set(context.breakpoints)):
         return empty_result(code, asof_date, "macro: history crosses st breakpoint")
 
-    d1_adj, err = _apply_asof_price_adjustment(d1, asof, adj_factor_by_date)
-    if d1_adj is None:
-        return empty_result(code, asof_date, f"macro: {err}")
-
     X_macro, err = _extract_tail_tensor(
-        d1_adj,
+        context.d1,
         L_MACRO,
         asof,
         by_daily=True,

@@ -76,6 +76,20 @@ def _row_from_task(data_dir: str | Path, code: str, asof: str, include_invalid: 
     }
 
 
+def _rows_from_code_task(
+    data_dir: str | Path,
+    code: str,
+    selected_asof_dates: tuple[str, ...],
+    include_invalid: bool,
+) -> list[dict]:
+    rows: list[dict] = []
+    for asof in selected_asof_dates:
+        row = _row_from_task(data_dir, code, asof, include_invalid)
+        if row is not None:
+            rows.append(row)
+    return rows
+
+
 def _iter_progress(iterable, total: int, show_progress: bool, desc: str):
     if show_progress and tqdm is not None:
         return tqdm(iterable, total=total, desc=desc)
@@ -92,23 +106,19 @@ def build_train_dataset(
 ) -> TrainDatasetBundle:
     selected_codes = resolve_codes(data_dir, codes)
     selected_asof_dates = resolve_asof_dates(data_dir, asof_dates)
-    tasks = [(code, asof) for code in selected_codes for asof in selected_asof_dates]
 
     rows: list[dict] = []
+    asof_tuple = tuple(selected_asof_dates)
     if num_workers <= 1:
-        iterator = _iter_progress(tasks, total=len(tasks), show_progress=show_progress, desc="building train dataset")
-        for code, asof in iterator:
-            row = _row_from_task(data_dir, code, asof, include_invalid)
-            if row is not None:
-                rows.append(row)
+        iterator = _iter_progress(selected_codes, total=len(selected_codes), show_progress=show_progress, desc="building train dataset")
+        for code in iterator:
+            rows.extend(_rows_from_code_task(data_dir, code, asof_tuple, include_invalid))
     else:
         with ProcessPoolExecutor(max_workers=num_workers) as executor:
-            futures = [executor.submit(_row_from_task, data_dir, code, asof, include_invalid) for code, asof in tasks]
+            futures = [executor.submit(_rows_from_code_task, data_dir, code, asof_tuple, include_invalid) for code in selected_codes]
             progress_iter = _iter_progress(as_completed(futures), total=len(futures), show_progress=show_progress, desc="building train dataset")
             for fut in progress_iter:
-                row = fut.result()
-                if row is not None:
-                    rows.append(row)
+                rows.extend(fut.result())
 
     if not rows:
         return TrainDatasetBundle(
