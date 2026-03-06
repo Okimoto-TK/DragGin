@@ -422,12 +422,6 @@ def preprocess(raw_dir: Path, out_dir: Path, max_workers: int = 4) -> None:
         calendar = pd.DataFrame({"trade_date": sorted(all_calendar_dates)})
         calendar.to_parquet(out_dir / "calendar.parquet", index=False)
 
-        min_trade_date = pd.to_datetime(calendar["trade_date"].min())
-        max_trade_date = pd.to_datetime(calendar["trade_date"].max())
-        namechange = _fetch_namechange(min_trade_date, max_trade_date)
-        breakpoints = _build_st_breakpoints(namechange)
-        _write_breakpoint_files(breakpoints, out_dir)
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser()
