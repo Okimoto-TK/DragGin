@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import os
 import re
+import time
 from dataclasses import dataclass
 from datetime import date
 from functools import lru_cache
@@ -372,55 +374,91 @@ def get_tensor_valid_asof_dates(data_dir: str, code: str) -> tuple[str, ...]:
 
 
 def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) -> DPResult:
+    profile_timing = os.getenv("DRAGGIN_PROFILE_BUILD", "0") == "1"
+    timing_segments: list[tuple[str, float]] = []
+    timing_last = time.perf_counter()
+
+    def mark_timing(segment: str) -> None:
+        nonlocal timing_last
+        if not profile_timing:
+            return
+        now = time.perf_counter()
+        timing_segments.append((segment, now - timing_last))
+        timing_last = now
+
+    def finish(result: DPResult) -> DPResult:
+        mark_timing("build_multiscale_tensors: return")
+        if profile_timing and timing_segments:
+            slowest_name, slowest_sec = max(timing_segments, key=lambda x: x[1])
+            print(f"[timing][tensor] code={code} asof={asof_date}")
+            for segment, duration in timing_segments:
+                print(f"  - {segment}: {duration * 1000:.3f} ms")
+            print(f"  - slowest: {slowest_name} ({slowest_sec * 1000:.3f} ms)")
+        return result
+
     data_dir_key = str(Path(data_dir).resolve())
+    mark_timing("resolve data dir")
     asof = pd.to_datetime(asof_date).date()
+    mark_timing("parse asof")
     context = _build_tensor_context(data_dir_key, code)
+    mark_timing("build tensor context")
     if context is None:
         m5 = _load_5m_data_cached(data_dir_key, code).copy()
+        mark_timing("load cached 5m (context none)")
         d1 = _load_daily_data_cached(data_dir_key, code).copy()
+        mark_timing("load cached daily (context none)")
         if not _validate_raw(m5):
-            return empty_result(code, asof_date, "missing/invalid 5m raw schema")
+            return finish(empty_result(code, asof_date, "missing/invalid 5m raw schema"))
         if not _validate_raw(d1):
-            return empty_result(code, asof_date, "missing/invalid daily raw schema")
-        return empty_result(code, asof_date, "30m aggregation failure")
+            return finish(empty_result(code, asof_date, "missing/invalid daily raw schema"))
+        return finish(empty_result(code, asof_date, "30m aggregation failure"))
 
     if asof not in context.asof_adj_valid:
-        return empty_result(code, asof_date, "missing adj_factor on asof date")
+        return finish(empty_result(code, asof_date, "missing adj_factor on asof date"))
+    mark_timing("validate asof adj_factor")
 
     micro_end = context.asof_to_micro_end.get(asof)
     if micro_end is None:
-        return empty_result(code, asof_date, "micro day must have exactly 48 bars")
+        return finish(empty_result(code, asof_date, "micro day must have exactly 48 bars"))
+    mark_timing("locate micro end")
 
     x_micro, err = _slice_tensor(context.micro_z, micro_end, L_MICRO, L_MICRO + W_MICRO + RAW_WARMUP, "micro")
     if x_micro is None:
-        return empty_result(code, asof_date, err)
+        return finish(empty_result(code, asof_date, err))
+    mark_timing("slice micro tensor")
 
     mezzo_end = context.asof_to_mezzo_end.get(asof)
     if mezzo_end is None:
-        return empty_result(code, asof_date, "30m aggregation failure")
+        return finish(empty_result(code, asof_date, "30m aggregation failure"))
+    mark_timing("locate mezzo end")
     x_mezzo, err = _slice_tensor(context.mezzo_z, mezzo_end, L_MEZZO, L_MEZZO + W_MEZZO + RAW_WARMUP, "mezzo")
     if x_mezzo is None:
-        return empty_result(code, asof_date, err)
+        return finish(empty_result(code, asof_date, err))
+    mark_timing("slice mezzo tensor")
 
     stock_calendar = context.stock_calendar
     idx = context.asof_to_stock_idx.get(asof)
     if idx is None:
-        return empty_result(code, asof_date, "asof date not in calendar")
+        return finish(empty_result(code, asof_date, "asof date not in calendar"))
+    mark_timing("locate stock idx")
 
     req_macro = L_MACRO + W_MACRO + RAW_WARMUP
     if idx + 1 < req_macro:
-        return empty_result(code, asof_date, "macro: insufficient zscore warmup/history")
+        return finish(empty_result(code, asof_date, "macro: insufficient zscore warmup/history"))
     if _has_breakpoint_crossing(list(stock_calendar), idx + 1 - req_macro, idx, set(context.breakpoints)):
-        return empty_result(code, asof_date, "macro: history crosses st breakpoint")
+        return finish(empty_result(code, asof_date, "macro: history crosses st breakpoint"))
+    mark_timing("validate macro history window")
 
     macro_idx = context.asof_to_macro_idx.get(asof)
     if macro_idx is None:
-        return empty_result(code, asof_date, "macro: missing adj_factor in required history")
+        return finish(empty_result(code, asof_date, "macro: missing adj_factor in required history"))
+    mark_timing("locate macro idx")
     x_macro, err = _slice_tensor(context.macro_z, macro_idx, L_MACRO, req_macro, "macro")
     if x_macro is None:
-        return empty_result(code, asof_date, err)
+        return finish(empty_result(code, asof_date, err))
+    mark_timing("slice macro tensor")
 
-    return DPResult(
+    return finish(DPResult(
         code=code,
         asof_date=asof_date,
         dp_ok=True,
@@ -431,7 +469,7 @@ def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) ->
         mask_micro=np.ones((L_MICRO,), dtype=np.uint8),
         mask_mezzo=np.ones((L_MEZZO,), dtype=np.uint8),
         mask_macro=np.ones((L_MACRO,), dtype=np.uint8),
-    )
+    ))
 
 
 def print_calendar_summary(data_dir: str | Path) -> None:

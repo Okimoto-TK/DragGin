@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import os
 from pathlib import Path
+import time
 
 import numpy as np
 import pandas as pd
@@ -391,48 +393,80 @@ def build_label_from_data_dir(
     dp_ok: bool = True,
     breakpoints: set | None = None,
 ) -> LabelBundle:
+    profile_timing = os.getenv("DRAGGIN_PROFILE_BUILD", "0") == "1"
+    timing_segments: list[tuple[str, float]] = []
+    timing_last = time.perf_counter()
+
+    def mark_timing(segment: str) -> None:
+        nonlocal timing_last
+        if not profile_timing:
+            return
+        now = time.perf_counter()
+        timing_segments.append((segment, now - timing_last))
+        timing_last = now
+
+    def finish(result: LabelBundle) -> LabelBundle:
+        mark_timing("build_label_from_data_dir: return")
+        if profile_timing and timing_segments:
+            slowest_name, slowest_sec = max(timing_segments, key=lambda x: x[1])
+            print(f"[timing][label] code={code} asof={asof_date}")
+            for segment, duration in timing_segments:
+                print(f"  - {segment}: {duration * 1000:.3f} ms")
+            print(f"  - slowest: {slowest_name} ({slowest_sec * 1000:.3f} ms)")
+        return result
+
     data_dir_key = str(Path(data_dir).resolve())
+    mark_timing("resolve data dir")
     context = _build_label_context(data_dir_key, code)
+    mark_timing("build label context")
     if context is None:
-        return _fail(code, asof_date, dp_ok, "daily data unavailable")
+        return finish(_fail(code, asof_date, dp_ok, "daily data unavailable"))
 
     asof = pd.to_datetime(asof_date).date()
+    mark_timing("parse asof")
     calendar_dates = context.calendar_dates
     if asof not in calendar_dates:
-        return _fail(code, asof_date, dp_ok, "asof date not in calendar")
+        return finish(_fail(code, asof_date, dp_ok, "asof date not in calendar"))
+    mark_timing("validate asof in calendar")
 
     trading_calendar_dates = context.trading_calendar_dates
     idx = context.asof_to_trading_idx.get(asof)
     if idx is None:
-        return _fail(code, asof_date, dp_ok, "asof date not in trading calendar")
+        return finish(_fail(code, asof_date, dp_ok, "asof date not in trading calendar"))
+    mark_timing("locate asof trading idx")
 
     effective_breakpoints = set(breakpoints) if breakpoints is not None else set(context.breakpoints)
     window_start_idx = max(0, idx - LABEL_Z_WINDOW - VOL_WINDOW)
     if _has_breakpoint_crossing(trading_calendar_dates, window_start_idx, idx + 3, effective_breakpoints):
-        return _fail(code, asof_date, dp_ok, "label window crosses st breakpoint")
+        return finish(_fail(code, asof_date, dp_ok, "label window crosses st breakpoint"))
+    mark_timing("validate breakpoint window")
 
     if idx not in context.raw_details_by_index:
-        return _fail(code, asof_date, dp_ok, context.raw_fail_by_index.get(idx, "raw label build failed"))
+        return finish(_fail(code, asof_date, dp_ok, context.raw_fail_by_index.get(idx, "raw label build failed")))
+    mark_timing("validate raw label details")
 
     valid_values = context.valid_raw_values
     pos = context.raw_idx_to_valid_pos.get(idx)
     if pos is None:
-        return _fail(code, asof_date, dp_ok, context.raw_fail_by_index.get(idx, "raw label build failed"))
+        return finish(_fail(code, asof_date, dp_ok, context.raw_fail_by_index.get(idx, "raw label build failed")))
     if pos < LABEL_Z_WINDOW:
-        return _fail(code, asof_date, dp_ok, f"insufficient y_raw history for label zscore: need {LABEL_Z_WINDOW}, got {pos}")
+        return finish(_fail(code, asof_date, dp_ok, f"insufficient y_raw history for label zscore: need {LABEL_Z_WINDOW}, got {pos}"))
+    mark_timing("locate valid raw position")
 
     if not context.label_ok_by_idx[idx]:
         mu = float(context.z_mu_by_valid_pos[pos])
         sd = float(context.z_sd_by_valid_pos[pos])
         if (not np.isfinite(mu)) or (not np.isfinite(sd)) or sd <= 0:
-            return _fail(code, asof_date, dp_ok, "label zscore sd invalid (<=0 or non-finite)")
-        return _fail(code, asof_date, dp_ok, "label zscore non-finite")
+            return finish(_fail(code, asof_date, dp_ok, "label zscore sd invalid (<=0 or non-finite)"))
+        return finish(_fail(code, asof_date, dp_ok, "label zscore non-finite"))
+    mark_timing("validate zscore status")
 
     y_raw_val = float(valid_values[pos])
     y_z = float(context.label_value_by_idx[idx])
+    mark_timing("extract final label values")
 
     details = context.raw_details_by_index[idx]
-    return LabelBundle(
+    return finish(LabelBundle(
         code=code,
         asof_date=asof_date,
         y=np.float32(y_z),
@@ -447,4 +481,4 @@ def build_label_from_data_dir(
         vol30=details["vol30"],
         ret_log=details["ret_log"],
         fail_reason=None,
-    )
+    ))
