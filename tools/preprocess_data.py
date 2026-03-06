@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import csv
+import os
 import shutil
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
@@ -328,6 +329,62 @@ def _combine_and_write_code(code: str, out_dir: Path) -> set[pd.Timestamp]:
     return cal_dates
 
 
+def _fetch_namechange(start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
+    token = os.getenv("TUSHARE_TOKEN", "").strip()
+    if not token:
+        return pd.DataFrame()
+    try:
+        import tushare as ts
+
+        pro = ts.pro_api(token)
+        df = pro.namechange(
+            ts_code="",
+            start_date=start_date.strftime("%Y%m%d"),
+            end_date=end_date.strftime("%Y%m%d"),
+            limit="",
+            offset="",
+            fields=["ts_code", "name", "start_date", "end_date"],
+        )
+        return df if df is not None else pd.DataFrame()
+    except Exception:
+        return pd.DataFrame()
+
+
+def _build_st_breakpoints(namechange: pd.DataFrame) -> pd.DataFrame:
+    if namechange.empty:
+        return pd.DataFrame(columns=["code", "break_date"])
+
+    df = namechange.copy().rename(columns={"ts_code": "code"})
+    if "code" not in df.columns or "name" not in df.columns or "start_date" not in df.columns:
+        return pd.DataFrame(columns=["code", "break_date"])
+
+    df["code"] = df["code"].astype(str)
+    df["name"] = df["name"].astype(str).str.strip()
+    df["start_date"] = _normalize_trade_date(df["start_date"])
+    df = df.dropna(subset=["code", "start_date"]).sort_values(["code", "start_date"]).reset_index(drop=True)
+    if df.empty:
+        return pd.DataFrame(columns=["code", "break_date"])
+
+    df["is_st"] = df["name"].str.startswith("ST", na=False) | df["name"].str.startswith("*ST", na=False)
+    df["prev_is_st"] = df.groupby("code", sort=False)["is_st"].shift(1)
+    changed = df[(df["prev_is_st"].notna()) & (df["is_st"] != df["prev_is_st"])].copy()
+    if changed.empty:
+        return pd.DataFrame(columns=["code", "break_date"])
+
+    out = changed[["code", "start_date"]].rename(columns={"start_date": "break_date"})
+    out = out.drop_duplicates(subset=["code", "break_date"]).sort_values(["code", "break_date"]).reset_index(drop=True)
+    return out
+
+
+def _write_breakpoint_files(breakpoints: pd.DataFrame, out_dir: Path) -> None:
+    if breakpoints.empty:
+        return
+    for code, g in breakpoints.groupby("code", sort=False):
+        code_dir = out_dir / str(code)
+        code_dir.mkdir(parents=True, exist_ok=True)
+        g[["break_date"]].reset_index(drop=True).to_parquet(code_dir / "breakpoints.parquet", index=False)
+
+
 def preprocess(raw_dir: Path, out_dir: Path, max_workers: int = 4) -> None:
     csv_files = sorted(raw_dir.glob("*.csv"))
     pq_files = sorted(raw_dir.glob("*.parquet"))
@@ -365,6 +422,11 @@ def preprocess(raw_dir: Path, out_dir: Path, max_workers: int = 4) -> None:
         calendar = pd.DataFrame({"trade_date": sorted(all_calendar_dates)})
         calendar.to_parquet(out_dir / "calendar.parquet", index=False)
 
+        min_trade_date = pd.to_datetime(calendar["trade_date"].min())
+        max_trade_date = pd.to_datetime(calendar["trade_date"].max())
+        namechange = _fetch_namechange(min_trade_date, max_trade_date)
+        breakpoints = _build_st_breakpoints(namechange)
+        _write_breakpoint_files(breakpoints, out_dir)
 
 
 if __name__ == "__main__":

@@ -14,13 +14,13 @@ L_MICRO = 48
 L_MEZZO = 40
 L_MACRO = 30
 C = 6
-RAW_WARMUP = 20
+RAW_WARMUP = 10
 EPS = 1e-8
 TANH_K = 5.0
 
-W_MICRO = 240
-W_MEZZO = 80
-W_MACRO = 60
+W_MICRO = 220
+W_MEZZO = 70
+W_MACRO = 55
 
 DATE_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{8})")
 
@@ -119,6 +119,18 @@ def load_daily_data(data_dir: str | Path, code: str) -> pd.DataFrame:
     return out
 
 
+
+
+def load_breakpoints(data_dir: str | Path, code: str) -> set[date]:
+    file_path = Path(data_dir) / code / "breakpoints.parquet"
+    if not file_path.exists():
+        return set()
+    try:
+        bp = pd.read_parquet(file_path, columns=["break_date"])
+    except Exception:
+        return set()
+    parsed = pd.to_datetime(bp.get("break_date"), errors="coerce").dropna()
+    return set(parsed.dt.date.tolist())
 def aggregate_30m_from_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
     agg_rows = []
     for d, g in df_5m.groupby("trade_date"):
@@ -267,6 +279,15 @@ def _extract_tail_tensor(
     return tail.to_numpy(dtype=np.float32), ""
 
 
+
+
+def _has_breakpoint_crossing(dates: list[date], start_idx: int, end_idx: int, breakpoints: set[date]) -> bool:
+    if not breakpoints or end_idx <= start_idx:
+        return False
+    window_dates = dates[start_idx : end_idx + 1]
+    if len(window_dates) < 2:
+        return False
+    return any(window_dates[0] < b <= window_dates[-1] for b in breakpoints)
 def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) -> DPResult:
     asof = pd.to_datetime(asof_date).date()
     m5 = load_5m_data(data_dir, code)
@@ -311,10 +332,13 @@ def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) ->
     if asof not in stock_calendar:
         return empty_result(code, asof_date, "asof date not in calendar")
     idx = stock_calendar.index(asof)
+    breakpoints = load_breakpoints(data_dir, code)
     req = L_MACRO + W_MACRO + RAW_WARMUP
     if idx + 1 < req:
         return empty_result(code, asof_date, "macro: insufficient zscore warmup/history")
     expected_daily_dates = stock_calendar[idx + 1 - req : idx + 1]
+    if _has_breakpoint_crossing(stock_calendar, idx + 1 - req, idx, breakpoints):
+        return empty_result(code, asof_date, "macro: history crosses st breakpoint")
 
     d1_adj, err = _apply_asof_price_adjustment(d1, asof, adj_factor_by_date)
     if d1_adj is None:

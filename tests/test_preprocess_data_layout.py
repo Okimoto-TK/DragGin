@@ -2,6 +2,7 @@ from pathlib import Path
 
 import pandas as pd
 
+from tools import preprocess_data
 from tools.preprocess_data import preprocess
 
 
@@ -61,6 +62,56 @@ def test_preprocess_outputs_per_code_layout_and_calendar(tmp_path: Path) -> None
     cal = pd.read_parquet(out / "calendar.parquet")
     assert sorted(cal["trade_date"].astype(str).tolist()) == ["2024-01-02", "2024-01-03"]
 
+
+
+
+def test_preprocess_writes_breakpoints_on_st_state_changes(tmp_path: Path, monkeypatch) -> None:
+    raw = tmp_path / "raw"
+    out = tmp_path / "out"
+    raw.mkdir()
+    out.mkdir()
+
+    pd.DataFrame(
+        {
+            "code": ["AAA"],
+            "trade_time": ["09:35"],
+            "close": [1.2],
+            "open": [1.1],
+            "high": [1.3],
+            "low": [1.0],
+            "vol": [110],
+            "date": ["20240102"],
+        }
+    ).to_csv(raw / "bars.csv", index=False)
+
+    pd.DataFrame(
+        {
+            "code": ["AAA", "AAA"],
+            "date": ["20240102", "20240103"],
+            "adj_factor": [1.0, 1.0],
+            "open": [10.0, 10.0],
+            "high": [11.0, 11.0],
+            "low": [9.0, 9.0],
+            "close": [10.5, 10.5],
+            "volume": [1000.0, 1000.0],
+        }
+    ).to_parquet(raw / "daily.parquet", index=False)
+
+    def fake_fetch(start_date, end_date):
+        return pd.DataFrame(
+            {
+                "ts_code": ["AAA", "AAA", "AAA", "AAA"],
+                "name": ["AAA", "STAAA", "*STAAA", "AAA"],
+                "start_date": ["20240101", "20240110", "20240120", "20240201"],
+                "end_date": [None, None, None, None],
+            }
+        )
+
+    monkeypatch.setattr(preprocess_data, "_fetch_namechange", fake_fetch)
+    preprocess(raw, out)
+
+    bp = pd.read_parquet(out / "AAA" / "breakpoints.parquet")
+    assert bp["break_date"].astype(str).tolist() == ["2024-01-10", "2024-02-01"]
 
 def test_preprocess_drops_nonpositive_volume_day_from_daily_and_5min(tmp_path: Path) -> None:
     raw = tmp_path / "raw"
