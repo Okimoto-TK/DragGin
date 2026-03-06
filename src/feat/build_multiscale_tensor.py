@@ -142,8 +142,6 @@ def aggregate_30m_from_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
         for i in range(8):
             chunk = g.iloc[i * 6 : (i + 1) * 6]
             vol_sum = chunk["volume"].sum()
-            if vol_sum <= 0:
-                return pd.DataFrame()
             agg_rows.append(
                 {
                     "trade_date": d,
