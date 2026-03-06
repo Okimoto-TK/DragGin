@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
+from bisect import bisect_left
 
 import numpy as np
 import pandas as pd
@@ -31,6 +33,18 @@ class LabelBundle:
     vol30: float | None
     ret_log: float | None
     fail_reason: str | None
+
+
+@dataclass
+class _LabelContext:
+    calendar_dates: tuple
+    trading_calendar_dates: tuple
+    by_date: pd.DataFrame
+    breakpoints: frozenset
+    valid_raw_indices: tuple[int, ...]
+    valid_raw_values: tuple[float, ...]
+    raw_details_by_index: dict[int, dict]
+    raw_fail_by_index: dict[int, str]
 
 
 def compute_daily_log_returns(df_daily_sorted: pd.DataFrame) -> pd.Series:
@@ -155,6 +169,65 @@ def _load_breakpoints(data_dir: str | Path, code: str) -> set:
     parsed = pd.to_datetime(bp.get("break_date"), errors="coerce").dropna()
     return set(parsed.dt.date.tolist())
 
+
+@lru_cache(maxsize=16)
+def _calendar_dates_cached(data_dir: str) -> tuple:
+    return tuple(pd.to_datetime(x).date() for x in build_calendar_from_daily_filenames(data_dir))
+
+
+@lru_cache(maxsize=512)
+def _daily_data_cached(data_dir: str, code: str) -> pd.DataFrame:
+    return load_daily_data(data_dir, code)
+
+
+@lru_cache(maxsize=512)
+def _breakpoints_cached(data_dir: str, code: str) -> frozenset:
+    return frozenset(_load_breakpoints(data_dir, code))
+
+
+@lru_cache(maxsize=512)
+def _build_label_context(data_dir: str, code: str) -> _LabelContext | None:
+    calendar_dates = _calendar_dates_cached(data_dir)
+    daily = _daily_data_cached(data_dir, code)
+    if daily.empty:
+        return None
+
+    daily = daily.copy()
+    daily["trade_date"] = pd.to_datetime(daily["trade_date"]).dt.date
+    suspended_dates: set = set()
+    if "volume" in daily.columns:
+        daily["volume"] = pd.to_numeric(daily["volume"], errors="coerce")
+        suspended_dates = set(daily.loc[(daily["volume"] <= 0) | (~np.isfinite(daily["volume"])), "trade_date"].tolist())
+        daily = daily[(daily["volume"] > 0) & np.isfinite(daily["volume"])]
+    daily = daily.drop_duplicates(subset=["trade_date"], keep="last").sort_values("trade_date")
+    by_date = daily.set_index("trade_date")
+
+    trading_calendar_dates = tuple(d for d in calendar_dates if d not in suspended_dates)
+
+    valid_raw_indices: list[int] = []
+    valid_raw_values: list[float] = []
+    raw_details_by_index: dict[int, dict] = {}
+    raw_fail_by_index: dict[int, str] = {}
+    for idx in range(len(trading_calendar_dates)):
+        ok_raw, y_raw_val, details, fail_reason = _compute_raw_label_for_idx(idx, trading_calendar_dates, by_date)
+        if ok_raw and y_raw_val is not None and np.isfinite(y_raw_val):
+            valid_raw_indices.append(idx)
+            valid_raw_values.append(float(y_raw_val))
+            raw_details_by_index[idx] = details
+        else:
+            raw_fail_by_index[idx] = fail_reason or "raw label build failed"
+
+    return _LabelContext(
+        calendar_dates=calendar_dates,
+        trading_calendar_dates=trading_calendar_dates,
+        by_date=by_date,
+        breakpoints=_breakpoints_cached(data_dir, code),
+        valid_raw_indices=tuple(valid_raw_indices),
+        valid_raw_values=tuple(valid_raw_values),
+        raw_details_by_index=raw_details_by_index,
+        raw_fail_by_index=raw_fail_by_index,
+    )
+
 def build_label_for_sample(
     code: str,
     asof_date: str,
@@ -243,18 +316,61 @@ def build_label_from_data_dir(
     dp_ok: bool = True,
     breakpoints: set | None = None,
 ) -> LabelBundle:
-    calendar = build_calendar_from_daily_filenames(data_dir)
+    data_dir_key = str(Path(data_dir).resolve())
+    context = _build_label_context(data_dir_key, code)
+    if context is None:
+        return _fail(code, asof_date, dp_ok, "daily data unavailable")
 
-    def _loader(target_code: str) -> pd.DataFrame:
-        return load_daily_data(data_dir, target_code)
+    asof = pd.to_datetime(asof_date).date()
+    calendar_dates = context.calendar_dates
+    if asof not in calendar_dates:
+        return _fail(code, asof_date, dp_ok, "asof date not in calendar")
 
-    breakpoints = _load_breakpoints(data_dir, code)
+    trading_calendar_dates = context.trading_calendar_dates
+    idx = bisect_left(trading_calendar_dates, asof)
+    if idx >= len(trading_calendar_dates) or trading_calendar_dates[idx] != asof:
+        return _fail(code, asof_date, dp_ok, "asof date not in trading calendar")
 
-    return build_label_for_sample(
+    effective_breakpoints = set(breakpoints) if breakpoints is not None else set(context.breakpoints)
+    window_start_idx = max(0, idx - LABEL_Z_WINDOW - VOL_WINDOW)
+    if _has_breakpoint_crossing(trading_calendar_dates, window_start_idx, idx + 3, effective_breakpoints):
+        return _fail(code, asof_date, dp_ok, "label window crosses st breakpoint")
+
+    if idx not in context.raw_details_by_index:
+        return _fail(code, asof_date, dp_ok, context.raw_fail_by_index.get(idx, "raw label build failed"))
+
+    valid_indices = context.valid_raw_indices
+    valid_values = context.valid_raw_values
+    pos = bisect_left(valid_indices, idx)
+    if pos < LABEL_Z_WINDOW:
+        return _fail(code, asof_date, dp_ok, f"insufficient y_raw history for label zscore: need {LABEL_Z_WINDOW}, got {pos}")
+
+    past_window = np.asarray(valid_values[pos - LABEL_Z_WINDOW : pos], dtype=np.float64)
+    mu = float(np.mean(past_window))
+    sd = float(np.std(past_window, ddof=0))
+    if (not np.isfinite(mu)) or (not np.isfinite(sd)) or sd <= 0:
+        return _fail(code, asof_date, dp_ok, "label zscore sd invalid (<=0 or non-finite)")
+
+    y_raw_val = float(valid_values[pos])
+    y_z = (y_raw_val - mu) / max(sd, ZSCORE_EPS)
+    y_z = float(TANH_K * np.tanh(y_z / TANH_K))
+    if not np.isfinite(y_z):
+        return _fail(code, asof_date, dp_ok, "label zscore non-finite")
+
+    details = context.raw_details_by_index[idx]
+    return LabelBundle(
         code=code,
         asof_date=asof_date,
-        calendar=calendar,
-        daily_loader=_loader,
-        dp_ok=dp_ok,
-        breakpoints=breakpoints,
+        y=np.float32(y_z),
+        y_raw=np.float32(y_raw_val),
+        y_z=np.float32(y_z),
+        label_ok=True,
+        loss_mask=bool(dp_ok),
+        entry_date=details["entry_date"],
+        exit_date=details["exit_date"],
+        entry_open=details["entry_open"],
+        exit_close=details["exit_close"],
+        vol30=details["vol30"],
+        ret_log=details["ret_log"],
+        fail_reason=None,
     )
