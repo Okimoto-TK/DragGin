@@ -155,3 +155,40 @@ def test_progress_wrapper_uses_tqdm(monkeypatch):
         show_progress=True,
     )
     assert called["v"]
+
+
+def test_build_train_dataset_benchmark_mode_limits_one_code(monkeypatch):
+    from src.feat import build_training_dataset as btd
+
+    seen_codes = []
+
+    def fake_build_multiscale_tensors(data_dir, code, asof):
+        seen_codes.append(code)
+        return _dp(dp_ok=True)
+
+    def fake_build_label_from_data_dir(data_dir, code, asof_date, dp_ok=True):
+        return _lb(label_ok=True, loss_mask=True)
+
+    monkeypatch.setattr(btd, "build_multiscale_tensors", fake_build_multiscale_tensors)
+    monkeypatch.setattr(btd, "build_label_from_data_dir", fake_build_label_from_data_dir)
+
+    timings: dict[str, dict[str, float]] = {}
+    out = build_train_dataset(
+        ".",
+        codes=["AAA", "BBB"],
+        asof_dates=["2024-01-02"],
+        include_invalid=False,
+        num_workers=4,
+        show_progress=False,
+        benchmark=True,
+        timings=timings,
+    )
+
+    assert out.y.shape == (1,)
+    assert seen_codes == ["AAA"]
+    assert timings["resolve_codes"]["count"] == 1.0
+    assert timings["resolve_asof_dates"]["count"] == 1.0
+    assert timings["_rows_from_code_task"]["count"] == 1.0
+    assert timings["build_multiscale_tensors"]["count"] == 1.0
+    assert timings["build_label_from_data_dir"]["count"] == 1.0
+    assert timings["_merge_shards"]["count"] == 1.0
