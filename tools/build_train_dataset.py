@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
+from src.feat import build_multiscale_tensor, labels_risk_adj
 from src.feat.build_training_dataset import build_train_dataset, resolve_asof_dates, resolve_codes, save_train_dataset
 
 
@@ -20,15 +21,23 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=1, help="number of worker processes")
     parser.add_argument("--show-progress", type=int, choices=[0, 1], default=1, help="show progress bar")
     parser.add_argument("--shard-tmp-dir", default="", help="temporary directory for per-code shard files; empty uses system default")
+    parser.add_argument("--benchmark", action="store_true", help="enable function-level benchmark timings and run only first code")
     args = parser.parse_args()
 
     raw_codes = _split_csv(args.codes)
     raw_asof_dates = _split_csv(args.asof_dates)
     codes = resolve_codes(args.data_dir, raw_codes or None)
     asof_dates = resolve_asof_dates(args.data_dir, raw_asof_dates or None)
+    selected_codes = codes
+    if args.benchmark:
+        build_multiscale_tensor.enable_benchmark()
+        labels_risk_adj.enable_benchmark()
+        selected_codes = codes[:1]
+        print(f"benchmark mode enabled: running only first code: {selected_codes[0] if selected_codes else '<none>'}")
+
     bundle = build_train_dataset(
         data_dir=args.data_dir,
-        codes=codes,
+        codes=selected_codes,
         asof_dates=asof_dates,
         include_invalid=bool(args.include_invalid),
         num_workers=max(1, int(args.num_workers)),
@@ -40,7 +49,7 @@ def main() -> None:
     save_train_dataset(bundle, out)
 
     print(f"saved: {out}")
-    print(f"codes: {len(codes)}")
+    print(f"codes: {len(selected_codes)}")
     print(f"asof_dates: {len(asof_dates)}")
     print(f"workers: {max(1, int(args.num_workers))}")
     print(f"samples: {len(bundle.y)}")
@@ -49,6 +58,21 @@ def main() -> None:
     print(f"X_macro: {bundle.X_macro.shape}")
     print(f"y: {bundle.y.shape}, loss_mask_true: {int(bundle.loss_mask.sum())}")
     print(f"shard_tmp_dir: {args.shard_tmp_dir or '<system_temp>'}")
+
+    if args.benchmark:
+        print("benchmark summary (build_multiscale_tensor):")
+        for row in build_multiscale_tensor.get_benchmark_report():
+            print(
+                f"  {row['function']}: count={int(row['count'])}, total={row['total_ms']:.3f}ms, "
+                f"avg={row['avg_ms']:.3f}ms, min={row['min_ms']:.3f}ms, max={row['max_ms']:.3f}ms"
+            )
+        print("benchmark summary (labels_risk_adj):")
+        for row in labels_risk_adj.get_benchmark_report():
+            print(
+                f"  {row['function']}: count={int(row['count'])}, total={row['total_ms']:.3f}ms, "
+                f"avg={row['avg_ms']:.3f}ms, min={row['min_ms']:.3f}ms, max={row['max_ms']:.3f}ms"
+            )
+        return
 
 
 if __name__ == "__main__":

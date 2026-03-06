@@ -1,7 +1,9 @@
 from __future__ import annotations
 
 import argparse
+import inspect
 import re
+import time
 from dataclasses import dataclass
 from datetime import date
 from functools import lru_cache
@@ -24,6 +26,10 @@ W_MEZZO = 80
 W_MACRO = 45
 
 DATE_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{8})")
+
+_BENCHMARK_ENABLED = False
+_BENCHMARK_WRAPPED = False
+_BENCHMARK_STATS: dict[str, dict[str, float]] = {}
 
 
 @dataclass
@@ -67,6 +73,72 @@ def empty_result(code: str, asof_date: str, reason: str) -> DPResult:
         mask_mezzo=np.zeros((L_MEZZO,), dtype=np.uint8),
         mask_macro=np.zeros((L_MACRO,), dtype=np.uint8),
     )
+
+
+def _record_benchmark(func_name: str, elapsed: float) -> None:
+    stats = _BENCHMARK_STATS.get(func_name)
+    if stats is None:
+        _BENCHMARK_STATS[func_name] = {
+            "count": 1.0,
+            "total": elapsed,
+            "min": elapsed,
+            "max": elapsed,
+        }
+        return
+    stats["count"] += 1.0
+    stats["total"] += elapsed
+    stats["min"] = min(stats["min"], elapsed)
+    stats["max"] = max(stats["max"], elapsed)
+
+
+def _benchmark_wrap(func_name: str, fn):
+    def wrapped(*args, **kwargs):
+        start = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _record_benchmark(func_name, time.perf_counter() - start)
+
+    wrapped.__name__ = fn.__name__
+    wrapped.__doc__ = fn.__doc__
+    wrapped.__qualname__ = fn.__qualname__
+    return wrapped
+
+
+def enable_benchmark() -> None:
+    global _BENCHMARK_ENABLED, _BENCHMARK_WRAPPED
+    _BENCHMARK_ENABLED = True
+    _BENCHMARK_STATS.clear()
+    if _BENCHMARK_WRAPPED:
+        return
+    skip = {"enable_benchmark", "get_benchmark_report", "_record_benchmark", "_benchmark_wrap"}
+    for name, obj in list(globals().items()):
+        if name in skip:
+            continue
+        if not inspect.isfunction(obj):
+            continue
+        if obj.__module__ != __name__:
+            continue
+        globals()[name] = _benchmark_wrap(name, obj)
+    _BENCHMARK_WRAPPED = True
+
+
+def get_benchmark_report() -> list[dict[str, float]]:
+    rows: list[dict[str, float]] = []
+    for name, stats in _BENCHMARK_STATS.items():
+        count = max(1, int(stats["count"]))
+        total = float(stats["total"])
+        rows.append(
+            {
+                "function": name,
+                "count": count,
+                "total_ms": total * 1000.0,
+                "avg_ms": total * 1000.0 / count,
+                "min_ms": float(stats["min"]) * 1000.0,
+                "max_ms": float(stats["max"]) * 1000.0,
+            }
+        )
+    return sorted(rows, key=lambda x: x["total_ms"], reverse=True)
 
 
 def parse_date_from_filename(path: Path) -> Optional[date]:
@@ -464,7 +536,11 @@ def main() -> None:
     parser.add_argument("--asof", required=True)
     parser.add_argument("--print-calendar", action="store_true")
     parser.add_argument("--dump-out", default=None)
+    parser.add_argument("--benchmark", action="store_true", help="enable function-level benchmark timings")
     args = parser.parse_args()
+
+    if args.benchmark:
+        enable_benchmark()
 
     if args.print_calendar:
         print_calendar_summary(args.data_dir)
@@ -487,6 +563,14 @@ def main() -> None:
             mask_macro=result.mask_macro,
             dp_ok=np.array(result.dp_ok),
         )
+
+    if args.benchmark:
+        print("benchmark summary (build_multiscale_tensor):")
+        for row in get_benchmark_report():
+            print(
+                f"  {row['function']}: count={int(row['count'])}, total={row['total_ms']:.3f}ms, "
+                f"avg={row['avg_ms']:.3f}ms, min={row['min_ms']:.3f}ms, max={row['max_ms']:.3f}ms"
+            )
 
 
 if __name__ == "__main__":

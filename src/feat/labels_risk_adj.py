@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import lru_cache
+import inspect
 from pathlib import Path
+import time
 
 import numpy as np
 import pandas as pd
@@ -14,6 +16,11 @@ ZSCORE_EPS = 1e-8
 VOL_WINDOW = 30
 LABEL_Z_WINDOW = 252
 TANH_K = 5.0
+
+
+_BENCHMARK_ENABLED = False
+_BENCHMARK_WRAPPED = False
+_BENCHMARK_STATS: dict[str, dict[str, float]] = {}
 
 
 @dataclass
@@ -55,6 +62,72 @@ class _LabelContext:
 def compute_daily_log_returns(df_daily_sorted: pd.DataFrame) -> pd.Series:
     close = df_daily_sorted["close"].astype(float)
     return np.log(close / close.shift(1))
+
+
+def _record_benchmark(func_name: str, elapsed: float) -> None:
+    stats = _BENCHMARK_STATS.get(func_name)
+    if stats is None:
+        _BENCHMARK_STATS[func_name] = {
+            "count": 1.0,
+            "total": elapsed,
+            "min": elapsed,
+            "max": elapsed,
+        }
+        return
+    stats["count"] += 1.0
+    stats["total"] += elapsed
+    stats["min"] = min(stats["min"], elapsed)
+    stats["max"] = max(stats["max"], elapsed)
+
+
+def _benchmark_wrap(func_name: str, fn):
+    def wrapped(*args, **kwargs):
+        start = time.perf_counter()
+        try:
+            return fn(*args, **kwargs)
+        finally:
+            _record_benchmark(func_name, time.perf_counter() - start)
+
+    wrapped.__name__ = fn.__name__
+    wrapped.__doc__ = fn.__doc__
+    wrapped.__qualname__ = fn.__qualname__
+    return wrapped
+
+
+def enable_benchmark() -> None:
+    global _BENCHMARK_ENABLED, _BENCHMARK_WRAPPED
+    _BENCHMARK_ENABLED = True
+    _BENCHMARK_STATS.clear()
+    if _BENCHMARK_WRAPPED:
+        return
+    skip = {"enable_benchmark", "get_benchmark_report", "_record_benchmark", "_benchmark_wrap"}
+    for name, obj in list(globals().items()):
+        if name in skip:
+            continue
+        if not inspect.isfunction(obj):
+            continue
+        if obj.__module__ != __name__:
+            continue
+        globals()[name] = _benchmark_wrap(name, obj)
+    _BENCHMARK_WRAPPED = True
+
+
+def get_benchmark_report() -> list[dict[str, float]]:
+    rows: list[dict[str, float]] = []
+    for name, stats in _BENCHMARK_STATS.items():
+        count = max(1, int(stats["count"]))
+        total = float(stats["total"])
+        rows.append(
+            {
+                "function": name,
+                "count": count,
+                "total_ms": total * 1000.0,
+                "avg_ms": total * 1000.0 / count,
+                "min_ms": float(stats["min"]) * 1000.0,
+                "max_ms": float(stats["max"]) * 1000.0,
+            }
+        )
+    return sorted(rows, key=lambda x: x["total_ms"], reverse=True)
 
 
 def rolling_std_last_n(returns: pd.Series, n: int = VOL_WINDOW) -> pd.Series:
