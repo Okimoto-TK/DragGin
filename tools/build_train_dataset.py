@@ -20,13 +20,14 @@ def main() -> None:
     parser.add_argument("--num-workers", type=int, default=1, help="number of worker processes")
     parser.add_argument("--show-progress", type=int, choices=[0, 1], default=1, help="show progress bar")
     parser.add_argument("--shard-tmp-dir", default="", help="temporary directory for per-code shard files; empty uses system default")
+    parser.add_argument("--benchmark", action="store_true", help="enable timing benchmark and process only one code")
     args = parser.parse_args()
 
     raw_codes = _split_csv(args.codes)
     raw_asof_dates = _split_csv(args.asof_dates)
     codes = resolve_codes(args.data_dir, raw_codes or None)
     asof_dates = resolve_asof_dates(args.data_dir, raw_asof_dates or None)
-    bundle = build_train_dataset(
+    bundle, benchmark_lines = build_train_dataset(
         data_dir=args.data_dir,
         codes=codes,
         asof_dates=asof_dates,
@@ -34,6 +35,8 @@ def main() -> None:
         num_workers=max(1, int(args.num_workers)),
         show_progress=bool(args.show_progress),
         shard_tmp_dir=(args.shard_tmp_dir or None),
+        benchmark=bool(args.benchmark),
+        return_benchmark_lines=True,
     )
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
@@ -49,6 +52,9 @@ def main() -> None:
     print(f"X_macro: {bundle.X_macro.shape}")
     print(f"y: {bundle.y.shape}, loss_mask_true: {int(bundle.loss_mask.sum())}")
     print(f"shard_tmp_dir: {args.shard_tmp_dir or '<system_temp>'}")
+    if args.benchmark:
+        for line in benchmark_lines:
+            print(line)
 
 
 if __name__ == "__main__":

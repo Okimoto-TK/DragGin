@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 import tempfile
+from time import perf_counter
 
 import numpy as np
 
@@ -33,6 +35,58 @@ class TrainDatasetBundle:
     dp_ok: np.ndarray
     label_ok: np.ndarray
     loss_mask: np.ndarray
+
+
+@dataclass
+class BenchmarkRecord:
+    count: int = 0
+    total_seconds: float = 0.0
+    min_seconds: float = float("inf")
+    max_seconds: float = 0.0
+
+
+class BenchmarkTracker:
+    def __init__(self, enabled: bool = False):
+        self.enabled = bool(enabled)
+        self._records: dict[str, BenchmarkRecord] = {}
+
+    @contextmanager
+    def timing(self, name: str):
+        if not self.enabled:
+            yield
+            return
+        start = perf_counter()
+        try:
+            yield
+        finally:
+            elapsed = perf_counter() - start
+            self.add(name, elapsed)
+
+    def add(self, name: str, elapsed_seconds: float) -> None:
+        if not self.enabled:
+            return
+        record = self._records.get(name)
+        if record is None:
+            record = BenchmarkRecord()
+            self._records[name] = record
+        record.count += 1
+        record.total_seconds += float(elapsed_seconds)
+        record.min_seconds = min(record.min_seconds, float(elapsed_seconds))
+        record.max_seconds = max(record.max_seconds, float(elapsed_seconds))
+
+    def to_lines(self) -> list[str]:
+        if not self.enabled:
+            return []
+        out = ["benchmark summary (seconds):"]
+        for name in sorted(self._records.keys()):
+            rec = self._records[name]
+            avg_seconds = rec.total_seconds / max(1, rec.count)
+            min_seconds = rec.min_seconds if rec.count > 0 else 0.0
+            out.append(
+                f"  - {name}: count={rec.count}, total={rec.total_seconds:.6f}, avg={avg_seconds:.6f}, "
+                f"min={min_seconds:.6f}, max={rec.max_seconds:.6f}"
+            )
+        return out
 
 
 def _empty_bundle() -> TrainDatasetBundle:
@@ -85,12 +139,16 @@ def _rows_from_code_task(
     selected_asof_dates: tuple[str, ...],
     include_invalid: bool,
     shard_dir: str,
+    benchmark: bool = False,
 ) -> dict:
+    bench = BenchmarkTracker(enabled=benchmark)
     data_dir_key = str(Path(data_dir).resolve())
     filtered_asofs = selected_asof_dates
     if not include_invalid:
-        tensor_valid = set(get_tensor_valid_asof_dates(data_dir_key, code))
-        label_valid = set(get_label_valid_asof_dates(data_dir_key, code))
+        with bench.timing("get_tensor_valid_asof_dates"):
+            tensor_valid = set(get_tensor_valid_asof_dates(data_dir_key, code))
+        with bench.timing("get_label_valid_asof_dates"):
+            label_valid = set(get_label_valid_asof_dates(data_dir_key, code))
         both_valid = tensor_valid & label_valid
         if both_valid:
             filtered_asofs = tuple(a for a in selected_asof_dates if a in both_valid)
@@ -113,8 +171,10 @@ def _rows_from_code_task(
 
     write_idx = 0
     for asof in filtered_asofs:
-        dp = build_multiscale_tensors(data_dir, code, asof)
-        lb = build_label_from_data_dir(data_dir, code, asof, dp_ok=dp.dp_ok)
+        with bench.timing("build_multiscale_tensors"):
+            dp = build_multiscale_tensors(data_dir, code, asof)
+        with bench.timing("build_label_from_data_dir"):
+            lb = build_label_from_data_dir(data_dir, code, asof, dp_ok=dp.dp_ok)
         if (not include_invalid) and (not lb.loss_mask):
             continue
 
@@ -135,27 +195,28 @@ def _rows_from_code_task(
         write_idx += 1
 
     shard_path = Path(shard_dir) / f"{code}.npz"
-    np.savez(
-        shard_path,
-        codes=codes[:write_idx],
-        asof_dates=asof_dates[:write_idx],
-        X_micro=X_micro[:write_idx],
-        X_mezzo=X_mezzo[:write_idx],
-        X_macro=X_macro[:write_idx],
-        mask_micro=mask_micro[:write_idx],
-        mask_mezzo=mask_mezzo[:write_idx],
-        mask_macro=mask_macro[:write_idx],
-        y=y[:write_idx],
-        y_raw=y_raw[:write_idx],
-        y_z=y_z[:write_idx],
-        dp_ok=dp_ok[:write_idx],
-        label_ok=label_ok[:write_idx],
-        loss_mask=loss_mask[:write_idx],
-    )
-    return {"path": str(shard_path), "rows": int(write_idx)}
+    with bench.timing("np.savez_shard"):
+        np.savez(
+            shard_path,
+            codes=codes[:write_idx],
+            asof_dates=asof_dates[:write_idx],
+            X_micro=X_micro[:write_idx],
+            X_mezzo=X_mezzo[:write_idx],
+            X_macro=X_macro[:write_idx],
+            mask_micro=mask_micro[:write_idx],
+            mask_mezzo=mask_mezzo[:write_idx],
+            mask_macro=mask_macro[:write_idx],
+            y=y[:write_idx],
+            y_raw=y_raw[:write_idx],
+            y_z=y_z[:write_idx],
+            dp_ok=dp_ok[:write_idx],
+            label_ok=label_ok[:write_idx],
+            loss_mask=loss_mask[:write_idx],
+        )
+    return {"path": str(shard_path), "rows": int(write_idx), "benchmark_lines": bench.to_lines()}
 
 
-def _merge_shards(shard_infos: list[dict]) -> TrainDatasetBundle:
+def _merge_shards(shard_infos: list[dict], benchmark: BenchmarkTracker | None = None) -> TrainDatasetBundle:
     if not shard_infos:
         return _empty_bundle()
 
@@ -181,9 +242,15 @@ def _merge_shards(shard_infos: list[dict]) -> TrainDatasetBundle:
     for info in shard_infos:
         if int(info.get("rows", 0)) <= 0:
             continue
-        with np.load(info["path"], allow_pickle=True) as d:
-            for k in parts:
-                parts[k].append(d[k])
+        if benchmark is None:
+            with np.load(info["path"], allow_pickle=True) as d:
+                for k in parts:
+                    parts[k].append(d[k])
+        else:
+            with benchmark.timing("np.load_shard"):
+                with np.load(info["path"], allow_pickle=True) as d:
+                    for k in parts:
+                        parts[k].append(d[k])
 
     if not parts["y"]:
         return _empty_bundle()
@@ -214,29 +281,50 @@ def build_train_dataset(
     num_workers: int = 1,
     show_progress: bool = True,
     shard_tmp_dir: str | Path | None = None,
-) -> TrainDatasetBundle:
-    selected_codes = resolve_codes(data_dir, codes)
-    selected_asof_dates = resolve_asof_dates(data_dir, asof_dates)
+    benchmark: bool = False,
+    return_benchmark_lines: bool = False,
+) -> TrainDatasetBundle | tuple[TrainDatasetBundle, list[str]]:
+    bench = BenchmarkTracker(enabled=benchmark)
+    with bench.timing("resolve_codes"):
+        selected_codes = resolve_codes(data_dir, codes)
+    with bench.timing("resolve_asof_dates"):
+        selected_asof_dates = resolve_asof_dates(data_dir, asof_dates)
+
+    if benchmark and selected_codes:
+        selected_codes = selected_codes[:1]
 
     asof_tuple = tuple(selected_asof_dates)
     tmp_root = None if shard_tmp_dir is None else str(Path(shard_tmp_dir))
-    with tempfile.TemporaryDirectory(prefix="train_dataset_shards_", dir=tmp_root) as shard_dir:
-        shard_infos: list[dict] = []
-        if num_workers <= 1:
-            iterator = _iter_progress(selected_codes, total=len(selected_codes), show_progress=show_progress, desc="building train dataset")
-            for code in iterator:
-                shard_infos.append(_rows_from_code_task(data_dir, code, asof_tuple, include_invalid, shard_dir))
-        else:
-            with ProcessPoolExecutor(max_workers=num_workers) as executor:
-                futures = [
-                    executor.submit(_rows_from_code_task, data_dir, code, asof_tuple, include_invalid, shard_dir)
-                    for code in selected_codes
-                ]
-                progress_iter = _iter_progress(as_completed(futures), total=len(futures), show_progress=show_progress, desc="building train dataset")
-                for fut in progress_iter:
-                    shard_infos.append(fut.result())
+    with bench.timing("temporary_directory_total"):
+        with tempfile.TemporaryDirectory(prefix="train_dataset_shards_", dir=tmp_root) as shard_dir:
+            shard_infos: list[dict] = []
+            if num_workers <= 1:
+                iterator = _iter_progress(selected_codes, total=len(selected_codes), show_progress=show_progress, desc="building train dataset")
+                for code in iterator:
+                    with bench.timing("_rows_from_code_task"):
+                        shard_infos.append(_rows_from_code_task(data_dir, code, asof_tuple, include_invalid, shard_dir, benchmark=benchmark))
+            else:
+                with ProcessPoolExecutor(max_workers=num_workers) as executor:
+                    futures = [
+                        executor.submit(_rows_from_code_task, data_dir, code, asof_tuple, include_invalid, shard_dir, benchmark)
+                        for code in selected_codes
+                    ]
+                    progress_iter = _iter_progress(as_completed(futures), total=len(futures), show_progress=show_progress, desc="building train dataset")
+                    for fut in progress_iter:
+                        shard_infos.append(fut.result())
 
-        return _merge_shards(shard_infos)
+            with bench.timing("_merge_shards"):
+                bundle = _merge_shards(shard_infos, benchmark=bench if benchmark else None)
+
+    child_lines: list[str] = []
+    if benchmark:
+        for info in shard_infos:
+            child_lines.extend([f"worker[{Path(info['path']).stem}] {line}" for line in info.get("benchmark_lines", [])])
+
+    benchmark_lines = [*bench.to_lines(), *child_lines]
+    if return_benchmark_lines:
+        return bundle, benchmark_lines
+    return bundle
 
 
 def save_train_dataset(bundle: TrainDatasetBundle, out_npz: str | Path) -> None:
