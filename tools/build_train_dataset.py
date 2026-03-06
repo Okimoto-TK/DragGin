@@ -4,7 +4,7 @@ import argparse
 from pathlib import Path
 
 from src.feat import build_multiscale_tensor, labels_risk_adj
-from src.feat.build_training_dataset import build_train_dataset, resolve_asof_dates, resolve_codes, save_train_dataset
+from src.feat import build_training_dataset as training_dataset
 
 
 def _split_csv(raw: str) -> list[str]:
@@ -26,18 +26,23 @@ def main() -> None:
 
     raw_codes = _split_csv(args.codes)
     raw_asof_dates = _split_csv(args.asof_dates)
-    codes = resolve_codes(args.data_dir, raw_codes or None)
-    asof_dates = resolve_asof_dates(args.data_dir, raw_asof_dates or None)
+    codes = training_dataset.resolve_codes(args.data_dir, raw_codes or None)
+    asof_dates = training_dataset.resolve_asof_dates(args.data_dir, raw_asof_dates or None)
     selected_codes = codes
     num_workers = max(1, int(args.num_workers))
     if args.benchmark:
         build_multiscale_tensor.enable_benchmark()
         labels_risk_adj.enable_benchmark()
+        # Rebind function references captured by build_training_dataset at import time
+        # so benchmark-wrapped functions are actually invoked.
+        training_dataset.build_multiscale_tensors = build_multiscale_tensor.build_multiscale_tensors
+        training_dataset.build_label_from_data_dir = labels_risk_adj.build_label_from_data_dir
+
         selected_codes = codes[:1]
         num_workers = 1
         print(f"benchmark mode enabled: running only first code: {selected_codes[0] if selected_codes else '<none>'}")
 
-    bundle = build_train_dataset(
+    bundle = training_dataset.build_train_dataset(
         data_dir=args.data_dir,
         codes=selected_codes,
         asof_dates=asof_dates,
@@ -48,7 +53,7 @@ def main() -> None:
     )
     out = Path(args.out)
     out.parent.mkdir(parents=True, exist_ok=True)
-    save_train_dataset(bundle, out)
+    training_dataset.save_train_dataset(bundle, out)
 
     print(f"saved: {out}")
     print(f"codes: {len(selected_codes)}")
