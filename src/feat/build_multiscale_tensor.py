@@ -18,9 +18,9 @@ RAW_WARMUP = 10
 EPS = 1e-8
 TANH_K = 5.0
 
-W_MICRO = 220
-W_MEZZO = 70
-W_MACRO = 55
+W_MICRO = 120
+W_MEZZO = 80
+W_MACRO = 45
 
 DATE_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{8})")
 
