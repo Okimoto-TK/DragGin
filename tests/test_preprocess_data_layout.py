@@ -2,7 +2,6 @@ from pathlib import Path
 
 import pandas as pd
 
-from tools import preprocess_data
 from tools.preprocess_data import preprocess
 
 
@@ -63,7 +62,7 @@ def test_preprocess_outputs_per_code_layout_and_calendar(tmp_path: Path) -> None
     assert sorted(cal["trade_date"].astype(str).tolist()) == ["2024-01-02", "2024-01-03"]
 
 
-def test_preprocess_writes_st_parquet_from_namechange(tmp_path: Path, monkeypatch) -> None:
+def test_preprocess_drops_nonpositive_volume_day_from_daily_and_5min(tmp_path: Path) -> None:
     raw = tmp_path / "raw"
     out = tmp_path / "out"
     raw.mkdir()
@@ -71,14 +70,14 @@ def test_preprocess_writes_st_parquet_from_namechange(tmp_path: Path, monkeypatc
 
     pd.DataFrame(
         {
-            "code": ["AAA"],
-            "trade_time": ["09:35"],
-            "close": [1.2],
-            "open": [1.1],
-            "high": [1.3],
-            "low": [1.0],
-            "vol": [110],
-            "date": ["20240102"],
+            "code": ["AAA", "AAA"],
+            "trade_time": ["2024-01-02 09:35", "2024-01-03 09:35"],
+            "close": [1.2, 1.3],
+            "open": [1.1, 1.2],
+            "high": [1.3, 1.4],
+            "low": [1.0, 1.1],
+            "vol": [110, 120],
+            "date": ["20240102", "20240103"],
         }
     ).to_csv(raw / "bars.csv", index=False)
 
@@ -91,53 +90,20 @@ def test_preprocess_writes_st_parquet_from_namechange(tmp_path: Path, monkeypatc
             "high": [11.0, 11.0],
             "low": [9.0, 9.0],
             "close": [10.5, 10.5],
-            "pct_chg": [5.0, 2.5],
+            "volume": [1000.0, 0.0],
         }
     ).to_parquet(raw / "daily.parquet", index=False)
 
-    def fake_fetch(start_date, end_date):
-        assert start_date.strftime("%Y%m%d") == "20240102"
-        assert end_date.strftime("%Y%m%d") == "20240103"
-        return pd.DataFrame(
-            {
-                "ts_code": ["AAA", "AAA", "BBB"],
-                "name": ["*STAAA", "AAA", "BBBST"],
-                "start_date": ["20240102", "20240201", "20240103"],
-                "end_date": ["20240110", None, "20240105"],
-            }
-        )
-
-    monkeypatch.setattr(preprocess_data, "_fetch_namechange", fake_fetch)
-
     preprocess(raw, out)
 
-    st = pd.read_parquet(out / "AAA" / "st.parquet")
-    assert st["st_type"].tolist() == ["*ST"]
-    assert st["start_date"].astype(str).tolist() == ["2024-01-02"]
-    assert st["revoke_st_date"].astype(str).tolist() == ["2024-01-10"]
-    assert not (out / "BBB" / "st.parquet").exists()
+    d1 = pd.read_parquet(out / "AAA" / "daily.parquet")
+    assert d1["trade_date"].astype(str).tolist() == ["2024-01-02"]
 
+    m5 = pd.read_parquet(out / "AAA" / "5min.parquet")
+    assert m5["trade_date"].astype(str).tolist() == ["2024-01-02"]
 
-
-def test_build_st_markers_handles_st_starst_transitions() -> None:
-    namechange = pd.DataFrame(
-        {
-            "ts_code": ["AAA", "AAA", "AAA", "BBB", "BBB", "CCC"],
-            "name": ["STAAA", "*STAAA", "AAA", "*STBBB", "BBB", "BBBST"],
-            "start_date": ["20240101", "20240301", "20240501", "20240201", "20240601", "20240102"],
-            "end_date": ["20240229", "20240430", None, "20240531", None, "20240110"],
-        }
-    )
-
-    st_df = preprocess_data._build_st_markers(namechange)
-
-    assert st_df["code"].tolist() == ["AAA", "AAA", "BBB"]
-    assert st_df["st_type"].tolist() == ["ST", "*ST", "*ST"]
-    assert st_df["start_date"].astype(str).tolist() == ["2024-01-01", "2024-03-01", "2024-02-01"]
-    # ST撤销、*ST撤销时间来自对应记录的end_date
-    assert st_df["revoke_st_date"].astype(str).tolist() == ["2024-02-29", "2024-04-30", "2024-05-31"]
-    # 非前缀名称不应被误判为ST
-    assert "CCC" not in st_df["code"].tolist()
+    cal = pd.read_parquet(out / "calendar.parquet")
+    assert cal["trade_date"].astype(str).tolist() == ["2024-01-02"]
 
 
 def test_preprocess_handles_non_hhmm_time_without_crash(tmp_path: Path) -> None:

@@ -2,14 +2,12 @@ from __future__ import annotations
 
 import argparse
 import csv
-import os
 import shutil
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable
 
-import numpy as np
 import pandas as pd
 
 try:
@@ -174,7 +172,9 @@ def _normalize_daily(df: pd.DataFrame) -> pd.DataFrame:
     )
     out["code"] = out["code"].astype(str)
     out["trade_date"] = _normalize_trade_date(out["trade_date"])
-    out = out.dropna(subset=["code", "trade_date"])
+    out["volume"] = pd.to_numeric(out["volume"], errors="coerce")
+    out = out.dropna(subset=["code", "trade_date", "volume"])
+    out = out[out["volume"] > 0]
     out = out.sort_values(["code", "trade_date"]).drop_duplicates(subset=["code", "trade_date"], keep="last")
     out = out.reset_index(drop=True)
     return out
@@ -290,78 +290,42 @@ def _combine_and_write_code(code: str, out_dir: Path) -> set[pd.Timestamp]:
     code_dir = out_dir / str(code)
     cal_dates = set()
 
-    parts_5m = list(code_dir.glob("5m_part_*.parquet"))
-    if parts_5m:
-        dfs = [pd.read_parquet(p) for p in parts_5m]
-        if dfs:
-            m5 = pd.concat(dfs, ignore_index=True)
-            m5 = m5.sort_values("dt").reset_index(drop=True)
-            m5.to_parquet(code_dir / "5min.parquet", index=False)
-        # 销毁碎片
-        for p in parts_5m:
-            try: p.unlink()
-            except OSError: pass
+    valid_trade_dates: set[pd.Timestamp] | None = None
 
     parts_1d = list(code_dir.glob("1d_part_*.parquet"))
     if parts_1d:
         dfs = [pd.read_parquet(p) for p in parts_1d]
         if dfs:
             d1 = pd.concat(dfs, ignore_index=True)
+            d1["volume"] = pd.to_numeric(d1["volume"], errors="coerce")
+            d1 = d1.dropna(subset=["trade_date", "volume"])
+            d1 = d1[d1["volume"] > 0]
             d1 = d1.sort_values("trade_date").drop_duplicates(subset=["trade_date"], keep="last").reset_index(drop=True)
             d1.to_parquet(code_dir / "daily.parquet", index=False)
-            cal_dates.update(d1["trade_date"].tolist())
+            valid_trade_dates = set(d1["trade_date"].tolist())
+            cal_dates.update(valid_trade_dates)
         for p in parts_1d:
-            try: p.unlink()
-            except OSError: pass
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+    parts_5m = list(code_dir.glob("5m_part_*.parquet"))
+    if parts_5m:
+        dfs = [pd.read_parquet(p) for p in parts_5m]
+        if dfs:
+            m5 = pd.concat(dfs, ignore_index=True)
+            if valid_trade_dates is not None:
+                m5 = m5[m5["trade_date"].isin(valid_trade_dates)]
+            m5 = m5.sort_values("dt").reset_index(drop=True)
+            m5.to_parquet(code_dir / "5min.parquet", index=False)
+        for p in parts_5m:
+            try:
+                p.unlink()
+            except OSError:
+                pass
 
     return cal_dates
-
-
-def _fetch_namechange(start_date: pd.Timestamp, end_date: pd.Timestamp) -> pd.DataFrame:
-    token = os.getenv("TUSHARE_TOKEN", "").strip()
-    if not token: return pd.DataFrame()
-    try:
-        import tushare as ts
-        pro = ts.pro_api(token)
-        df = pro.namechange(
-            ts_code="",
-            start_date=start_date.strftime("%Y%m%d"),
-            end_date=end_date.strftime("%Y%m%d"),
-            limit="",
-            offset="",
-            fields=["ts_code", "name", "start_date", "end_date"],
-        )
-        return df if df is not None else pd.DataFrame()
-    except Exception:
-        return pd.DataFrame()
-
-
-def _build_st_markers(namechange: pd.DataFrame) -> pd.DataFrame:
-    if namechange.empty: return pd.DataFrame()
-    df = namechange.copy().rename(columns={"ts_code": "code"})
-    df["name"] = df["name"].astype(str)
-    df["start_date"] = _normalize_trade_date(df["start_date"])
-    df["end_date"] = _normalize_trade_date(df["end_date"])
-    df = df.dropna(subset=["code", "start_date"]).reset_index(drop=True)
-
-    normalized_name = df["name"].str.strip()
-    is_star_st = normalized_name.str.startswith("*ST", na=False)
-    is_st = normalized_name.str.startswith("ST", na=False) | is_star_st
-    st_df = df[is_st].copy()
-    if st_df.empty: return pd.DataFrame()
-
-    st_df["st_type"] = np.where(is_star_st.loc[st_df.index], "*ST", "ST")
-    st_df["revoke_st_date"] = st_df["end_date"]
-    return st_df[["code", "name", "start_date", "end_date", "st_type", "revoke_st_date"]].sort_values(
-        ["code", "start_date", "end_date"], na_position="last").reset_index(drop=True)
-
-
-def _write_st_files(st_df: pd.DataFrame, out_dir: Path) -> None:
-    if st_df.empty: return
-    for code, g in st_df.groupby("code", sort=False):
-        code_dir = out_dir / str(code)
-        code_dir.mkdir(parents=True, exist_ok=True)
-        g.reset_index(drop=True).to_parquet(code_dir / "st.parquet", index=False)
 
 
 def preprocess(raw_dir: Path, out_dir: Path, max_workers: int = 4) -> None:
@@ -401,11 +365,6 @@ def preprocess(raw_dir: Path, out_dir: Path, max_workers: int = 4) -> None:
         calendar = pd.DataFrame({"trade_date": sorted(all_calendar_dates)})
         calendar.to_parquet(out_dir / "calendar.parquet", index=False)
 
-        min_trade_date = pd.to_datetime(calendar["trade_date"].min())
-        max_trade_date = pd.to_datetime(calendar["trade_date"].max())
-        namechange = _fetch_namechange(min_trade_date, max_trade_date)
-        st_df = _build_st_markers(namechange)
-        _write_st_files(st_df, out_dir)
 
 
 if __name__ == "__main__":
