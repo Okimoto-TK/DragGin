@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import re
+from functools import lru_cache
 from dataclasses import dataclass
 from datetime import date
 from pathlib import Path
@@ -119,6 +120,16 @@ def load_daily_data(data_dir: str | Path, code: str) -> pd.DataFrame:
     return out
 
 
+@lru_cache(maxsize=512)
+def _load_5m_data_cached(data_dir: str, code: str) -> pd.DataFrame:
+    return load_5m_data(data_dir, code)
+
+
+@lru_cache(maxsize=512)
+def _load_daily_data_cached(data_dir: str, code: str) -> pd.DataFrame:
+    return load_daily_data(data_dir, code)
+
+
 
 
 def load_breakpoints(data_dir: str | Path, code: str) -> set[date]:
@@ -131,6 +142,18 @@ def load_breakpoints(data_dir: str | Path, code: str) -> set[date]:
         return set()
     parsed = pd.to_datetime(bp.get("break_date"), errors="coerce").dropna()
     return set(parsed.dt.date.tolist())
+
+
+@lru_cache(maxsize=512)
+def _load_breakpoints_cached(data_dir: str, code: str) -> tuple[date, ...]:
+    return tuple(sorted(load_breakpoints(data_dir, code)))
+
+
+@lru_cache(maxsize=16)
+def _load_market_calendar_dates(data_dir: str) -> tuple[date, ...]:
+    return tuple(pd.to_datetime(x).date() for x in build_calendar_from_daily_filenames(data_dir))
+
+
 def aggregate_30m_from_5m(df_5m: pd.DataFrame) -> pd.DataFrame:
     agg_rows = []
     for d, g in df_5m.groupby("trade_date"):
@@ -287,9 +310,10 @@ def _has_breakpoint_crossing(dates: list[date], start_idx: int, end_idx: int, br
         return False
     return any(window_dates[0] < b <= window_dates[-1] for b in breakpoints)
 def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) -> DPResult:
+    data_dir_key = str(Path(data_dir).resolve())
     asof = pd.to_datetime(asof_date).date()
-    m5 = load_5m_data(data_dir, code)
-    d1 = load_daily_data(data_dir, code)
+    m5 = _load_5m_data_cached(data_dir_key, code).copy()
+    d1 = _load_daily_data_cached(data_dir_key, code).copy()
     if not _validate_raw(m5):
         return empty_result(code, asof_date, "missing/invalid 5m raw schema")
     if not _validate_raw(d1):
@@ -324,13 +348,13 @@ def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) ->
     if X_mezzo is None:
         return empty_result(code, asof_date, f"mezzo: {err}")
 
-    market_calendar = [pd.to_datetime(x).date() for x in build_calendar_from_daily_filenames(data_dir)]
+    market_calendar = _load_market_calendar_dates(data_dir_key)
     stock_trade_dates = set(d1["trade_date"].tolist())
     stock_calendar = [d for d in market_calendar if d in stock_trade_dates]
     if asof not in stock_calendar:
         return empty_result(code, asof_date, "asof date not in calendar")
     idx = stock_calendar.index(asof)
-    breakpoints = load_breakpoints(data_dir, code)
+    breakpoints = set(_load_breakpoints_cached(data_dir_key, code))
     req = L_MACRO + W_MACRO + RAW_WARMUP
     if idx + 1 < req:
         return empty_result(code, asof_date, "macro: insufficient zscore warmup/history")
