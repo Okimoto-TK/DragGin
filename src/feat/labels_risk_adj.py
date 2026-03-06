@@ -45,6 +45,8 @@ class _LabelContext:
     valid_raw_values: tuple[float, ...]
     raw_details_by_index: dict[int, dict]
     raw_fail_by_index: dict[int, str]
+    z_mu_by_valid_pos: tuple[float, ...]
+    z_sd_by_valid_pos: tuple[float, ...]
 
 
 def compute_daily_log_returns(df_daily_sorted: pd.DataFrame) -> pd.Series:
@@ -217,6 +219,24 @@ def _build_label_context(data_dir: str, code: str) -> _LabelContext | None:
         else:
             raw_fail_by_index[idx] = fail_reason or "raw label build failed"
 
+    valid_raw_values_np = np.asarray(valid_raw_values, dtype=np.float64)
+    if len(valid_raw_values_np) > 0:
+        csum = np.concatenate(([0.0], np.cumsum(valid_raw_values_np)))
+        csum2 = np.concatenate(([0.0], np.cumsum(valid_raw_values_np * valid_raw_values_np)))
+        mu = np.full((len(valid_raw_values_np),), np.nan, dtype=np.float64)
+        sd = np.full((len(valid_raw_values_np),), np.nan, dtype=np.float64)
+        if len(valid_raw_values_np) > LABEL_Z_WINDOW:
+            ends = np.arange(LABEL_Z_WINDOW, len(valid_raw_values_np), dtype=np.int64)
+            sums = csum[ends] - csum[ends - LABEL_Z_WINDOW]
+            sums2 = csum2[ends] - csum2[ends - LABEL_Z_WINDOW]
+            m = sums / LABEL_Z_WINDOW
+            var = np.maximum(sums2 / LABEL_Z_WINDOW - m * m, 0.0)
+            mu[ends] = m
+            sd[ends] = np.sqrt(var)
+    else:
+        mu = np.asarray([], dtype=np.float64)
+        sd = np.asarray([], dtype=np.float64)
+
     return _LabelContext(
         calendar_dates=calendar_dates,
         trading_calendar_dates=trading_calendar_dates,
@@ -226,6 +246,8 @@ def _build_label_context(data_dir: str, code: str) -> _LabelContext | None:
         valid_raw_values=tuple(valid_raw_values),
         raw_details_by_index=raw_details_by_index,
         raw_fail_by_index=raw_fail_by_index,
+        z_mu_by_valid_pos=tuple(mu.tolist()),
+        z_sd_by_valid_pos=tuple(sd.tolist()),
     )
 
 def build_label_for_sample(
@@ -345,9 +367,8 @@ def build_label_from_data_dir(
     if pos < LABEL_Z_WINDOW:
         return _fail(code, asof_date, dp_ok, f"insufficient y_raw history for label zscore: need {LABEL_Z_WINDOW}, got {pos}")
 
-    past_window = np.asarray(valid_values[pos - LABEL_Z_WINDOW : pos], dtype=np.float64)
-    mu = float(np.mean(past_window))
-    sd = float(np.std(past_window, ddof=0))
+    mu = float(context.z_mu_by_valid_pos[pos])
+    sd = float(context.z_sd_by_valid_pos[pos])
     if (not np.isfinite(mu)) or (not np.isfinite(sd)) or sd <= 0:
         return _fail(code, asof_date, dp_ok, "label zscore sd invalid (<=0 or non-finite)")
 
