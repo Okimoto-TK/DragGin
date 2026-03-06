@@ -189,14 +189,23 @@ def _apply_asof_price_adjustment(
     asof_date: date,
     adj_factor_by_date: pd.Series,
 ) -> tuple[Optional[pd.DataFrame], str]:
-    if asof_date not in adj_factor_by_date.index:
+    adj_map = adj_factor_by_date.copy()
+    adj_map.index = pd.to_datetime(adj_map.index, errors="coerce").date
+
+    if asof_date not in adj_map.index:
         return None, "missing adj_factor on asof date"
-    asof_factor = float(adj_factor_by_date.loc[asof_date])
+    asof_factor = float(adj_map.loc[asof_date])
     if (not np.isfinite(asof_factor)) or asof_factor <= 0:
         return None, "invalid adj_factor on asof date"
 
-    trade_dates = df["trade_date"]
-    mapped = trade_dates.map(adj_factor_by_date)
+    if "trade_date" in df.columns:
+        trade_dates = pd.to_datetime(df["trade_date"], errors="coerce").dt.date
+    elif "dt" in df.columns:
+        trade_dates = pd.to_datetime(df["dt"], errors="coerce").dt.date
+    else:
+        return None, "missing trade_date/dt for adjustment"
+
+    mapped = trade_dates.map(adj_map)
     if mapped.isna().any():
         return None, "missing adj_factor in required history"
     factors = mapped.astype(float).to_numpy() / asof_factor
