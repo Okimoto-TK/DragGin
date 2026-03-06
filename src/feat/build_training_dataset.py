@@ -3,6 +3,7 @@ from __future__ import annotations
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
+import sys
 import tempfile
 import time
 
@@ -16,6 +17,11 @@ try:
     from tqdm.auto import tqdm
 except Exception:  # pragma: no cover
     tqdm = None
+
+TARGET_BENCH_MODULES = {
+    "src.feat.build_multiscale_tensor",
+    "src.feat.labels_risk_adj",
+}
 
 
 @dataclass
@@ -37,25 +43,85 @@ class TrainDatasetBundle:
 
 
 @dataclass
+class FunctionBenchmarkStat:
+    name: str
+    call_count: int
+    total_ms: float
+    avg_ms: float
+    p50_ms: float
+    p95_ms: float
+
+
+@dataclass
 class BenchmarkReport:
     code: str
     rows_total: int
     rows_kept: int
-    dp_total_ms: float
-    dp_avg_ms: float
-    dp_p50_ms: float
-    dp_p95_ms: float
-    label_total_ms: float
-    label_avg_ms: float
-    label_p50_ms: float
-    label_p95_ms: float
-    end_to_end_total_ms: float
-    end_to_end_avg_ms: float
-    end_to_end_p50_ms: float
-    end_to_end_p95_ms: float
-    dp_ok_count: int
-    label_ok_count: int
-    loss_mask_count: int
+    function_stats: tuple[FunctionBenchmarkStat, ...]
+
+
+_LAST_BENCHMARK_REPORT: BenchmarkReport | None = None
+
+
+class _FunctionProfiler:
+    def __init__(self, enabled: bool):
+        self.enabled = enabled
+        self._active = False
+        self._starts: dict[int, tuple[str, float]] = {}
+        self._durations: dict[str, list[float]] = {}
+
+    def _callback(self, frame, event, arg):
+        if not self.enabled:
+            return
+        module_name = frame.f_globals.get("__name__", "")
+        if module_name not in TARGET_BENCH_MODULES:
+            return
+
+        frame_id = id(frame)
+        if event == "call":
+            func_name = f"{module_name}.{frame.f_code.co_name}"
+            self._starts[frame_id] = (func_name, time.perf_counter())
+            return
+
+        if event == "return":
+            start = self._starts.pop(frame_id, None)
+            if start is None:
+                return
+            func_name, start_ts = start
+            elapsed_ms = (time.perf_counter() - start_ts) * 1000.0
+            self._durations.setdefault(func_name, []).append(elapsed_ms)
+
+    def __enter__(self):
+        if self.enabled:
+            self._active = True
+            sys.setprofile(self._callback)
+        return self
+
+    def __exit__(self, exc_type, exc, tb):
+        if self._active:
+            sys.setprofile(None)
+            self._active = False
+
+    def build_stats(self) -> tuple[FunctionBenchmarkStat, ...]:
+        out: list[FunctionBenchmarkStat] = []
+        for name, durations in self._durations.items():
+            total, avg, p50, p95 = _timing_stats(durations)
+            out.append(
+                FunctionBenchmarkStat(
+                    name=name,
+                    call_count=len(durations),
+                    total_ms=total,
+                    avg_ms=avg,
+                    p50_ms=p50,
+                    p95_ms=p95,
+                )
+            )
+        out.sort(key=lambda x: x.total_ms, reverse=True)
+        return tuple(out)
+
+
+def get_last_benchmark_report() -> BenchmarkReport | None:
+    return _LAST_BENCHMARK_REPORT
 
 
 def _empty_bundle() -> TrainDatasetBundle:
@@ -133,41 +199,31 @@ def _rows_from_code_task(
     label_ok = np.zeros((n,), dtype=np.bool_)
     loss_mask = np.zeros((n,), dtype=np.bool_)
 
-    dp_times_ms: list[float] = []
-    label_times_ms: list[float] = []
-    e2e_times_ms: list[float] = []
+    profiler = _FunctionProfiler(enabled=benchmark)
 
     write_idx = 0
-    for asof in selected_asof_dates:
-        iter_start = time.perf_counter()
+    with profiler:
+        for asof in selected_asof_dates:
+            dp = build_multiscale_tensors(data_dir, code, asof)
+            lb = build_label_from_data_dir(data_dir, code, asof, dp_ok=dp.dp_ok)
+            if (not include_invalid) and (not lb.loss_mask):
+                continue
 
-        dp_start = time.perf_counter()
-        dp = build_multiscale_tensors(data_dir, code, asof)
-        dp_times_ms.append((time.perf_counter() - dp_start) * 1000.0)
-
-        label_start = time.perf_counter()
-        lb = build_label_from_data_dir(data_dir, code, asof, dp_ok=dp.dp_ok)
-        label_times_ms.append((time.perf_counter() - label_start) * 1000.0)
-        e2e_times_ms.append((time.perf_counter() - iter_start) * 1000.0)
-
-        if (not include_invalid) and (not lb.loss_mask):
-            continue
-
-        codes[write_idx] = code
-        asof_dates[write_idx] = asof
-        X_micro[write_idx] = dp.X_micro.astype(np.float32)
-        X_mezzo[write_idx] = dp.X_mezzo.astype(np.float32)
-        X_macro[write_idx] = dp.X_macro.astype(np.float32)
-        mask_micro[write_idx] = dp.mask_micro.astype(np.uint8)
-        mask_mezzo[write_idx] = dp.mask_mezzo.astype(np.uint8)
-        mask_macro[write_idx] = dp.mask_macro.astype(np.uint8)
-        y[write_idx] = np.float32(lb.y)
-        y_raw[write_idx] = np.float32(lb.y_raw)
-        y_z[write_idx] = np.float32(lb.y_z)
-        dp_ok[write_idx] = bool(dp.dp_ok)
-        label_ok[write_idx] = bool(lb.label_ok)
-        loss_mask[write_idx] = bool(lb.loss_mask)
-        write_idx += 1
+            codes[write_idx] = code
+            asof_dates[write_idx] = asof
+            X_micro[write_idx] = dp.X_micro.astype(np.float32)
+            X_mezzo[write_idx] = dp.X_mezzo.astype(np.float32)
+            X_macro[write_idx] = dp.X_macro.astype(np.float32)
+            mask_micro[write_idx] = dp.mask_micro.astype(np.uint8)
+            mask_mezzo[write_idx] = dp.mask_mezzo.astype(np.uint8)
+            mask_macro[write_idx] = dp.mask_macro.astype(np.uint8)
+            y[write_idx] = np.float32(lb.y)
+            y_raw[write_idx] = np.float32(lb.y_raw)
+            y_z[write_idx] = np.float32(lb.y_z)
+            dp_ok[write_idx] = bool(dp.dp_ok)
+            label_ok[write_idx] = bool(lb.label_ok)
+            loss_mask[write_idx] = bool(lb.loss_mask)
+            write_idx += 1
 
     shard_path = Path(shard_dir) / f"{code}.npz"
     np.savez(
@@ -190,28 +246,11 @@ def _rows_from_code_task(
 
     out = {"path": str(shard_path), "rows": int(write_idx)}
     if benchmark:
-        dp_total, dp_avg, dp_p50, dp_p95 = _timing_stats(dp_times_ms)
-        label_total, label_avg, label_p50, label_p95 = _timing_stats(label_times_ms)
-        e2e_total, e2e_avg, e2e_p50, e2e_p95 = _timing_stats(e2e_times_ms)
         out["benchmark"] = BenchmarkReport(
             code=code,
             rows_total=len(selected_asof_dates),
             rows_kept=int(write_idx),
-            dp_total_ms=dp_total,
-            dp_avg_ms=dp_avg,
-            dp_p50_ms=dp_p50,
-            dp_p95_ms=dp_p95,
-            label_total_ms=label_total,
-            label_avg_ms=label_avg,
-            label_p50_ms=label_p50,
-            label_p95_ms=label_p95,
-            end_to_end_total_ms=e2e_total,
-            end_to_end_avg_ms=e2e_avg,
-            end_to_end_p50_ms=e2e_p50,
-            end_to_end_p95_ms=e2e_p95,
-            dp_ok_count=int(dp_ok[:write_idx].sum()),
-            label_ok_count=int(label_ok[:write_idx].sum()),
-            loss_mask_count=int(loss_mask[:write_idx].sum()),
+            function_stats=profiler.build_stats(),
         )
     return out
 
@@ -276,7 +315,9 @@ def build_train_dataset(
     show_progress: bool = True,
     shard_tmp_dir: str | Path | None = None,
     benchmark: bool = False,
-) -> tuple[TrainDatasetBundle, BenchmarkReport | None]:
+) -> TrainDatasetBundle:
+    global _LAST_BENCHMARK_REPORT
+
     selected_codes = resolve_codes(data_dir, codes)
     selected_asof_dates = resolve_asof_dates(data_dir, asof_dates)
 
@@ -302,11 +343,10 @@ def build_train_dataset(
                 for fut in progress_iter:
                     shard_infos.append(fut.result())
 
-        bundle = _merge_shards(shard_infos)
-        benchmark_report = None
+        _LAST_BENCHMARK_REPORT = None
         if benchmark and shard_infos:
-            benchmark_report = shard_infos[0].get("benchmark")
-        return bundle, benchmark_report
+            _LAST_BENCHMARK_REPORT = shard_infos[0].get("benchmark")
+        return _merge_shards(shard_infos)
 
 
 def save_train_dataset(bundle: TrainDatasetBundle, out_npz: str | Path) -> None:
