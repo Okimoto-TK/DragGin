@@ -6,10 +6,12 @@ from pathlib import Path
 import tempfile
 
 import numpy as np
+import pandas as pd
 
 from src.feat.build_multiscale_tensor import build_calendar_from_daily_filenames
-from src.feat.build_multiscale_tensor import build_multiscale_tensors
-from src.feat.labels_risk_adj import build_label_from_data_dir
+from src.feat.build_multiscale_tensor import L_MACRO, L_MEZZO, L_MICRO
+from src.feat.build_multiscale_tensor import _build_tensor_context, get_tensor_valid_asof_dates
+from src.feat.labels_risk_adj import _build_label_context, get_label_valid_asof_dates
 
 try:
     from tqdm.auto import tqdm
@@ -86,6 +88,8 @@ def _rows_from_code_task(
     include_invalid: bool,
     shard_dir: str,
 ) -> dict:
+    data_dir_key = str(Path(data_dir).resolve())
+    asof_parsed = [pd.to_datetime(x).date() for x in selected_asof_dates]
     n = len(selected_asof_dates)
     codes = np.empty((n,), dtype=object)
     asof_dates = np.empty((n,), dtype=object)
@@ -102,46 +106,71 @@ def _rows_from_code_task(
     label_ok = np.zeros((n,), dtype=np.bool_)
     loss_mask = np.zeros((n,), dtype=np.bool_)
 
-    write_idx = 0
-    for asof in selected_asof_dates:
-        dp = build_multiscale_tensors(data_dir, code, asof)
-        lb = build_label_from_data_dir(data_dir, code, asof, dp_ok=dp.dp_ok)
-        if (not include_invalid) and (not lb.loss_mask):
-            continue
+    tensor_context = _build_tensor_context(data_dir_key, code)
+    valid_tensor_dates = set(get_tensor_valid_asof_dates(data_dir_key, code))
+    tensor_valid_pos = np.asarray([i for i, asof in enumerate(selected_asof_dates) if asof in valid_tensor_dates], dtype=np.int64)
+    if tensor_context is not None and tensor_valid_pos.size > 0:
+        tensor_valid_dates = [asof_parsed[i] for i in tensor_valid_pos]
+        micro_end = np.asarray([tensor_context.asof_to_micro_end[d] for d in tensor_valid_dates], dtype=np.int64)
+        mezzo_end = np.asarray([tensor_context.asof_to_mezzo_end[d] for d in tensor_valid_dates], dtype=np.int64)
+        macro_end = np.asarray([tensor_context.asof_to_macro_idx[d] for d in tensor_valid_dates], dtype=np.int64)
 
-        codes[write_idx] = code
-        asof_dates[write_idx] = asof
-        X_micro[write_idx] = dp.X_micro.astype(np.float32)
-        X_mezzo[write_idx] = dp.X_mezzo.astype(np.float32)
-        X_macro[write_idx] = dp.X_macro.astype(np.float32)
-        mask_micro[write_idx] = dp.mask_micro.astype(np.uint8)
-        mask_mezzo[write_idx] = dp.mask_mezzo.astype(np.uint8)
-        mask_macro[write_idx] = dp.mask_macro.astype(np.uint8)
-        y[write_idx] = np.float32(lb.y)
-        y_raw[write_idx] = np.float32(lb.y_raw)
-        y_z[write_idx] = np.float32(lb.y_z)
-        dp_ok[write_idx] = bool(dp.dp_ok)
-        label_ok[write_idx] = bool(lb.label_ok)
-        loss_mask[write_idx] = bool(lb.loss_mask)
-        write_idx += 1
+        micro_offsets = np.arange(-L_MICRO + 1, 1, dtype=np.int64)
+        mezzo_offsets = np.arange(-L_MEZZO + 1, 1, dtype=np.int64)
+        macro_offsets = np.arange(-L_MACRO + 1, 1, dtype=np.int64)
+
+        micro_idx2d = micro_end[:, None] + micro_offsets[None, :]
+        mezzo_idx2d = mezzo_end[:, None] + mezzo_offsets[None, :]
+        macro_idx2d = macro_end[:, None] + macro_offsets[None, :]
+
+        X_micro[tensor_valid_pos] = tensor_context.micro_z[micro_idx2d].astype(np.float32)
+        X_mezzo[tensor_valid_pos] = tensor_context.mezzo_z[mezzo_idx2d].astype(np.float32)
+        X_macro[tensor_valid_pos] = tensor_context.macro_z[macro_idx2d].astype(np.float32)
+        mask_micro[tensor_valid_pos] = np.ones((tensor_valid_pos.size, L_MICRO), dtype=np.uint8)
+        mask_mezzo[tensor_valid_pos] = np.ones((tensor_valid_pos.size, L_MEZZO), dtype=np.uint8)
+        mask_macro[tensor_valid_pos] = np.ones((tensor_valid_pos.size, L_MACRO), dtype=np.uint8)
+        dp_ok[tensor_valid_pos] = True
+
+    label_context = _build_label_context(data_dir_key, code)
+    valid_label_dates = set(get_label_valid_asof_dates(data_dir_key, code))
+    label_valid_pos = np.asarray([i for i, asof in enumerate(selected_asof_dates) if asof in valid_label_dates], dtype=np.int64)
+    if label_context is not None and label_valid_pos.size > 0:
+        label_valid_dates = [asof_parsed[i] for i in label_valid_pos]
+        idx_arr = np.asarray([label_context.asof_to_trading_idx[d] for d in label_valid_dates], dtype=np.int64)
+        valid_pos_arr = np.asarray([label_context.raw_idx_to_valid_pos[idx] for idx in idx_arr], dtype=np.int64)
+        valid_raw_values = np.asarray(label_context.valid_raw_values, dtype=np.float32)
+        label_values = np.asarray(label_context.label_value_by_idx, dtype=np.float32)
+
+        y_raw[label_valid_pos] = valid_raw_values[valid_pos_arr]
+        y_z[label_valid_pos] = label_values[idx_arr]
+        y[label_valid_pos] = label_values[idx_arr]
+        label_ok[label_valid_pos] = True
+
+    loss_mask = dp_ok & label_ok
+
+    codes[:] = code
+    asof_dates[:] = np.asarray(selected_asof_dates, dtype=object)
+
+    keep = np.arange(n, dtype=np.int64) if include_invalid else np.flatnonzero(loss_mask)
+    write_idx = int(keep.size)
 
     shard_path = Path(shard_dir) / f"{code}.npz"
     np.savez(
         shard_path,
-        codes=codes[:write_idx],
-        asof_dates=asof_dates[:write_idx],
-        X_micro=X_micro[:write_idx],
-        X_mezzo=X_mezzo[:write_idx],
-        X_macro=X_macro[:write_idx],
-        mask_micro=mask_micro[:write_idx],
-        mask_mezzo=mask_mezzo[:write_idx],
-        mask_macro=mask_macro[:write_idx],
-        y=y[:write_idx],
-        y_raw=y_raw[:write_idx],
-        y_z=y_z[:write_idx],
-        dp_ok=dp_ok[:write_idx],
-        label_ok=label_ok[:write_idx],
-        loss_mask=loss_mask[:write_idx],
+        codes=codes[keep],
+        asof_dates=asof_dates[keep],
+        X_micro=X_micro[keep],
+        X_mezzo=X_mezzo[keep],
+        X_macro=X_macro[keep],
+        mask_micro=mask_micro[keep],
+        mask_mezzo=mask_mezzo[keep],
+        mask_macro=mask_macro[keep],
+        y=y[keep],
+        y_raw=y_raw[keep],
+        y_z=y_z[keep],
+        dp_ok=dp_ok[keep],
+        label_ok=label_ok[keep],
+        loss_mask=loss_mask[keep],
     )
     return {"path": str(shard_path), "rows": int(write_idx)}
 
