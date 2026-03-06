@@ -262,8 +262,8 @@ def _extract_tail_tensor(
     sd = past_only.rolling(window=z_window, min_periods=z_window).std(ddof=0)
 
     sd_tail = sd.iloc[-L:]
-    if (~np.isfinite(sd_tail.to_numpy()) | (sd_tail.to_numpy() <= 0)).any():
-        return None, "zscore sd invalid (<=0 or non-finite)"
+    if (~np.isfinite(sd_tail.to_numpy()) | (sd_tail.to_numpy() < 0)).any():
+        return None, "zscore sd invalid (<0 or non-finite)"
 
     z = (raw - mu) / sd.clip(lower=EPS)
     z = TANH_K * np.tanh(z / TANH_K)
