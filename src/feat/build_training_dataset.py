@@ -4,6 +4,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 import tempfile
+import time
 
 import numpy as np
 
@@ -33,6 +34,28 @@ class TrainDatasetBundle:
     dp_ok: np.ndarray
     label_ok: np.ndarray
     loss_mask: np.ndarray
+
+
+@dataclass
+class BenchmarkReport:
+    code: str
+    rows_total: int
+    rows_kept: int
+    dp_total_ms: float
+    dp_avg_ms: float
+    dp_p50_ms: float
+    dp_p95_ms: float
+    label_total_ms: float
+    label_avg_ms: float
+    label_p50_ms: float
+    label_p95_ms: float
+    end_to_end_total_ms: float
+    end_to_end_avg_ms: float
+    end_to_end_p50_ms: float
+    end_to_end_p95_ms: float
+    dp_ok_count: int
+    label_ok_count: int
+    loss_mask_count: int
 
 
 def _empty_bundle() -> TrainDatasetBundle:
@@ -79,12 +102,20 @@ def _iter_progress(iterable, total: int, show_progress: bool, desc: str):
     return iterable
 
 
+def _timing_stats(values: list[float]) -> tuple[float, float, float, float]:
+    if not values:
+        return 0.0, 0.0, 0.0, 0.0
+    arr = np.asarray(values, dtype=np.float64)
+    return float(arr.sum()), float(arr.mean()), float(np.percentile(arr, 50)), float(np.percentile(arr, 95))
+
+
 def _rows_from_code_task(
     data_dir: str | Path,
     code: str,
     selected_asof_dates: tuple[str, ...],
     include_invalid: bool,
     shard_dir: str,
+    benchmark: bool = False,
 ) -> dict:
     n = len(selected_asof_dates)
     codes = np.empty((n,), dtype=object)
@@ -102,10 +133,23 @@ def _rows_from_code_task(
     label_ok = np.zeros((n,), dtype=np.bool_)
     loss_mask = np.zeros((n,), dtype=np.bool_)
 
+    dp_times_ms: list[float] = []
+    label_times_ms: list[float] = []
+    e2e_times_ms: list[float] = []
+
     write_idx = 0
     for asof in selected_asof_dates:
+        iter_start = time.perf_counter()
+
+        dp_start = time.perf_counter()
         dp = build_multiscale_tensors(data_dir, code, asof)
+        dp_times_ms.append((time.perf_counter() - dp_start) * 1000.0)
+
+        label_start = time.perf_counter()
         lb = build_label_from_data_dir(data_dir, code, asof, dp_ok=dp.dp_ok)
+        label_times_ms.append((time.perf_counter() - label_start) * 1000.0)
+        e2e_times_ms.append((time.perf_counter() - iter_start) * 1000.0)
+
         if (not include_invalid) and (not lb.loss_mask):
             continue
 
@@ -143,7 +187,33 @@ def _rows_from_code_task(
         label_ok=label_ok[:write_idx],
         loss_mask=loss_mask[:write_idx],
     )
-    return {"path": str(shard_path), "rows": int(write_idx)}
+
+    out = {"path": str(shard_path), "rows": int(write_idx)}
+    if benchmark:
+        dp_total, dp_avg, dp_p50, dp_p95 = _timing_stats(dp_times_ms)
+        label_total, label_avg, label_p50, label_p95 = _timing_stats(label_times_ms)
+        e2e_total, e2e_avg, e2e_p50, e2e_p95 = _timing_stats(e2e_times_ms)
+        out["benchmark"] = BenchmarkReport(
+            code=code,
+            rows_total=len(selected_asof_dates),
+            rows_kept=int(write_idx),
+            dp_total_ms=dp_total,
+            dp_avg_ms=dp_avg,
+            dp_p50_ms=dp_p50,
+            dp_p95_ms=dp_p95,
+            label_total_ms=label_total,
+            label_avg_ms=label_avg,
+            label_p50_ms=label_p50,
+            label_p95_ms=label_p95,
+            end_to_end_total_ms=e2e_total,
+            end_to_end_avg_ms=e2e_avg,
+            end_to_end_p50_ms=e2e_p50,
+            end_to_end_p95_ms=e2e_p95,
+            dp_ok_count=int(dp_ok[:write_idx].sum()),
+            label_ok_count=int(label_ok[:write_idx].sum()),
+            loss_mask_count=int(loss_mask[:write_idx].sum()),
+        )
+    return out
 
 
 def _merge_shards(shard_infos: list[dict]) -> TrainDatasetBundle:
@@ -205,9 +275,14 @@ def build_train_dataset(
     num_workers: int = 1,
     show_progress: bool = True,
     shard_tmp_dir: str | Path | None = None,
-) -> TrainDatasetBundle:
+    benchmark: bool = False,
+) -> tuple[TrainDatasetBundle, BenchmarkReport | None]:
     selected_codes = resolve_codes(data_dir, codes)
     selected_asof_dates = resolve_asof_dates(data_dir, asof_dates)
+
+    if benchmark:
+        selected_codes = selected_codes[:1]
+        num_workers = 1
 
     asof_tuple = tuple(selected_asof_dates)
     tmp_root = None if shard_tmp_dir is None else str(Path(shard_tmp_dir))
@@ -216,18 +291,22 @@ def build_train_dataset(
         if num_workers <= 1:
             iterator = _iter_progress(selected_codes, total=len(selected_codes), show_progress=show_progress, desc="building train dataset")
             for code in iterator:
-                shard_infos.append(_rows_from_code_task(data_dir, code, asof_tuple, include_invalid, shard_dir))
+                shard_infos.append(_rows_from_code_task(data_dir, code, asof_tuple, include_invalid, shard_dir, benchmark=benchmark))
         else:
             with ProcessPoolExecutor(max_workers=num_workers) as executor:
                 futures = [
-                    executor.submit(_rows_from_code_task, data_dir, code, asof_tuple, include_invalid, shard_dir)
+                    executor.submit(_rows_from_code_task, data_dir, code, asof_tuple, include_invalid, shard_dir, benchmark)
                     for code in selected_codes
                 ]
                 progress_iter = _iter_progress(as_completed(futures), total=len(futures), show_progress=show_progress, desc="building train dataset")
                 for fut in progress_iter:
                     shard_infos.append(fut.result())
 
-        return _merge_shards(shard_infos)
+        bundle = _merge_shards(shard_infos)
+        benchmark_report = None
+        if benchmark and shard_infos:
+            benchmark_report = shard_infos[0].get("benchmark")
+        return bundle, benchmark_report
 
 
 def save_train_dataset(bundle: TrainDatasetBundle, out_npz: str | Path) -> None:

@@ -55,11 +55,13 @@ def test_build_train_dataset_filters_invalid(monkeypatch):
     monkeypatch.setattr(btd, "build_multiscale_tensors", fake_build_multiscale_tensors)
     monkeypatch.setattr(btd, "build_label_from_data_dir", fake_build_label_from_data_dir)
 
-    filtered = build_train_dataset(".", ["AAA"], ["2024-01-02", "2024-01-03"], include_invalid=False, show_progress=False)
+    filtered, filtered_bench = build_train_dataset(".", ["AAA"], ["2024-01-02", "2024-01-03"], include_invalid=False, show_progress=False)
+    assert filtered_bench is None
     assert filtered.y.shape == (1,)
     assert filtered.asof_dates.tolist() == ["2024-01-03"]
 
-    unfiltered = build_train_dataset(".", ["AAA"], ["2024-01-02", "2024-01-03"], include_invalid=True, show_progress=False)
+    unfiltered, unfiltered_bench = build_train_dataset(".", ["AAA"], ["2024-01-02", "2024-01-03"], include_invalid=True, show_progress=False)
+    assert unfiltered_bench is None
     assert unfiltered.y.shape == (2,)
     assert unfiltered.loss_mask.tolist() == [False, True]
 
@@ -115,7 +117,7 @@ def test_build_train_dataset_multiprocess_path(monkeypatch):
     monkeypatch.setattr(btd, "ProcessPoolExecutor", FakeExecutor)
     monkeypatch.setattr(btd, "as_completed", lambda futures: futures)
 
-    out = build_train_dataset(
+    out, out_bench = build_train_dataset(
         ".",
         codes=["AAA"],
         asof_dates=["2024-01-02", "2024-01-03"],
@@ -123,6 +125,7 @@ def test_build_train_dataset_multiprocess_path(monkeypatch):
         num_workers=2,
         show_progress=False,
     )
+    assert out_bench is None
     assert out.y.shape == (2,)
 
 
@@ -146,7 +149,7 @@ def test_progress_wrapper_uses_tqdm(monkeypatch):
     monkeypatch.setattr(btd, "build_multiscale_tensors", fake_build_multiscale_tensors)
     monkeypatch.setattr(btd, "build_label_from_data_dir", fake_build_label_from_data_dir)
 
-    _ = build_train_dataset(
+    _, bench = build_train_dataset(
         ".",
         codes=["AAA"],
         asof_dates=["2024-01-02"],
@@ -154,4 +157,5 @@ def test_progress_wrapper_uses_tqdm(monkeypatch):
         num_workers=1,
         show_progress=True,
     )
+    assert bench is None
     assert called["v"]
