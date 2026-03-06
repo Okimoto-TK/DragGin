@@ -3,7 +3,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
-from bisect import bisect_left
 
 import numpy as np
 import pandas as pd
@@ -47,6 +46,10 @@ class _LabelContext:
     raw_fail_by_index: dict[int, str]
     z_mu_by_valid_pos: tuple[float, ...]
     z_sd_by_valid_pos: tuple[float, ...]
+    asof_to_trading_idx: dict[date, int]
+    raw_idx_to_valid_pos: dict[int, int]
+    label_ok_by_idx: tuple[bool, ...]
+    label_value_by_idx: tuple[float, ...]
 
 
 def compute_daily_log_returns(df_daily_sorted: pd.DataFrame) -> pd.Series:
@@ -237,6 +240,27 @@ def _build_label_context(data_dir: str, code: str) -> _LabelContext | None:
         mu = np.asarray([], dtype=np.float64)
         sd = np.asarray([], dtype=np.float64)
 
+    asof_to_trading_idx = {d: i for i, d in enumerate(trading_calendar_dates)}
+    raw_idx_to_valid_pos = {idx: pos for pos, idx in enumerate(valid_raw_indices)}
+    label_ok_by_idx = np.zeros((len(trading_calendar_dates),), dtype=np.bool_)
+    label_value_by_idx = np.zeros((len(trading_calendar_dates),), dtype=np.float32)
+    for pos, idx in enumerate(valid_raw_indices):
+        if pos < LABEL_Z_WINDOW:
+            continue
+        if idx not in raw_details_by_index:
+            continue
+        mu_pos = float(mu[pos])
+        sd_pos = float(sd[pos])
+        if (not np.isfinite(mu_pos)) or (not np.isfinite(sd_pos)) or sd_pos <= 0:
+            continue
+        y_raw_pos = float(valid_raw_values[pos])
+        y_z_pos = (y_raw_pos - mu_pos) / max(sd_pos, ZSCORE_EPS)
+        y_z_pos = float(TANH_K * np.tanh(y_z_pos / TANH_K))
+        if not np.isfinite(y_z_pos):
+            continue
+        label_ok_by_idx[idx] = True
+        label_value_by_idx[idx] = np.float32(y_z_pos)
+
     return _LabelContext(
         calendar_dates=calendar_dates,
         trading_calendar_dates=trading_calendar_dates,
@@ -248,6 +272,10 @@ def _build_label_context(data_dir: str, code: str) -> _LabelContext | None:
         raw_fail_by_index=raw_fail_by_index,
         z_mu_by_valid_pos=tuple(mu.tolist()),
         z_sd_by_valid_pos=tuple(sd.tolist()),
+        asof_to_trading_idx=asof_to_trading_idx,
+        raw_idx_to_valid_pos=raw_idx_to_valid_pos,
+        label_ok_by_idx=tuple(bool(x) for x in label_ok_by_idx.tolist()),
+        label_value_by_idx=tuple(float(x) for x in label_value_by_idx.tolist()),
     )
 
 def build_label_for_sample(
@@ -374,8 +402,8 @@ def build_label_from_data_dir(
         return _fail(code, asof_date, dp_ok, "asof date not in calendar")
 
     trading_calendar_dates = context.trading_calendar_dates
-    idx = bisect_left(trading_calendar_dates, asof)
-    if idx >= len(trading_calendar_dates) or trading_calendar_dates[idx] != asof:
+    idx = context.asof_to_trading_idx.get(asof)
+    if idx is None:
         return _fail(code, asof_date, dp_ok, "asof date not in trading calendar")
 
     effective_breakpoints = set(breakpoints) if breakpoints is not None else set(context.breakpoints)
@@ -386,22 +414,22 @@ def build_label_from_data_dir(
     if idx not in context.raw_details_by_index:
         return _fail(code, asof_date, dp_ok, context.raw_fail_by_index.get(idx, "raw label build failed"))
 
-    valid_indices = context.valid_raw_indices
     valid_values = context.valid_raw_values
-    pos = bisect_left(valid_indices, idx)
+    pos = context.raw_idx_to_valid_pos.get(idx)
+    if pos is None:
+        return _fail(code, asof_date, dp_ok, context.raw_fail_by_index.get(idx, "raw label build failed"))
     if pos < LABEL_Z_WINDOW:
         return _fail(code, asof_date, dp_ok, f"insufficient y_raw history for label zscore: need {LABEL_Z_WINDOW}, got {pos}")
 
-    mu = float(context.z_mu_by_valid_pos[pos])
-    sd = float(context.z_sd_by_valid_pos[pos])
-    if (not np.isfinite(mu)) or (not np.isfinite(sd)) or sd <= 0:
-        return _fail(code, asof_date, dp_ok, "label zscore sd invalid (<=0 or non-finite)")
+    if not context.label_ok_by_idx[idx]:
+        mu = float(context.z_mu_by_valid_pos[pos])
+        sd = float(context.z_sd_by_valid_pos[pos])
+        if (not np.isfinite(mu)) or (not np.isfinite(sd)) or sd <= 0:
+            return _fail(code, asof_date, dp_ok, "label zscore sd invalid (<=0 or non-finite)")
+        return _fail(code, asof_date, dp_ok, "label zscore non-finite")
 
     y_raw_val = float(valid_values[pos])
-    y_z = (y_raw_val - mu) / max(sd, ZSCORE_EPS)
-    y_z = float(TANH_K * np.tanh(y_z / TANH_K))
-    if not np.isfinite(y_z):
-        return _fail(code, asof_date, dp_ok, "label zscore non-finite")
+    y_z = float(context.label_value_by_idx[idx])
 
     details = context.raw_details_by_index[idx]
     return LabelBundle(

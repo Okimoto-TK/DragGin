@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import argparse
 import re
-from bisect import bisect_left
 from dataclasses import dataclass
 from datetime import date
 from functools import lru_cache
@@ -46,9 +45,10 @@ class _TensorContext:
     micro_z: np.ndarray
     mezzo_z: np.ndarray
     macro_z: np.ndarray
-    micro_day_end_idx: dict[date, int]
-    mezzo_day_end_idx: dict[date, int]
-    macro_day_idx: dict[date, int]
+    asof_to_micro_end: dict[date, int]
+    asof_to_mezzo_end: dict[date, int]
+    asof_to_macro_idx: dict[date, int]
+    asof_to_stock_idx: dict[date, int]
     stock_calendar: tuple[date, ...]
     breakpoints: frozenset[date]
     asof_adj_valid: frozenset[date]
@@ -314,9 +314,10 @@ def _build_tensor_context(data_dir: str, code: str) -> _TensorContext | None:
         micro_z=micro_z,
         mezzo_z=mezzo_z,
         macro_z=macro_z,
-        micro_day_end_idx=_build_day_end_index(m5_adj, 48),
-        mezzo_day_end_idx=_build_day_end_index(m30, 8),
-        macro_day_idx={d: i for i, d in enumerate(d1_adj["trade_date"].tolist())},
+        asof_to_micro_end=_build_day_end_index(m5_adj, 48),
+        asof_to_mezzo_end=_build_day_end_index(m30, 8),
+        asof_to_macro_idx={d: i for i, d in enumerate(d1_adj["trade_date"].tolist())},
+        asof_to_stock_idx={d: i for i, d in enumerate(stock_calendar)},
         stock_calendar=stock_calendar,
         breakpoints=frozenset(_load_breakpoints_cached(data_dir, code)),
         asof_adj_valid=frozenset(adj_factor_by_date.index.tolist()),
@@ -351,9 +352,9 @@ def get_tensor_valid_asof_dates(data_dir: str, code: str) -> tuple[str, ...]:
     for idx, asof in enumerate(stock_calendar):
         if asof not in context.asof_adj_valid:
             continue
-        micro_end = context.micro_day_end_idx.get(asof)
-        mezzo_end = context.mezzo_day_end_idx.get(asof)
-        macro_idx = context.macro_day_idx.get(asof)
+        micro_end = context.asof_to_micro_end.get(asof)
+        mezzo_end = context.asof_to_mezzo_end.get(asof)
+        macro_idx = context.asof_to_macro_idx.get(asof)
         if micro_end is None or mezzo_end is None or macro_idx is None:
             continue
         if micro_end + 1 < req_micro or mezzo_end + 1 < req_mezzo or idx + 1 < req_macro:
@@ -386,7 +387,7 @@ def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) ->
     if asof not in context.asof_adj_valid:
         return empty_result(code, asof_date, "missing adj_factor on asof date")
 
-    micro_end = context.micro_day_end_idx.get(asof)
+    micro_end = context.asof_to_micro_end.get(asof)
     if micro_end is None:
         return empty_result(code, asof_date, "micro day must have exactly 48 bars")
 
@@ -394,7 +395,7 @@ def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) ->
     if x_micro is None:
         return empty_result(code, asof_date, err)
 
-    mezzo_end = context.mezzo_day_end_idx.get(asof)
+    mezzo_end = context.asof_to_mezzo_end.get(asof)
     if mezzo_end is None:
         return empty_result(code, asof_date, "30m aggregation failure")
     x_mezzo, err = _slice_tensor(context.mezzo_z, mezzo_end, L_MEZZO, L_MEZZO + W_MEZZO + RAW_WARMUP, "mezzo")
@@ -402,8 +403,8 @@ def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) ->
         return empty_result(code, asof_date, err)
 
     stock_calendar = context.stock_calendar
-    idx = bisect_left(stock_calendar, asof)
-    if idx >= len(stock_calendar) or stock_calendar[idx] != asof:
+    idx = context.asof_to_stock_idx.get(asof)
+    if idx is None:
         return empty_result(code, asof_date, "asof date not in calendar")
 
     req_macro = L_MACRO + W_MACRO + RAW_WARMUP
@@ -412,7 +413,7 @@ def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) ->
     if _has_breakpoint_crossing(list(stock_calendar), idx + 1 - req_macro, idx, set(context.breakpoints)):
         return empty_result(code, asof_date, "macro: history crosses st breakpoint")
 
-    macro_idx = context.macro_day_idx.get(asof)
+    macro_idx = context.asof_to_macro_idx.get(asof)
     if macro_idx is None:
         return empty_result(code, asof_date, "macro: missing adj_factor in required history")
     x_macro, err = _slice_tensor(context.macro_z, macro_idx, L_MACRO, req_macro, "macro")
