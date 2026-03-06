@@ -55,11 +55,11 @@ def test_build_train_dataset_filters_invalid(monkeypatch):
     monkeypatch.setattr(btd, "build_multiscale_tensors", fake_build_multiscale_tensors)
     monkeypatch.setattr(btd, "build_label_from_data_dir", fake_build_label_from_data_dir)
 
-    filtered = build_train_dataset(".", ["AAA"], ["2024-01-02", "2024-01-03"], include_invalid=False)
+    filtered = build_train_dataset(".", ["AAA"], ["2024-01-02", "2024-01-03"], include_invalid=False, show_progress=False)
     assert filtered.y.shape == (1,)
     assert filtered.asof_dates.tolist() == ["2024-01-03"]
 
-    unfiltered = build_train_dataset(".", ["AAA"], ["2024-01-02", "2024-01-03"], include_invalid=True)
+    unfiltered = build_train_dataset(".", ["AAA"], ["2024-01-02", "2024-01-03"], include_invalid=True, show_progress=False)
     assert unfiltered.y.shape == (2,)
     assert unfiltered.loss_mask.tolist() == [False, True]
 
@@ -79,3 +79,79 @@ def test_resolve_defaults(tmp_path, monkeypatch):
     monkeypatch.setattr(btd, "build_calendar_from_daily_filenames", lambda _: ["2024-01-02", "2024-01-03"])
     asof_dates = resolve_asof_dates(data_dir, None)
     assert asof_dates == ["2024-01-02", "2024-01-03"]
+
+
+def test_build_train_dataset_multiprocess_path(monkeypatch):
+    from src.feat import build_training_dataset as btd
+
+    def fake_build_multiscale_tensors(data_dir, code, asof):
+        return _dp(dp_ok=True)
+
+    def fake_build_label_from_data_dir(data_dir, code, asof_date, dp_ok=True):
+        return _lb(label_ok=True, loss_mask=True)
+
+    class FakeFuture:
+        def __init__(self, value):
+            self._value = value
+
+        def result(self):
+            return self._value
+
+    class FakeExecutor:
+        def __init__(self, max_workers):
+            self.max_workers = max_workers
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def submit(self, fn, *args, **kwargs):
+            return FakeFuture(fn(*args, **kwargs))
+
+    monkeypatch.setattr(btd, "build_multiscale_tensors", fake_build_multiscale_tensors)
+    monkeypatch.setattr(btd, "build_label_from_data_dir", fake_build_label_from_data_dir)
+    monkeypatch.setattr(btd, "ProcessPoolExecutor", FakeExecutor)
+    monkeypatch.setattr(btd, "as_completed", lambda futures: futures)
+
+    out = build_train_dataset(
+        ".",
+        codes=["AAA"],
+        asof_dates=["2024-01-02", "2024-01-03"],
+        include_invalid=False,
+        num_workers=2,
+        show_progress=False,
+    )
+    assert out.y.shape == (2,)
+
+
+def test_progress_wrapper_uses_tqdm(monkeypatch):
+    from src.feat import build_training_dataset as btd
+
+    called = {"v": False}
+
+    def fake_tqdm(iterable, total, desc):
+        called["v"] = True
+        return iterable
+
+    monkeypatch.setattr(btd, "tqdm", fake_tqdm)
+
+    def fake_build_multiscale_tensors(data_dir, code, asof):
+        return _dp(dp_ok=True)
+
+    def fake_build_label_from_data_dir(data_dir, code, asof_date, dp_ok=True):
+        return _lb(label_ok=True, loss_mask=True)
+
+    monkeypatch.setattr(btd, "build_multiscale_tensors", fake_build_multiscale_tensors)
+    monkeypatch.setattr(btd, "build_label_from_data_dir", fake_build_label_from_data_dir)
+
+    _ = build_train_dataset(
+        ".",
+        codes=["AAA"],
+        asof_dates=["2024-01-02"],
+        include_invalid=False,
+        num_workers=1,
+        show_progress=True,
+    )
+    assert called["v"]

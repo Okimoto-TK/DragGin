@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -8,6 +9,11 @@ import numpy as np
 from src.feat.build_multiscale_tensor import build_calendar_from_daily_filenames
 from src.feat.build_multiscale_tensor import build_multiscale_tensors
 from src.feat.labels_risk_adj import build_label_from_data_dir
+
+try:
+    from tqdm.auto import tqdm
+except Exception:  # pragma: no cover
+    tqdm = None
 
 
 @dataclass
@@ -47,40 +53,62 @@ def resolve_asof_dates(data_dir: str | Path, asof_dates: list[str] | None = None
     return build_calendar_from_daily_filenames(data_dir)
 
 
+def _row_from_task(data_dir: str | Path, code: str, asof: str, include_invalid: bool) -> dict | None:
+    dp = build_multiscale_tensors(data_dir, code, asof)
+    lb = build_label_from_data_dir(data_dir, code, asof, dp_ok=dp.dp_ok)
+    if (not include_invalid) and (not lb.loss_mask):
+        return None
+    return {
+        "code": code,
+        "asof": asof,
+        "X_micro": dp.X_micro.astype(np.float32),
+        "X_mezzo": dp.X_mezzo.astype(np.float32),
+        "X_macro": dp.X_macro.astype(np.float32),
+        "mask_micro": dp.mask_micro.astype(np.uint8),
+        "mask_mezzo": dp.mask_mezzo.astype(np.uint8),
+        "mask_macro": dp.mask_macro.astype(np.uint8),
+        "y": np.float32(lb.y),
+        "y_raw": np.float32(lb.y_raw),
+        "y_z": np.float32(lb.y_z),
+        "dp_ok": bool(dp.dp_ok),
+        "label_ok": bool(lb.label_ok),
+        "loss_mask": bool(lb.loss_mask),
+    }
+
+
+def _iter_progress(iterable, total: int, show_progress: bool, desc: str):
+    if show_progress and tqdm is not None:
+        return tqdm(iterable, total=total, desc=desc)
+    return iterable
+
+
 def build_train_dataset(
     data_dir: str | Path,
     codes: list[str] | None = None,
     asof_dates: list[str] | None = None,
     include_invalid: bool = False,
+    num_workers: int = 1,
+    show_progress: bool = True,
 ) -> TrainDatasetBundle:
     selected_codes = resolve_codes(data_dir, codes)
     selected_asof_dates = resolve_asof_dates(data_dir, asof_dates)
+    tasks = [(code, asof) for code in selected_codes for asof in selected_asof_dates]
 
     rows: list[dict] = []
-    for code in selected_codes:
-        for asof in selected_asof_dates:
-            dp = build_multiscale_tensors(data_dir, code, asof)
-            lb = build_label_from_data_dir(data_dir, code, asof, dp_ok=dp.dp_ok)
-            if (not include_invalid) and (not lb.loss_mask):
-                continue
-            rows.append(
-                {
-                    "code": code,
-                    "asof": asof,
-                    "X_micro": dp.X_micro.astype(np.float32),
-                    "X_mezzo": dp.X_mezzo.astype(np.float32),
-                    "X_macro": dp.X_macro.astype(np.float32),
-                    "mask_micro": dp.mask_micro.astype(np.uint8),
-                    "mask_mezzo": dp.mask_mezzo.astype(np.uint8),
-                    "mask_macro": dp.mask_macro.astype(np.uint8),
-                    "y": np.float32(lb.y),
-                    "y_raw": np.float32(lb.y_raw),
-                    "y_z": np.float32(lb.y_z),
-                    "dp_ok": bool(dp.dp_ok),
-                    "label_ok": bool(lb.label_ok),
-                    "loss_mask": bool(lb.loss_mask),
-                }
-            )
+    if num_workers <= 1:
+        iterator = _iter_progress(tasks, total=len(tasks), show_progress=show_progress, desc="building train dataset")
+        for code, asof in iterator:
+            row = _row_from_task(data_dir, code, asof, include_invalid)
+            if row is not None:
+                rows.append(row)
+    else:
+        with ProcessPoolExecutor(max_workers=num_workers) as executor:
+            futures = [executor.submit(_row_from_task, data_dir, code, asof, include_invalid) for code, asof in tasks]
+            progress_iter = _iter_progress(as_completed(futures), total=len(futures), show_progress=show_progress, desc="building train dataset")
+            for fut in progress_iter:
+                row = fut.result()
+                if row is not None:
+                    rows.append(row)
 
     if not rows:
         return TrainDatasetBundle(
