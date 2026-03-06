@@ -8,8 +8,8 @@ import tempfile
 import numpy as np
 
 from src.feat.build_multiscale_tensor import build_calendar_from_daily_filenames
-from src.feat.build_multiscale_tensor import build_multiscale_tensors
-from src.feat.labels_risk_adj import build_label_from_data_dir
+from src.feat.build_multiscale_tensor import build_multiscale_tensors, get_tensor_valid_asof_dates
+from src.feat.labels_risk_adj import build_label_from_data_dir, get_label_valid_asof_dates
 
 try:
     from tqdm.auto import tqdm
@@ -125,8 +125,17 @@ def _rows_from_code_task(
     include_invalid: bool,
     shard_dir: str,
 ) -> str:
+    data_dir_key = str(Path(data_dir).resolve())
+    filtered_asofs = selected_asof_dates
+    if not include_invalid:
+        tensor_valid = set(get_tensor_valid_asof_dates(data_dir_key, code))
+        label_valid = set(get_label_valid_asof_dates(data_dir_key, code))
+        both_valid = tensor_valid & label_valid
+        if both_valid:
+            filtered_asofs = tuple(a for a in selected_asof_dates if a in both_valid)
+
     rows: list[dict] = []
-    for asof in selected_asof_dates:
+    for asof in filtered_asofs:
         row = _row_from_task(data_dir, code, asof, include_invalid)
         if row is not None:
             rows.append(row)

@@ -331,6 +331,31 @@ def build_label_for_sample(
     )
 
 
+
+@lru_cache(maxsize=512)
+def get_label_valid_asof_dates(data_dir: str, code: str) -> tuple[str, ...]:
+    context = _build_label_context(data_dir, code)
+    if context is None:
+        return tuple()
+
+    trading_calendar_dates = context.trading_calendar_dates
+    valid_indices = context.valid_raw_indices
+    out: list[str] = []
+    for pos, idx in enumerate(valid_indices):
+        if pos < LABEL_Z_WINDOW:
+            continue
+        if idx not in context.raw_details_by_index:
+            continue
+        mu = float(context.z_mu_by_valid_pos[pos])
+        sd = float(context.z_sd_by_valid_pos[pos])
+        if (not np.isfinite(mu)) or (not np.isfinite(sd)) or sd <= 0:
+            continue
+        window_start_idx = max(0, idx - LABEL_Z_WINDOW - VOL_WINDOW)
+        if _has_breakpoint_crossing(trading_calendar_dates, window_start_idx, idx + 3, set(context.breakpoints)):
+            continue
+        out.append(trading_calendar_dates[idx].isoformat())
+    return tuple(out)
+
 def build_label_from_data_dir(
     data_dir: str | Path,
     code: str,
