@@ -133,12 +133,35 @@ def _compute_raw_label_for_idx(
     return True, y_raw, details, None
 
 
+
+
+def _has_breakpoint_crossing(calendar_dates: list, start_idx: int, end_idx: int, breakpoints: set) -> bool:
+    if not breakpoints or end_idx <= start_idx:
+        return False
+    window_dates = calendar_dates[start_idx : end_idx + 1]
+    if len(window_dates) < 2:
+        return False
+    return any(window_dates[0] < b <= window_dates[-1] for b in breakpoints)
+
+
+def _load_breakpoints(data_dir: str | Path, code: str) -> set:
+    file_path = Path(data_dir) / code / "breakpoints.parquet"
+    if not file_path.exists():
+        return set()
+    try:
+        bp = pd.read_parquet(file_path, columns=["break_date"])
+    except Exception:
+        return set()
+    parsed = pd.to_datetime(bp.get("break_date"), errors="coerce").dropna()
+    return set(parsed.dt.date.tolist())
+
 def build_label_for_sample(
     code: str,
     asof_date: str,
     calendar: list[str],
     daily_loader,
     dp_ok: bool = True,
+    breakpoints: set | None = None,
 ) -> LabelBundle:
     asof = pd.to_datetime(asof_date).date()
     calendar_dates = [pd.to_datetime(x).date() for x in calendar]
@@ -152,17 +175,31 @@ def build_label_for_sample(
 
     daily = daily.copy()
     daily["trade_date"] = pd.to_datetime(daily["trade_date"]).dt.date
+    suspended_dates: set[pd.Timestamp | object] = set()
+    if "volume" in daily.columns:
+        daily["volume"] = pd.to_numeric(daily["volume"], errors="coerce")
+        suspended_dates = set(daily.loc[(daily["volume"] <= 0) | (~np.isfinite(daily["volume"])), "trade_date"].tolist())
+        daily = daily[(daily["volume"] > 0) & np.isfinite(daily["volume"])]
     daily = daily.drop_duplicates(subset=["trade_date"], keep="last").sort_values("trade_date")
     by_date = daily.set_index("trade_date")
 
-    idx = calendar_dates.index(asof)
-    ok_raw, y_raw_val, details, fail_reason = _compute_raw_label_for_idx(idx, calendar_dates, by_date)
+    trading_calendar_dates = [d for d in calendar_dates if d not in suspended_dates]
+    if asof not in trading_calendar_dates:
+        return _fail(code, asof_date, dp_ok, "asof date not in trading calendar")
+
+    idx = trading_calendar_dates.index(asof)
+    effective_breakpoints = breakpoints or set()
+    window_start_idx = max(0, idx - LABEL_Z_WINDOW - VOL_WINDOW)
+    if _has_breakpoint_crossing(trading_calendar_dates, window_start_idx, idx + 3, effective_breakpoints):
+        return _fail(code, asof_date, dp_ok, "label window crosses st breakpoint")
+
+    ok_raw, y_raw_val, details, fail_reason = _compute_raw_label_for_idx(idx, trading_calendar_dates, by_date)
     if not ok_raw or y_raw_val is None:
         return _fail(code, asof_date, dp_ok, fail_reason or "raw label build failed")
 
     past_raw_values: list[float] = []
     for pidx in range(idx):
-        ok_past, y_past, _, _ = _compute_raw_label_for_idx(pidx, calendar_dates, by_date)
+        ok_past, y_past, _, _ = _compute_raw_label_for_idx(pidx, trading_calendar_dates, by_date)
         if ok_past and y_past is not None and np.isfinite(y_past):
             past_raw_values.append(float(y_past))
 
@@ -204,11 +241,14 @@ def build_label_from_data_dir(
     code: str,
     asof_date: str,
     dp_ok: bool = True,
+    breakpoints: set | None = None,
 ) -> LabelBundle:
     calendar = build_calendar_from_daily_filenames(data_dir)
 
     def _loader(target_code: str) -> pd.DataFrame:
         return load_daily_data(data_dir, target_code)
+
+    breakpoints = _load_breakpoints(data_dir, code)
 
     return build_label_for_sample(
         code=code,
@@ -216,4 +256,5 @@ def build_label_from_data_dir(
         calendar=calendar,
         daily_loader=_loader,
         dp_ok=dp_ok,
+        breakpoints=breakpoints,
     )
