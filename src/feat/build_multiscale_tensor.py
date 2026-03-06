@@ -113,6 +113,8 @@ def load_daily_data(data_dir: str | Path, code: str) -> pd.DataFrame:
     if not required.issubset(set(out.columns)):
         return pd.DataFrame()
     out["trade_date"] = pd.to_datetime(out["trade_date"]).dt.date
+    out["volume"] = pd.to_numeric(out["volume"], errors="coerce")
+    out = out[(out["volume"] > 0) & np.isfinite(out["volume"])]
     out = out.drop_duplicates(subset=["trade_date"], keep="last").sort_values("trade_date").reset_index(drop=True)
     return out
 
@@ -298,14 +300,16 @@ def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) ->
     if X_mezzo is None:
         return empty_result(code, asof_date, f"mezzo: {err}")
 
-    calendar = [pd.to_datetime(x).date() for x in build_calendar_from_daily_filenames(data_dir)]
-    if asof not in calendar:
+    market_calendar = [pd.to_datetime(x).date() for x in build_calendar_from_daily_filenames(data_dir)]
+    stock_trade_dates = set(d1["trade_date"].tolist())
+    stock_calendar = [d for d in market_calendar if d in stock_trade_dates]
+    if asof not in stock_calendar:
         return empty_result(code, asof_date, "asof date not in calendar")
-    idx = calendar.index(asof)
+    idx = stock_calendar.index(asof)
     req = L_MACRO + W_MACRO + RAW_WARMUP
     if idx + 1 < req:
         return empty_result(code, asof_date, "macro: insufficient zscore warmup/history")
-    expected_daily_dates = calendar[idx + 1 - req : idx + 1]
+    expected_daily_dates = stock_calendar[idx + 1 - req : idx + 1]
 
     d1_adj, err = _apply_asof_price_adjustment(d1, asof, adj_factor_by_date)
     if d1_adj is None:

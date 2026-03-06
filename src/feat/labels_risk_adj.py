@@ -152,17 +152,24 @@ def build_label_for_sample(
 
     daily = daily.copy()
     daily["trade_date"] = pd.to_datetime(daily["trade_date"]).dt.date
+    if "volume" in daily.columns:
+        daily["volume"] = pd.to_numeric(daily["volume"], errors="coerce")
+        daily = daily[(daily["volume"] > 0) & np.isfinite(daily["volume"])]
     daily = daily.drop_duplicates(subset=["trade_date"], keep="last").sort_values("trade_date")
     by_date = daily.set_index("trade_date")
 
-    idx = calendar_dates.index(asof)
-    ok_raw, y_raw_val, details, fail_reason = _compute_raw_label_for_idx(idx, calendar_dates, by_date)
+    trading_calendar_dates = [d for d in calendar_dates if d in by_date.index]
+    if asof not in trading_calendar_dates:
+        return _fail(code, asof_date, dp_ok, "asof date not in trading calendar")
+
+    idx = trading_calendar_dates.index(asof)
+    ok_raw, y_raw_val, details, fail_reason = _compute_raw_label_for_idx(idx, trading_calendar_dates, by_date)
     if not ok_raw or y_raw_val is None:
         return _fail(code, asof_date, dp_ok, fail_reason or "raw label build failed")
 
     past_raw_values: list[float] = []
     for pidx in range(idx):
-        ok_past, y_past, _, _ = _compute_raw_label_for_idx(pidx, calendar_dates, by_date)
+        ok_past, y_past, _, _ = _compute_raw_label_for_idx(pidx, trading_calendar_dates, by_date)
         if ok_past and y_past is not None and np.isfinite(y_past):
             past_raw_values.append(float(y_past))
 
