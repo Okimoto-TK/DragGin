@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from src.feat.build_multiscale_tensor import DPResult
-from src.feat.build_training_dataset import build_train_dataset
+from src.feat.build_training_dataset import build_train_dataset, resolve_asof_dates, resolve_codes
 from src.feat.labels_risk_adj import LabelBundle
 
 
@@ -62,3 +62,20 @@ def test_build_train_dataset_filters_invalid(monkeypatch):
     unfiltered = build_train_dataset(".", ["AAA"], ["2024-01-02", "2024-01-03"], include_invalid=True)
     assert unfiltered.y.shape == (2,)
     assert unfiltered.loss_mask.tolist() == [False, True]
+
+
+def test_resolve_defaults(tmp_path, monkeypatch):
+    data_dir = tmp_path / "data"
+    (data_dir / "AAA").mkdir(parents=True)
+    (data_dir / "BBB").mkdir(parents=True)
+    (data_dir / "AAA" / "daily.parquet").write_text("x")
+    (data_dir / "BBB" / "daily.parquet").write_text("x")
+
+    codes = resolve_codes(data_dir, None)
+    assert codes == ["AAA", "BBB"]
+
+    from src.feat import build_training_dataset as btd
+
+    monkeypatch.setattr(btd, "build_calendar_from_daily_filenames", lambda _: ["2024-01-02", "2024-01-03"])
+    asof_dates = resolve_asof_dates(data_dir, None)
+    assert asof_dates == ["2024-01-02", "2024-01-03"]

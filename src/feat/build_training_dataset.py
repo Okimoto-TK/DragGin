@@ -5,6 +5,7 @@ from pathlib import Path
 
 import numpy as np
 
+from src.feat.build_multiscale_tensor import build_calendar_from_daily_filenames
 from src.feat.build_multiscale_tensor import build_multiscale_tensors
 from src.feat.labels_risk_adj import build_label_from_data_dir
 
@@ -27,15 +28,37 @@ class TrainDatasetBundle:
     loss_mask: np.ndarray
 
 
+def resolve_codes(data_dir: str | Path, codes: list[str] | None = None) -> list[str]:
+    if codes:
+        return [c for c in codes if c]
+    root = Path(data_dir)
+    out: list[str] = []
+    for p in sorted(root.iterdir()):
+        if not p.is_dir():
+            continue
+        if (p / "daily.parquet").exists():
+            out.append(p.name)
+    return out
+
+
+def resolve_asof_dates(data_dir: str | Path, asof_dates: list[str] | None = None) -> list[str]:
+    if asof_dates:
+        return [d for d in asof_dates if d]
+    return build_calendar_from_daily_filenames(data_dir)
+
+
 def build_train_dataset(
     data_dir: str | Path,
-    codes: list[str],
-    asof_dates: list[str],
+    codes: list[str] | None = None,
+    asof_dates: list[str] | None = None,
     include_invalid: bool = False,
 ) -> TrainDatasetBundle:
+    selected_codes = resolve_codes(data_dir, codes)
+    selected_asof_dates = resolve_asof_dates(data_dir, asof_dates)
+
     rows: list[dict] = []
-    for code in codes:
-        for asof in asof_dates:
+    for code in selected_codes:
+        for asof in selected_asof_dates:
             dp = build_multiscale_tensors(data_dir, code, asof)
             lb = build_label_from_data_dir(data_dir, code, asof, dp_ok=dp.dp_ok)
             if (not include_invalid) and (not lb.loss_mask):
