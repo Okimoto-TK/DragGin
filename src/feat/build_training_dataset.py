@@ -136,8 +136,8 @@ def _rows_from_code_task(
     row_task_t0 = time.perf_counter()
     for asof in selected_asof_dates:
         _record_timing(local_timings, "_rows_from_code_task.iter_asof", 0.0)
-        dp = _timed_call(local_timings, "build_multiscale_tensors", build_multiscale_tensors, data_dir, code, asof)
-        lb = _timed_call(local_timings, "build_label_from_data_dir", build_label_from_data_dir, data_dir, code, asof, dp_ok=dp.dp_ok)
+        dp = build_multiscale_tensors(data_dir, code, asof, timings=local_timings)
+        lb = build_label_from_data_dir(data_dir, code, asof, dp_ok=dp.dp_ok, timings=local_timings)
         if (not include_invalid) and (not lb.loss_mask):
             continue
 

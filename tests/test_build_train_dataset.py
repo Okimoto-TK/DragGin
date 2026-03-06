@@ -44,10 +44,10 @@ def _lb(label_ok: bool, loss_mask: bool) -> LabelBundle:
 def test_build_train_dataset_filters_invalid(monkeypatch):
     from src.feat import build_training_dataset as btd
 
-    def fake_build_multiscale_tensors(data_dir, code, asof):
+    def fake_build_multiscale_tensors(data_dir, code, asof, timings=None):
         return _dp(dp_ok=(asof == "2024-01-03"))
 
-    def fake_build_label_from_data_dir(data_dir, code, asof_date, dp_ok=True):
+    def fake_build_label_from_data_dir(data_dir, code, asof_date, dp_ok=True, timings=None):
         if asof_date == "2024-01-03":
             return _lb(label_ok=True, loss_mask=True)
         return _lb(label_ok=False, loss_mask=False)
@@ -84,10 +84,10 @@ def test_resolve_defaults(tmp_path, monkeypatch):
 def test_build_train_dataset_multiprocess_path(monkeypatch):
     from src.feat import build_training_dataset as btd
 
-    def fake_build_multiscale_tensors(data_dir, code, asof):
+    def fake_build_multiscale_tensors(data_dir, code, asof, timings=None):
         return _dp(dp_ok=True)
 
-    def fake_build_label_from_data_dir(data_dir, code, asof_date, dp_ok=True):
+    def fake_build_label_from_data_dir(data_dir, code, asof_date, dp_ok=True, timings=None):
         return _lb(label_ok=True, loss_mask=True)
 
     class FakeFuture:
@@ -137,10 +137,10 @@ def test_progress_wrapper_uses_tqdm(monkeypatch):
 
     monkeypatch.setattr(btd, "tqdm", fake_tqdm)
 
-    def fake_build_multiscale_tensors(data_dir, code, asof):
+    def fake_build_multiscale_tensors(data_dir, code, asof, timings=None):
         return _dp(dp_ok=True)
 
-    def fake_build_label_from_data_dir(data_dir, code, asof_date, dp_ok=True):
+    def fake_build_label_from_data_dir(data_dir, code, asof_date, dp_ok=True, timings=None):
         return _lb(label_ok=True, loss_mask=True)
 
     monkeypatch.setattr(btd, "build_multiscale_tensors", fake_build_multiscale_tensors)
@@ -162,11 +162,17 @@ def test_build_train_dataset_benchmark_mode_limits_one_code(monkeypatch):
 
     seen_codes = []
 
-    def fake_build_multiscale_tensors(data_dir, code, asof):
+    def fake_build_multiscale_tensors(data_dir, code, asof, timings=None):
         seen_codes.append(code)
+        if timings is not None:
+            timings.setdefault("build_multiscale_tensors", {"total": 0.0, "count": 0.0})
+            timings["build_multiscale_tensors"]["count"] += 1.0
         return _dp(dp_ok=True)
 
-    def fake_build_label_from_data_dir(data_dir, code, asof_date, dp_ok=True):
+    def fake_build_label_from_data_dir(data_dir, code, asof_date, dp_ok=True, timings=None):
+        if timings is not None:
+            timings.setdefault("build_label_from_data_dir", {"total": 0.0, "count": 0.0})
+            timings["build_label_from_data_dir"]["count"] += 1.0
         return _lb(label_ok=True, loss_mask=True)
 
     monkeypatch.setattr(btd, "build_multiscale_tensors", fake_build_multiscale_tensors)

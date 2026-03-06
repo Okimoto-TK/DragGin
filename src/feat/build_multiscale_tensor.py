@@ -8,6 +8,7 @@ from datetime import date
 from functools import lru_cache
 from pathlib import Path
 from typing import Optional
+import time
 
 import numpy as np
 import pandas as pd
@@ -25,6 +26,21 @@ W_MEZZO = 80
 W_MACRO = 45
 
 DATE_PATTERN = re.compile(r"(\d{4}-\d{2}-\d{2}|\d{8})")
+
+
+def _record_timing(timings: dict[str, dict[str, float]] | None, name: str, elapsed: float) -> None:
+    if timings is None:
+        return
+    stat = timings.setdefault(name, {"total": 0.0, "count": 0.0})
+    stat["total"] += float(elapsed)
+    stat["count"] += 1.0
+
+
+def _timed_call(timings: dict[str, dict[str, float]] | None, name: str, fn, *args, **kwargs):
+    t0 = time.perf_counter()
+    out = fn(*args, **kwargs)
+    _record_timing(timings, name, time.perf_counter() - t0)
+    return out
 
 
 @dataclass
@@ -370,13 +386,19 @@ def get_tensor_valid_asof_dates(data_dir: str, code: str) -> tuple[str, ...]:
     return tuple(out)
 
 
-def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) -> DPResult:
+def build_multiscale_tensors(
+    data_dir: str | Path,
+    code: str,
+    asof_date: str,
+    timings: dict[str, dict[str, float]] | None = None,
+) -> DPResult:
     data_dir_key = str(Path(data_dir).resolve())
-    asof = pd.to_datetime(asof_date).date()
-    context = _build_tensor_context(data_dir_key, code)
+    t0 = time.perf_counter()
+    asof = _timed_call(timings, "pd.to_datetime(asof)", pd.to_datetime, asof_date).date()
+    context = _timed_call(timings, "_build_tensor_context", _build_tensor_context, data_dir_key, code)
     if context is None:
-        m5 = _load_5m_data_cached(data_dir_key, code).copy()
-        d1 = _load_daily_data_cached(data_dir_key, code).copy()
+        m5 = _timed_call(timings, "_load_5m_data_cached", _load_5m_data_cached, data_dir_key, code).copy()
+        d1 = _timed_call(timings, "_load_daily_data_cached", _load_daily_data_cached, data_dir_key, code).copy()
         if not _validate_raw(m5):
             return empty_result(code, asof_date, "missing/invalid 5m raw schema")
         if not _validate_raw(d1):
@@ -390,14 +412,14 @@ def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) ->
     if micro_end is None:
         return empty_result(code, asof_date, "micro day must have exactly 48 bars")
 
-    x_micro, err = _slice_tensor(context.micro_z, micro_end, L_MICRO, L_MICRO + W_MICRO + RAW_WARMUP, "micro")
+    x_micro, err = _timed_call(timings, "_slice_tensor(micro)", _slice_tensor, context.micro_z, micro_end, L_MICRO, L_MICRO + W_MICRO + RAW_WARMUP, "micro")
     if x_micro is None:
         return empty_result(code, asof_date, err)
 
     mezzo_end = context.mezzo_day_end_idx.get(asof)
     if mezzo_end is None:
         return empty_result(code, asof_date, "30m aggregation failure")
-    x_mezzo, err = _slice_tensor(context.mezzo_z, mezzo_end, L_MEZZO, L_MEZZO + W_MEZZO + RAW_WARMUP, "mezzo")
+    x_mezzo, err = _timed_call(timings, "_slice_tensor(mezzo)", _slice_tensor, context.mezzo_z, mezzo_end, L_MEZZO, L_MEZZO + W_MEZZO + RAW_WARMUP, "mezzo")
     if x_mezzo is None:
         return empty_result(code, asof_date, err)
 
@@ -415,11 +437,11 @@ def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) ->
     macro_idx = context.macro_day_idx.get(asof)
     if macro_idx is None:
         return empty_result(code, asof_date, "macro: missing adj_factor in required history")
-    x_macro, err = _slice_tensor(context.macro_z, macro_idx, L_MACRO, req_macro, "macro")
+    x_macro, err = _timed_call(timings, "_slice_tensor(macro)", _slice_tensor, context.macro_z, macro_idx, L_MACRO, req_macro, "macro")
     if x_macro is None:
         return empty_result(code, asof_date, err)
 
-    return DPResult(
+    out = DPResult(
         code=code,
         asof_date=asof_date,
         dp_ok=True,
@@ -431,6 +453,8 @@ def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) ->
         mask_mezzo=np.ones((L_MEZZO,), dtype=np.uint8),
         mask_macro=np.ones((L_MACRO,), dtype=np.uint8),
     )
+    _record_timing(timings, "build_multiscale_tensors", time.perf_counter() - t0)
+    return out
 
 
 def print_calendar_summary(data_dir: str | Path) -> None:

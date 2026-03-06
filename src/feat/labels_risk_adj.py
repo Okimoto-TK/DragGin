@@ -4,6 +4,7 @@ from dataclasses import dataclass
 from functools import lru_cache
 from pathlib import Path
 from bisect import bisect_left
+import time
 
 import numpy as np
 import pandas as pd
@@ -15,6 +16,21 @@ ZSCORE_EPS = 1e-8
 VOL_WINDOW = 30
 LABEL_Z_WINDOW = 252
 TANH_K = 5.0
+
+
+def _record_timing(timings: dict[str, dict[str, float]] | None, name: str, elapsed: float) -> None:
+    if timings is None:
+        return
+    stat = timings.setdefault(name, {"total": 0.0, "count": 0.0})
+    stat["total"] += float(elapsed)
+    stat["count"] += 1.0
+
+
+def _timed_call(timings: dict[str, dict[str, float]] | None, name: str, fn, *args, **kwargs):
+    t0 = time.perf_counter()
+    out = fn(*args, **kwargs)
+    _record_timing(timings, name, time.perf_counter() - t0)
+    return out
 
 
 @dataclass
@@ -331,7 +347,6 @@ def build_label_for_sample(
     )
 
 
-
 @lru_cache(maxsize=512)
 def get_label_valid_asof_dates(data_dir: str, code: str) -> tuple[str, ...]:
     context = _build_label_context(data_dir, code)
@@ -362,13 +377,15 @@ def build_label_from_data_dir(
     asof_date: str,
     dp_ok: bool = True,
     breakpoints: set | None = None,
+    timings: dict[str, dict[str, float]] | None = None,
 ) -> LabelBundle:
+    t0 = time.perf_counter()
     data_dir_key = str(Path(data_dir).resolve())
-    context = _build_label_context(data_dir_key, code)
+    context = _timed_call(timings, "_build_label_context", _build_label_context, data_dir_key, code)
     if context is None:
         return _fail(code, asof_date, dp_ok, "daily data unavailable")
 
-    asof = pd.to_datetime(asof_date).date()
+    asof = _timed_call(timings, "pd.to_datetime(label_asof)", pd.to_datetime, asof_date).date()
     calendar_dates = context.calendar_dates
     if asof not in calendar_dates:
         return _fail(code, asof_date, dp_ok, "asof date not in calendar")
@@ -404,7 +421,7 @@ def build_label_from_data_dir(
         return _fail(code, asof_date, dp_ok, "label zscore non-finite")
 
     details = context.raw_details_by_index[idx]
-    return LabelBundle(
+    out = LabelBundle(
         code=code,
         asof_date=asof_date,
         y=np.float32(y_z),
@@ -420,3 +437,5 @@ def build_label_from_data_dir(
         ret_log=details["ret_log"],
         fail_reason=None,
     )
+    _record_timing(timings, "build_label_from_data_dir", time.perf_counter() - t0)
+    return out
