@@ -214,6 +214,6 @@ def test_build_train_dataset_shards_writes_per_code_files(tmp_path, monkeypatch)
         show_progress=False,
     )
 
-    assert sorted(p.name for p in out_dir.glob("*.npz")) == ["AAA.npz", "BBB.npz"]
+    assert sorted(p.name for p in out_dir.glob("*.npy")) == ["AAA.npy", "BBB.npy"]
     assert len(infos) == 2
     assert sorted(int(x["rows"]) for x in infos) == [1, 1]

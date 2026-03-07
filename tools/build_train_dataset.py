@@ -15,7 +15,7 @@ def main() -> None:
     parser.add_argument("--data-dir", default="./data")
     parser.add_argument("--codes", default="", help="comma-separated stock codes; empty means all codes")
     parser.add_argument("--asof-dates", default="", help="comma-separated asof dates; empty means all calendar dates")
-    parser.add_argument("--out", required=True, help="output folder path for per-code shard npz files")
+    parser.add_argument("--out", required=True, help="output folder path for per-code shard npy files")
     parser.add_argument("--include-invalid", type=int, choices=[0, 1], default=0)
     parser.add_argument("--num-workers", type=int, default=1, help="number of worker processes")
     parser.add_argument("--show-progress", type=int, choices=[0, 1], default=1, help="show progress bar")

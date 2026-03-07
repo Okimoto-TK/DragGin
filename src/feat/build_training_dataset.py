@@ -128,24 +128,24 @@ def _rows_from_code_task(
             loss_mask[write_idx] = bool(lb.loss_mask)
             write_idx += 1
 
-        shard_path = Path(shard_dir) / f"{code}.npz"
-        np.savez(
-            shard_path,
-            codes=codes[:write_idx],
-            asof_dates=asof_dates[:write_idx],
-            X_micro=X_micro[:write_idx],
-            X_mezzo=X_mezzo[:write_idx],
-            X_macro=X_macro[:write_idx],
-            mask_micro=mask_micro[:write_idx],
-            mask_mezzo=mask_mezzo[:write_idx],
-            mask_macro=mask_macro[:write_idx],
-            y=y[:write_idx],
-            y_raw=y_raw[:write_idx],
-            y_z=y_z[:write_idx],
-            dp_ok=dp_ok[:write_idx],
-            label_ok=label_ok[:write_idx],
-            loss_mask=loss_mask[:write_idx],
-        )
+        shard_path = Path(shard_dir) / f"{code}.npy"
+        shard_payload = {
+            "codes": codes[:write_idx],
+            "asof_dates": asof_dates[:write_idx],
+            "X_micro": X_micro[:write_idx],
+            "X_mezzo": X_mezzo[:write_idx],
+            "X_macro": X_macro[:write_idx],
+            "mask_micro": mask_micro[:write_idx],
+            "mask_mezzo": mask_mezzo[:write_idx],
+            "mask_macro": mask_macro[:write_idx],
+            "y": y[:write_idx],
+            "y_raw": y_raw[:write_idx],
+            "y_z": y_z[:write_idx],
+            "dp_ok": dp_ok[:write_idx],
+            "label_ok": label_ok[:write_idx],
+            "loss_mask": loss_mask[:write_idx],
+        }
+        np.save(shard_path, shard_payload, allow_pickle=True)
         return {"path": str(shard_path), "rows": int(write_idx)}
     finally:
         clear_tensor_worker_cache()
@@ -178,9 +178,9 @@ def _merge_shards(shard_infos: list[dict]) -> TrainDatasetBundle:
     for info in shard_infos:
         if int(info.get("rows", 0)) <= 0:
             continue
-        with np.load(info["path"], allow_pickle=True) as d:
-            for k in parts:
-                parts[k].append(d[k])
+        data = np.load(info["path"], allow_pickle=True).item()
+        for k in parts:
+            parts[k].append(data[k])
 
     if not parts["y"]:
         return _empty_bundle()
