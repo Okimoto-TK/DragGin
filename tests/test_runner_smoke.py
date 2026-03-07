@@ -112,6 +112,10 @@ def test_train_one_epoch_smoke(tmp_path: Path) -> None:
     assert any("events.out.tfevents" in p.name for p in runs_dir.iterdir()) or runs_dir.exists()
     assert (out / "metrics" / "curve.json").exists()
     assert (out / "reports" / "feedback" / f"{cfg.exp_name}.yaml").exists()
+    ckpt_dir = out / "checkpoints" / cfg.exp_name
+    assert (ckpt_dir / "latest.ckpt").exists()
+    assert (ckpt_dir / "best.ckpt").exists()
+    assert (ckpt_dir / "epoch_0001.ckpt").exists()
 
     data = json.loads((out / "metrics" / "curve.json").read_text(encoding="utf-8"))
     assert len(data["train"]) >= 1
@@ -167,6 +171,61 @@ def test_train_one_epoch_with_val_ratio_split(tmp_path: Path) -> None:
     assert result["feedback"]["meta"]["status"] == "ok"
     assert result["feedback"]["data"]["train_samples"] == 8
     assert result["feedback"]["data"]["val_samples"] == 2
+
+
+
+
+def test_resume_from_checkpoint_and_save_every(tmp_path: Path) -> None:
+    train_path = _write_shard(tmp_path / "resume_train.npy", n=6)
+    val_path = _write_shard(tmp_path / "resume_val.npy", n=4)
+
+    out_dir = tmp_path / "out_resume"
+    first_cfg = TrainConfig(
+        train_shards=[train_path],
+        val_shards=[val_path],
+        batch_size=2,
+        grad_accum_steps=1,
+        num_epochs=2,
+        lr=1e-3,
+        weight_decay=1e-4,
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        exp_name="resume_run",
+        out_dir=str(out_dir),
+        save_every=2,
+    )
+    run_training(first_cfg)
+
+    ckpt_dir = out_dir / "checkpoints" / first_cfg.exp_name
+    latest_path = ckpt_dir / "latest.ckpt"
+    epoch2_path = ckpt_dir / "epoch_0002.ckpt"
+    assert latest_path.exists()
+    assert epoch2_path.exists()
+
+    second_cfg = TrainConfig(
+        train_shards=[train_path],
+        val_shards=[val_path],
+        batch_size=2,
+        grad_accum_steps=1,
+        num_epochs=1,
+        lr=1e-3,
+        weight_decay=1e-4,
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        exp_name="resume_run",
+        out_dir=str(out_dir),
+        checkpoint=str(latest_path),
+        save_every=1,
+    )
+    run_training(second_cfg)
+
+    epoch3_path = ckpt_dir / "epoch_0003.ckpt"
+    assert epoch3_path.exists()
+
+    resumed_latest = torch.load(latest_path, map_location="cpu")
+    assert int(resumed_latest["epoch"]) == 2
 
 
 def test_shard_batch_iterator_no_buffer_does_not_preload(tmp_path: Path) -> None:

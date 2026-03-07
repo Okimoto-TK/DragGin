@@ -45,6 +45,8 @@ def main() -> None:
     parser.add_argument("--compile-mode", type=str, default="reduce-overhead", help="torch.compile mode")
     parser.add_argument("--log-every", type=int, default=10, help="log every N optimizer steps")
     parser.add_argument("--curve-save-every", type=int, default=100, help="save curve JSON every N optimizer steps")
+    parser.add_argument("--checkpoint", type=str, default=None, help="resume training from checkpoint path")
+    parser.add_argument("--save-every", type=int, default=1, help="save an epoch checkpoint every N epochs")
     args = parser.parse_args()
 
     train_shards = _expand_paths(args.train_shards)
@@ -75,6 +77,8 @@ def main() -> None:
         compile_mode=str(args.compile_mode),
         log_every=max(1, int(args.log_every)),
         curve_save_every=max(1, int(args.curve_save_every)),
+        checkpoint=args.checkpoint,
+        save_every=max(1, int(args.save_every)),
     )
     output = run_training(cfg)
 

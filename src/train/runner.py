@@ -435,6 +435,34 @@ class TrainConfig:
     compile_mode: str = "reduce-overhead"
     log_every: int = 10
     curve_save_every: int = 100
+    checkpoint: str | None = None
+    save_every: int = 1
+
+
+def _build_checkpoint_payload(
+    *,
+    epoch: int,
+    global_step: int,
+    model: nn.Module,
+    optimizer: AdamW,
+    scaler: GradScaler,
+    history: dict[str, list[dict[str, float | int]]],
+    best_val: dict[str, float],
+) -> dict[str, Any]:
+    return {
+        "epoch": int(epoch),
+        "global_step": int(global_step),
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "history": history,
+        "best_val": best_val,
+    }
+
+
+def _save_checkpoint(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
 
 
 class CUDAPrefetcher:
@@ -504,16 +532,19 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
     logs_dir = out_dir / "logs"
     runs_dir = out_dir / "runs" / config.exp_name
     metrics_dir = out_dir / "metrics"
+    checkpoints_dir = out_dir / "checkpoints" / config.exp_name
     feedback_path = out_dir / "reports" / "feedback" / f"{config.exp_name}.yaml"
 
     logs_dir.mkdir(parents=True, exist_ok=True)
     runs_dir.mkdir(parents=True, exist_ok=True)
     metrics_dir.mkdir(parents=True, exist_ok=True)
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
     logger = _setup_logger(logs_dir / "train.log")
 
     writer = SummaryWriter(log_dir=str(runs_dir))
     curve_path = metrics_dir / "curve.json"
     history: dict[str, list[dict[str, float | int]]] = {"train": [], "val": []}
+    start_epoch = 0
 
     train_sample_count = 0
     val_sample_count = 0
@@ -592,11 +623,34 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
     global_step = 0
     epochs_completed = 0
     best_val = {"loss": float("inf"), "huber": float("inf"), "mae": float("inf"), "mse": float("inf")}
+    latest_ckpt_path = checkpoints_dir / "latest.ckpt"
+    best_ckpt_path = checkpoints_dir / "best.ckpt"
+
+    if config.checkpoint is not None:
+        checkpoint_path = Path(config.checkpoint)
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        scaler_state = checkpoint.get("scaler_state_dict")
+        if isinstance(scaler_state, dict):
+            scaler.load_state_dict(scaler_state)
+        global_step = int(checkpoint.get("global_step", 0))
+        start_epoch = int(checkpoint.get("epoch", -1)) + 1
+        epochs_completed = start_epoch
+        history_ckpt = checkpoint.get("history")
+        if isinstance(history_ckpt, dict) and "train" in history_ckpt and "val" in history_ckpt:
+            history = history_ckpt
+        best_val_ckpt = checkpoint.get("best_val")
+        if isinstance(best_val_ckpt, dict):
+            for key in ("loss", "huber", "mae", "mse"):
+                if key in best_val_ckpt:
+                    best_val[key] = float(best_val_ckpt[key])
+        logger.info("resumed_from=%s start_epoch=%d global_step=%d", str(checkpoint_path), start_epoch, global_step)
     last_train_row: dict[str, Any] = {}
     last_val_row: dict[str, Any] = {"loss": 0.0}
 
     try:
-        for epoch in range(config.num_epochs):
+        for epoch in range(start_epoch, start_epoch + config.num_epochs):
             model.train()
             optimizer.zero_grad(set_to_none=True)
             epoch_train_iter = iter(train_loader)
@@ -755,8 +809,25 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
             )
             curve_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
 
+            is_best = val_row["loss"] <= best_val["loss"]
             for key in ("loss", "huber", "mae", "mse"):
                 best_val[key] = min(best_val[key], val_row[key])
+
+            checkpoint_payload = _build_checkpoint_payload(
+                epoch=epoch,
+                global_step=global_step,
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                history=history,
+                best_val=best_val,
+            )
+            _save_checkpoint(latest_ckpt_path, checkpoint_payload)
+            if is_best:
+                _save_checkpoint(best_ckpt_path, checkpoint_payload)
+            if epochs_completed % max(1, int(config.save_every)) == 0:
+                epoch_ckpt_path = checkpoints_dir / f"epoch_{epochs_completed:04d}.ckpt"
+                _save_checkpoint(epoch_ckpt_path, checkpoint_payload)
 
         feedback = {
             "meta": {
@@ -849,6 +920,8 @@ def _parse_args() -> TrainConfig:
     parser.add_argument("--compile-mode", type=str, default="reduce-overhead")
     parser.add_argument("--log-every", type=int, default=10)
     parser.add_argument("--curve-save-every", type=int, default=100)
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--save-every", type=int, default=1)
 
     args = parser.parse_args()
     return TrainConfig(
@@ -874,6 +947,8 @@ def _parse_args() -> TrainConfig:
         compile_mode=str(args.compile_mode),
         log_every=max(1, int(args.log_every)),
         curve_save_every=max(1, int(args.curve_save_every)),
+        checkpoint=args.checkpoint,
+        save_every=max(1, int(args.save_every)),
     )
 
 
