@@ -236,6 +236,40 @@ def build_train_dataset(
         return _merge_shards(shard_infos)
 
 
+def build_train_dataset_shards(
+    data_dir: str | Path,
+    out_dir: str | Path,
+    codes: list[str] | None = None,
+    asof_dates: list[str] | None = None,
+    include_invalid: bool = False,
+    num_workers: int = 1,
+    show_progress: bool = True,
+) -> list[dict]:
+    selected_codes = resolve_codes(data_dir, codes)
+    selected_asof_dates = resolve_asof_dates(data_dir, asof_dates)
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    asof_tuple = tuple(selected_asof_dates)
+    shard_infos: list[dict] = []
+    if num_workers <= 1:
+        iterator = _iter_progress(selected_codes, total=len(selected_codes), show_progress=show_progress, desc="building train dataset")
+        for code in iterator:
+            shard_infos.append(_rows_from_code_task(data_dir, code, asof_tuple, include_invalid, str(out_path)))
+        return shard_infos
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [
+            executor.submit(_rows_from_code_task, data_dir, code, asof_tuple, include_invalid, str(out_path))
+            for code in selected_codes
+        ]
+        progress_iter = _iter_progress(as_completed(futures), total=len(futures), show_progress=show_progress, desc="building train dataset")
+        for fut in progress_iter:
+            shard_infos.append(fut.result())
+    return shard_infos
+
+
 def save_train_dataset(bundle: TrainDatasetBundle, out_npz: str | Path) -> None:
     np.savez_compressed(
         out_npz,
