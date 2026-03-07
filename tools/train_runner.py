@@ -37,6 +37,7 @@ def main() -> None:
     parser.add_argument("--exp-name", type=str, required=True)
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--y-key", type=str, default="y")
+    parser.add_argument("--buffer", action="store_true", help="preload all shards into memory")
     args = parser.parse_args()
 
     train_shards = _expand_paths(args.train_shards)
@@ -59,6 +60,7 @@ def main() -> None:
         out_dir=args.out_dir,
         y_key=args.y_key,
         val_ratio=args.val_ratio,
+        buffer=args.buffer,
     )
     output = run_training(cfg)
 
