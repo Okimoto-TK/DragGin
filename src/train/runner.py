@@ -525,13 +525,13 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 if not should_step:
                     continue
 
-                if config.clip_grad_norm is not None:
+                if config.clip_grad_norm is not None and scaled_loss.requires_grad:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_grad_norm)
 
                 if scaled_loss.requires_grad:
                     scaler.step(optimizer)
-                scaler.update()
+                    scaler.update()
                 optimizer.zero_grad(set_to_none=True)
                 if scheduler is not None:
                     scheduler.step()

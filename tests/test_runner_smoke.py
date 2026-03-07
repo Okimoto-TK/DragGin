@@ -15,7 +15,7 @@ from src.train.runner import (
 )
 
 
-def _write_shard(path: Path, n: int = 3) -> str:
+def _write_shard(path: Path, n: int = 3, all_loss_mask_false: bool = False) -> str:
     rng = np.random.default_rng(7)
     shard = {
         "codes": np.array([f"C{i:03d}" for i in range(n)], dtype=object),
@@ -31,7 +31,7 @@ def _write_shard(path: Path, n: int = 3) -> str:
         "y_z": rng.normal(size=(n,)).astype(np.float32),
         "dp_ok": np.ones((n,), dtype=bool),
         "label_ok": np.ones((n,), dtype=bool),
-        "loss_mask": np.array([(i % 2) == 0 for i in range(n)], dtype=bool),
+        "loss_mask": np.zeros((n,), dtype=bool) if all_loss_mask_false else np.array([(i % 2) == 0 for i in range(n)], dtype=bool),
     }
     np.save(path, shard, allow_pickle=True)
     return str(path)
@@ -118,6 +118,30 @@ def test_train_one_epoch_smoke(tmp_path: Path) -> None:
     assert len(data["val"]) == 1
 
 
+
+
+
+
+def test_train_one_epoch_all_invalid_train_mask_does_not_crash(tmp_path: Path) -> None:
+    train_path = _write_shard(tmp_path / "train_all_invalid.npy", n=4, all_loss_mask_false=True)
+    val_path = _write_shard(tmp_path / "val_valid.npy", n=2)
+
+    cfg = TrainConfig(
+        train_shards=[train_path],
+        val_shards=[val_path],
+        batch_size=2,
+        grad_accum_steps=1,
+        num_epochs=1,
+        lr=1e-3,
+        weight_decay=1e-4,
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        exp_name="smoke_all_invalid",
+        out_dir=str(tmp_path / "out_all_invalid"),
+    )
+    result = run_training(cfg)
+    assert result["feedback"]["meta"]["status"] == "ok"
 
 
 def test_train_one_epoch_with_val_ratio_split(tmp_path: Path) -> None:
