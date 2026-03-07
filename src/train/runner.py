@@ -163,32 +163,30 @@ class ShardBatchIterator:
             path = self.shard_paths[shard_idx]
             self.last_row_orders[path] = row_indices.tolist()
 
-        batch_samples: list[dict[str, Any]] = []
+        batch_chunks: list[tuple[dict[str, Any], np.ndarray]] = []
+        buffered_rows = 0
+
+        def _materialize_batch(chunks: list[tuple[dict[str, Any], np.ndarray]]) -> dict[str, Any]:
+            if len(chunks) == 1:
+                shard, rows = chunks[0]
+                return _batch_from_shard_rows(shard=shard, rows=rows, y_key=self.y_key)
+            return _batch_from_shard_chunks(chunks=chunks, y_key=self.y_key)
 
         def _consume_shard(shard_idx: int, shard: dict[str, Any]) -> list[dict[str, Any]]:
-            nonlocal batch_samples
+            nonlocal batch_chunks, buffered_rows
             emitted: list[dict[str, Any]] = []
             row_indices = row_orders[shard_idx]
-            for row_idx in row_indices.tolist():
-                batch_samples.append(
-                    {
-                        "code": str(shard["codes"][row_idx]),
-                        "asof_date": str(shard["asof_dates"][row_idx]),
-                        "x_micro": torch.as_tensor(shard["X_micro"][row_idx], dtype=torch.float32),
-                        "x_mezzo": torch.as_tensor(shard["X_mezzo"][row_idx], dtype=torch.float32),
-                        "x_macro": torch.as_tensor(shard["X_macro"][row_idx], dtype=torch.float32),
-                        "mask_micro": torch.as_tensor(shard["mask_micro"][row_idx], dtype=torch.bool),
-                        "mask_mezzo": torch.as_tensor(shard["mask_mezzo"][row_idx], dtype=torch.bool),
-                        "mask_macro": torch.as_tensor(shard["mask_macro"][row_idx], dtype=torch.bool),
-                        "y": torch.as_tensor(shard[self.y_key][row_idx], dtype=torch.float32),
-                        "dp_ok": torch.as_tensor(shard["dp_ok"][row_idx], dtype=torch.bool),
-                        "label_ok": torch.as_tensor(shard["label_ok"][row_idx], dtype=torch.bool),
-                        "loss_mask": torch.as_tensor(shard["loss_mask"][row_idx], dtype=torch.bool),
-                    }
-                )
-                if len(batch_samples) == self.batch_size:
-                    emitted.append(collate_batch(batch_samples))
-                    batch_samples = []
+            start = 0
+            while start < row_indices.size:
+                take = min(self.batch_size - buffered_rows, int(row_indices.size - start))
+                rows = np.ascontiguousarray(row_indices[start : start + take], dtype=np.int64)
+                batch_chunks.append((shard, rows))
+                buffered_rows += int(rows.size)
+                start += take
+                if buffered_rows == self.batch_size:
+                    emitted.append(_materialize_batch(batch_chunks))
+                    batch_chunks = []
+                    buffered_rows = 0
             return emitted
 
         if self._buffered_shards is not None:
@@ -227,8 +225,8 @@ class ShardBatchIterator:
                     yield out_batch
                 del shard
 
-        if batch_samples:
-            yield collate_batch(batch_samples)
+        if buffered_rows > 0:
+            yield _materialize_batch(batch_chunks)
 
 
 
@@ -285,6 +283,60 @@ def collate_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "dp_ok": torch.stack([sample["dp_ok"] for sample in samples], dim=0),
         "label_ok": torch.stack([sample["label_ok"] for sample in samples], dim=0),
         "loss_mask": torch.stack([sample["loss_mask"] for sample in samples], dim=0),
+    }
+
+
+def _batch_from_shard_rows(shard: dict[str, Any], rows: np.ndarray, y_key: str) -> dict[str, Any]:
+    rows = np.asarray(rows, dtype=np.int64)
+    rows_contig = np.ascontiguousarray(rows)
+    return {
+        "code": shard["codes"][rows_contig].astype(str).tolist(),
+        "asof_date": shard["asof_dates"][rows_contig].astype(str).tolist(),
+        "x_micro": torch.from_numpy(np.ascontiguousarray(shard["X_micro"][rows_contig], dtype=np.float32)),
+        "x_mezzo": torch.from_numpy(np.ascontiguousarray(shard["X_mezzo"][rows_contig], dtype=np.float32)),
+        "x_macro": torch.from_numpy(np.ascontiguousarray(shard["X_macro"][rows_contig], dtype=np.float32)),
+        "mask_micro": torch.from_numpy(np.ascontiguousarray(shard["mask_micro"][rows_contig])).to(torch.bool),
+        "mask_mezzo": torch.from_numpy(np.ascontiguousarray(shard["mask_mezzo"][rows_contig])).to(torch.bool),
+        "mask_macro": torch.from_numpy(np.ascontiguousarray(shard["mask_macro"][rows_contig])).to(torch.bool),
+        "y": torch.from_numpy(np.ascontiguousarray(shard[y_key][rows_contig], dtype=np.float32)),
+        "dp_ok": torch.from_numpy(np.ascontiguousarray(shard["dp_ok"][rows_contig])).to(torch.bool),
+        "label_ok": torch.from_numpy(np.ascontiguousarray(shard["label_ok"][rows_contig])).to(torch.bool),
+        "loss_mask": torch.from_numpy(np.ascontiguousarray(shard["loss_mask"][rows_contig])).to(torch.bool),
+    }
+
+
+def _batch_from_shard_chunks(chunks: list[tuple[dict[str, Any], np.ndarray]], y_key: str) -> dict[str, Any]:
+    codes: list[str] = []
+    asof_dates: list[str] = []
+
+    def _cat_contiguous(key: str, dtype: np.dtype[Any] | None = None) -> np.ndarray:
+        arrays = []
+        for shard, rows in chunks:
+            rows_contig = np.ascontiguousarray(rows)
+            arr = shard[key][rows_contig]
+            if dtype is not None:
+                arr = arr.astype(dtype, copy=False)
+            arrays.append(np.ascontiguousarray(arr))
+        return np.ascontiguousarray(np.concatenate(arrays, axis=0))
+
+    for shard, rows in chunks:
+        rows_contig = np.ascontiguousarray(rows)
+        codes.extend(shard["codes"][rows_contig].astype(str).tolist())
+        asof_dates.extend(shard["asof_dates"][rows_contig].astype(str).tolist())
+
+    return {
+        "code": codes,
+        "asof_date": asof_dates,
+        "x_micro": torch.from_numpy(_cat_contiguous("X_micro", np.float32)),
+        "x_mezzo": torch.from_numpy(_cat_contiguous("X_mezzo", np.float32)),
+        "x_macro": torch.from_numpy(_cat_contiguous("X_macro", np.float32)),
+        "mask_micro": torch.from_numpy(_cat_contiguous("mask_micro")).to(torch.bool),
+        "mask_mezzo": torch.from_numpy(_cat_contiguous("mask_mezzo")).to(torch.bool),
+        "mask_macro": torch.from_numpy(_cat_contiguous("mask_macro")).to(torch.bool),
+        "y": torch.from_numpy(_cat_contiguous(y_key, np.float32)),
+        "dp_ok": torch.from_numpy(_cat_contiguous("dp_ok")).to(torch.bool),
+        "label_ok": torch.from_numpy(_cat_contiguous("label_ok")).to(torch.bool),
+        "loss_mask": torch.from_numpy(_cat_contiguous("loss_mask")).to(torch.bool),
     }
 
 
@@ -377,13 +429,53 @@ class TrainConfig:
     split_seed: int = 42
     buffer: bool = False
     num_workers: int = 1
+    pin_memory: bool = False
+    prefetch_cuda: bool = False
+    enable_compile: bool = False
+    compile_mode: str = "reduce-overhead"
+    log_every: int = 10
+    curve_save_every: int = 100
 
 
-def _to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+class CUDAPrefetcher:
+    def __init__(self, loader: Any, device: torch.device, pin_memory: bool) -> None:
+        self.loader_iter = iter(loader)
+        self.device = device
+        self.pin_memory = pin_memory
+        self.stream = torch.cuda.Stream(device=device)
+        self.next_batch: dict[str, Any] | None = None
+        self._preload()
+
+    def _preload(self) -> None:
+        try:
+            raw_batch = next(self.loader_iter)
+        except StopIteration:
+            self.next_batch = None
+            return
+
+        with torch.cuda.stream(self.stream):
+            self.next_batch = _to_device(raw_batch, self.device, pin_memory=self.pin_memory)
+
+    def next(self) -> dict[str, Any] | None:
+        torch.cuda.current_stream(device=self.device).wait_stream(self.stream)
+        batch = self.next_batch
+        if batch is None:
+            return None
+        for value in batch.values():
+            if isinstance(value, torch.Tensor):
+                value.record_stream(torch.cuda.current_stream(device=self.device))
+        self._preload()
+        return batch
+
+
+def _to_device(batch: dict[str, Any], device: torch.device, pin_memory: bool = False) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key, value in batch.items():
         if isinstance(value, torch.Tensor):
-            out[key] = value.to(device)
+            tensor = value
+            if pin_memory and tensor.device.type == "cpu":
+                tensor = tensor.pin_memory()
+            out[key] = tensor.to(device, non_blocking=True)
         else:
             out[key] = value
     return out
@@ -484,7 +576,14 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
     )
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
     model.to(device)
+    if device.type == "cuda" and config.enable_compile and hasattr(torch, "compile"):
+        model = torch.compile(model, mode=config.compile_mode)
     optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     scheduler = None
     use_amp = device.type == "cuda"
@@ -510,9 +609,8 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 [Path(p).name for p in train_loader.last_shard_order[:3]],
             )
 
-            for batch_idx, raw_batch in enumerate(epoch_train_iter):
-                batch = _to_device(raw_batch, device)
-
+            def _train_on_batch(batch: dict[str, Any], batch_idx: int) -> None:
+                nonlocal global_step, last_train_row
                 with autocast(enabled=use_amp):
                     y_hat, aux = model(batch)
                     loss, metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
@@ -523,7 +621,7 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
 
                 should_step = (batch_idx + 1) % max(1, config.grad_accum_steps) == 0 or (batch_idx + 1) == len(train_loader)
                 if not should_step:
-                    continue
+                    return
 
                 if config.clip_grad_norm is not None and scaled_loss.requires_grad:
                     scaler.unscale_(optimizer)
@@ -540,12 +638,7 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 batch_size_current = int(batch["y"].shape[0])
                 num_valid = int(metrics["num_valid"])
                 valid_ratio = float(num_valid / max(1, batch_size_current))
-                micro_lambda_mean = float(aux["micro"]["lambda_mean"].mean().detach().item())
-                mezzo_lambda_mean = float(aux["mezzo"]["lambda_mean"].mean().detach().item())
-                macro_lambda_mean = float(aux["macro"]["lambda_mean"].mean().detach().item())
                 gate = aux["fusion"]["gate"]
-                gate_mean = float(gate.mean().detach().item())
-                gate_std = float(gate.std(unbiased=False).detach().item())
 
                 train_row = {
                     "step": int(global_step),
@@ -556,11 +649,11 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                     "lr": float(optimizer.param_groups[0]["lr"]),
                     "num_valid": int(num_valid),
                     "valid_ratio": float(valid_ratio),
-                    "micro_lambda_mean": micro_lambda_mean,
-                    "mezzo_lambda_mean": mezzo_lambda_mean,
-                    "macro_lambda_mean": macro_lambda_mean,
-                    "gate_mean": gate_mean,
-                    "gate_std": gate_std,
+                    "micro_lambda_mean": float(aux["micro"]["lambda_mean"].mean().detach().item()),
+                    "mezzo_lambda_mean": float(aux["mezzo"]["lambda_mean"].mean().detach().item()),
+                    "macro_lambda_mean": float(aux["macro"]["lambda_mean"].mean().detach().item()),
+                    "gate_mean": float(gate.mean().detach().item()),
+                    "gate_std": float(gate.std(unbiased=False).detach().item()),
                 }
                 history["train"].append(train_row)
                 last_train_row = train_row
@@ -578,14 +671,30 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 writer.add_scalar("model/gate_mean", train_row["gate_mean"], global_step)
                 writer.add_scalar("model/gate_std", train_row["gate_std"], global_step)
 
-                logger.info(
-                    "epoch=%d step=%d train_loss=%.6f valid_ratio=%.4f",
-                    epoch + 1,
-                    global_step,
-                    train_row["loss"],
-                    train_row["valid_ratio"],
-                )
-                curve_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+                if global_step % max(1, config.log_every) == 0:
+                    logger.info(
+                        "epoch=%d step=%d train_loss=%.6f valid_ratio=%.4f",
+                        epoch + 1,
+                        global_step,
+                        train_row["loss"],
+                        train_row["valid_ratio"],
+                    )
+                if global_step % max(1, config.curve_save_every) == 0:
+                    curve_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+
+            if device.type == "cuda" and config.prefetch_cuda:
+                prefetcher = CUDAPrefetcher(train_loader, device=device, pin_memory=config.pin_memory)
+                batch_idx = 0
+                while True:
+                    batch = prefetcher.next()
+                    if batch is None:
+                        break
+                    _train_on_batch(batch, batch_idx)
+                    batch_idx += 1
+            else:
+                for batch_idx, raw_batch in enumerate(epoch_train_iter):
+                    batch = _to_device(raw_batch, device, pin_memory=config.pin_memory)
+                    _train_on_batch(batch, batch_idx)
 
             model.eval()
             val_loss_sum = 0.0
@@ -594,16 +703,31 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
             val_mse_sum = 0.0
             val_batches = 0
             with torch.no_grad():
-                for raw_batch in val_loader:
-                    batch = _to_device(raw_batch, device)
-                    with autocast(enabled=use_amp):
-                        y_hat, _ = model(batch)
-                        val_loss, val_metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
-                    val_loss_sum += float(val_loss.detach().item())
-                    val_huber_sum += float(val_metrics["huber"].detach().item())
-                    val_mae_sum += float(val_metrics["mae"].detach().item())
-                    val_mse_sum += float(val_metrics["mse"].detach().item())
-                    val_batches += 1
+                if device.type == "cuda" and config.prefetch_cuda:
+                    val_prefetcher = CUDAPrefetcher(val_loader, device=device, pin_memory=config.pin_memory)
+                    while True:
+                        batch = val_prefetcher.next()
+                        if batch is None:
+                            break
+                        with autocast(enabled=use_amp):
+                            y_hat, _ = model(batch)
+                            val_loss, val_metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
+                        val_loss_sum += float(val_loss.detach().item())
+                        val_huber_sum += float(val_metrics["huber"].detach().item())
+                        val_mae_sum += float(val_metrics["mae"].detach().item())
+                        val_mse_sum += float(val_metrics["mse"].detach().item())
+                        val_batches += 1
+                else:
+                    for raw_batch in val_loader:
+                        batch = _to_device(raw_batch, device, pin_memory=config.pin_memory)
+                        with autocast(enabled=use_amp):
+                            y_hat, _ = model(batch)
+                            val_loss, val_metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
+                        val_loss_sum += float(val_loss.detach().item())
+                        val_huber_sum += float(val_metrics["huber"].detach().item())
+                        val_mae_sum += float(val_metrics["mae"].detach().item())
+                        val_mse_sum += float(val_metrics["mse"].detach().item())
+                        val_batches += 1
 
             denom = max(1, val_batches)
             val_row = {
@@ -719,6 +843,12 @@ def _parse_args() -> TrainConfig:
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--buffer", action="store_true")
     parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument("--pin-memory", action="store_true")
+    parser.add_argument("--prefetch-cuda", action="store_true")
+    parser.add_argument("--enable-compile", action="store_true")
+    parser.add_argument("--compile-mode", type=str, default="reduce-overhead")
+    parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument("--curve-save-every", type=int, default=100)
 
     args = parser.parse_args()
     return TrainConfig(
@@ -738,6 +868,12 @@ def _parse_args() -> TrainConfig:
         val_ratio=args.val_ratio,
         buffer=args.buffer,
         num_workers=max(1, int(args.num_workers)),
+        pin_memory=bool(args.pin_memory),
+        prefetch_cuda=bool(args.prefetch_cuda),
+        enable_compile=bool(args.enable_compile),
+        compile_mode=str(args.compile_mode),
+        log_every=max(1, int(args.log_every)),
+        curve_save_every=max(1, int(args.curve_save_every)),
     )
 
 

@@ -39,6 +39,12 @@ def main() -> None:
     parser.add_argument("--y-key", type=str, default="y")
     parser.add_argument("--buffer", action="store_true", help="preload all shards into memory")
     parser.add_argument("--num-workers", type=int, default=1, help="number of worker processes for shard loading")
+    parser.add_argument("--pin-memory", action="store_true", help="pin CPU batch memory before H2D copy")
+    parser.add_argument("--prefetch-cuda", action="store_true", help="prefetch next batch to CUDA stream")
+    parser.add_argument("--enable-compile", action="store_true", help="enable torch.compile on CUDA")
+    parser.add_argument("--compile-mode", type=str, default="reduce-overhead", help="torch.compile mode")
+    parser.add_argument("--log-every", type=int, default=10, help="log every N optimizer steps")
+    parser.add_argument("--curve-save-every", type=int, default=100, help="save curve JSON every N optimizer steps")
     args = parser.parse_args()
 
     train_shards = _expand_paths(args.train_shards)
@@ -63,6 +69,12 @@ def main() -> None:
         val_ratio=args.val_ratio,
         buffer=args.buffer,
         num_workers=max(1, int(args.num_workers)),
+        pin_memory=bool(args.pin_memory),
+        prefetch_cuda=bool(args.prefetch_cuda),
+        enable_compile=bool(args.enable_compile),
+        compile_mode=str(args.compile_mode),
+        log_every=max(1, int(args.log_every)),
+        curve_save_every=max(1, int(args.curve_save_every)),
     )
     output = run_training(cfg)
 
