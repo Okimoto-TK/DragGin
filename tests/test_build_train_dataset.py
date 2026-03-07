@@ -3,7 +3,7 @@ from __future__ import annotations
 import numpy as np
 
 from src.feat.build_multiscale_tensor import DPResult
-from src.feat.build_training_dataset import build_train_dataset, resolve_asof_dates, resolve_codes
+from src.feat.build_training_dataset import build_train_dataset, build_train_dataset_shards, resolve_asof_dates, resolve_codes
 from src.feat.labels_risk_adj import LabelBundle
 
 
@@ -189,3 +189,31 @@ def test_worker_cache_cleared_after_code_task(monkeypatch):
     )
     assert out.y.shape == (2,)
     assert calls == {"tensor": 2, "label": 2}
+
+
+def test_build_train_dataset_shards_writes_per_code_files(tmp_path, monkeypatch):
+    from src.feat import build_training_dataset as btd
+
+    def fake_build_multiscale_tensors(data_dir, code, asof):
+        return _dp(dp_ok=True)
+
+    def fake_build_label_from_data_dir(data_dir, code, asof_date, dp_ok=True):
+        return _lb(label_ok=True, loss_mask=True)
+
+    monkeypatch.setattr(btd, "build_multiscale_tensors", fake_build_multiscale_tensors)
+    monkeypatch.setattr(btd, "build_label_from_data_dir", fake_build_label_from_data_dir)
+
+    out_dir = tmp_path / "out"
+    infos = build_train_dataset_shards(
+        ".",
+        out_dir=out_dir,
+        codes=["AAA", "BBB"],
+        asof_dates=["2024-01-02"],
+        include_invalid=False,
+        num_workers=1,
+        show_progress=False,
+    )
+
+    assert sorted(p.name for p in out_dir.glob("*.npy")) == ["AAA.npy", "BBB.npy"]
+    assert len(infos) == 2
+    assert sorted(int(x["rows"]) for x in infos) == [1, 1]

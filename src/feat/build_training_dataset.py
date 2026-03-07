@@ -128,24 +128,24 @@ def _rows_from_code_task(
             loss_mask[write_idx] = bool(lb.loss_mask)
             write_idx += 1
 
-        shard_path = Path(shard_dir) / f"{code}.npz"
-        np.savez(
-            shard_path,
-            codes=codes[:write_idx],
-            asof_dates=asof_dates[:write_idx],
-            X_micro=X_micro[:write_idx],
-            X_mezzo=X_mezzo[:write_idx],
-            X_macro=X_macro[:write_idx],
-            mask_micro=mask_micro[:write_idx],
-            mask_mezzo=mask_mezzo[:write_idx],
-            mask_macro=mask_macro[:write_idx],
-            y=y[:write_idx],
-            y_raw=y_raw[:write_idx],
-            y_z=y_z[:write_idx],
-            dp_ok=dp_ok[:write_idx],
-            label_ok=label_ok[:write_idx],
-            loss_mask=loss_mask[:write_idx],
-        )
+        shard_path = Path(shard_dir) / f"{code}.npy"
+        shard_payload = {
+            "codes": codes[:write_idx],
+            "asof_dates": asof_dates[:write_idx],
+            "X_micro": X_micro[:write_idx],
+            "X_mezzo": X_mezzo[:write_idx],
+            "X_macro": X_macro[:write_idx],
+            "mask_micro": mask_micro[:write_idx],
+            "mask_mezzo": mask_mezzo[:write_idx],
+            "mask_macro": mask_macro[:write_idx],
+            "y": y[:write_idx],
+            "y_raw": y_raw[:write_idx],
+            "y_z": y_z[:write_idx],
+            "dp_ok": dp_ok[:write_idx],
+            "label_ok": label_ok[:write_idx],
+            "loss_mask": loss_mask[:write_idx],
+        }
+        np.save(shard_path, shard_payload, allow_pickle=True)
         return {"path": str(shard_path), "rows": int(write_idx)}
     finally:
         clear_tensor_worker_cache()
@@ -178,9 +178,9 @@ def _merge_shards(shard_infos: list[dict]) -> TrainDatasetBundle:
     for info in shard_infos:
         if int(info.get("rows", 0)) <= 0:
             continue
-        with np.load(info["path"], allow_pickle=True) as d:
-            for k in parts:
-                parts[k].append(d[k])
+        data = np.load(info["path"], allow_pickle=True).item()
+        for k in parts:
+            parts[k].append(data[k])
 
     if not parts["y"]:
         return _empty_bundle()
@@ -234,6 +234,40 @@ def build_train_dataset(
                     shard_infos.append(fut.result())
 
         return _merge_shards(shard_infos)
+
+
+def build_train_dataset_shards(
+    data_dir: str | Path,
+    out_dir: str | Path,
+    codes: list[str] | None = None,
+    asof_dates: list[str] | None = None,
+    include_invalid: bool = False,
+    num_workers: int = 1,
+    show_progress: bool = True,
+) -> list[dict]:
+    selected_codes = resolve_codes(data_dir, codes)
+    selected_asof_dates = resolve_asof_dates(data_dir, asof_dates)
+
+    out_path = Path(out_dir)
+    out_path.mkdir(parents=True, exist_ok=True)
+
+    asof_tuple = tuple(selected_asof_dates)
+    shard_infos: list[dict] = []
+    if num_workers <= 1:
+        iterator = _iter_progress(selected_codes, total=len(selected_codes), show_progress=show_progress, desc="building train dataset")
+        for code in iterator:
+            shard_infos.append(_rows_from_code_task(data_dir, code, asof_tuple, include_invalid, str(out_path)))
+        return shard_infos
+
+    with ProcessPoolExecutor(max_workers=num_workers) as executor:
+        futures = [
+            executor.submit(_rows_from_code_task, data_dir, code, asof_tuple, include_invalid, str(out_path))
+            for code in selected_codes
+        ]
+        progress_iter = _iter_progress(as_completed(futures), total=len(futures), show_progress=show_progress, desc="building train dataset")
+        for fut in progress_iter:
+            shard_infos.append(fut.result())
+    return shard_infos
 
 
 def save_train_dataset(bundle: TrainDatasetBundle, out_npz: str | Path) -> None:
