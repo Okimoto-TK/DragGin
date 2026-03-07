@@ -155,3 +155,37 @@ def test_progress_wrapper_uses_tqdm(monkeypatch):
         show_progress=True,
     )
     assert called["v"]
+
+
+def test_worker_cache_cleared_after_code_task(monkeypatch):
+    from src.feat import build_training_dataset as btd
+
+    calls = {"tensor": 0, "label": 0}
+
+    def fake_build_multiscale_tensors(data_dir, code, asof):
+        return _dp(dp_ok=True)
+
+    def fake_build_label_from_data_dir(data_dir, code, asof_date, dp_ok=True):
+        return _lb(label_ok=True, loss_mask=True)
+
+    def fake_clear_tensor_worker_cache():
+        calls["tensor"] += 1
+
+    def fake_clear_label_worker_cache():
+        calls["label"] += 1
+
+    monkeypatch.setattr(btd, "build_multiscale_tensors", fake_build_multiscale_tensors)
+    monkeypatch.setattr(btd, "build_label_from_data_dir", fake_build_label_from_data_dir)
+    monkeypatch.setattr(btd, "clear_tensor_worker_cache", fake_clear_tensor_worker_cache)
+    monkeypatch.setattr(btd, "clear_label_worker_cache", fake_clear_label_worker_cache)
+
+    out = build_train_dataset(
+        ".",
+        codes=["AAA", "BBB"],
+        asof_dates=["2024-01-02"],
+        include_invalid=False,
+        num_workers=1,
+        show_progress=False,
+    )
+    assert out.y.shape == (2,)
+    assert calls == {"tensor": 2, "label": 2}

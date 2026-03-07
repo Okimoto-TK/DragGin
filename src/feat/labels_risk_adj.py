@@ -434,6 +434,14 @@ def get_label_valid_asof_dates(data_dir: str, code: str) -> tuple[str, ...]:
         out.append(trading_calendar_dates[idx].isoformat())
     return tuple(out)
 
+
+def clear_label_worker_cache() -> None:
+    _calendar_dates_cached.cache_clear()
+    _daily_data_cached.cache_clear()
+    _breakpoints_cached.cache_clear()
+    _build_label_context.cache_clear()
+    get_label_valid_asof_dates.cache_clear()
+
 def build_label_from_data_dir(
     data_dir: str | Path,
     code: str,

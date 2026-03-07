@@ -384,6 +384,15 @@ def get_tensor_valid_asof_dates(data_dir: str, code: str) -> tuple[str, ...]:
     return tuple(out)
 
 
+def clear_tensor_worker_cache() -> None:
+    _load_5m_data_cached.cache_clear()
+    _load_daily_data_cached.cache_clear()
+    _load_breakpoints_cached.cache_clear()
+    _load_market_calendar_dates.cache_clear()
+    _build_tensor_context.cache_clear()
+    get_tensor_valid_asof_dates.cache_clear()
+
+
 def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) -> DPResult:
     data_dir_key = str(Path(data_dir).resolve())
     asof = pd.to_datetime(asof_date).date()
