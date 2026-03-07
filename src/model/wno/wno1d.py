@@ -44,10 +44,12 @@ class WNO1DEncoder(nn.Module):
 
         if self.enable_dynamic_threshold:
             self.approx_gate = SoftThresholdGate(init_lambda=init_lambda)
-            self.detail_gate = SoftThresholdGate(init_lambda=init_lambda)
+            self.detail_gates = nn.ModuleList(
+                [SoftThresholdGate(init_lambda=init_lambda) for _ in range(self.levels)]
+            )
         else:
             self.approx_gate = None
-            self.detail_gate = None
+            self.detail_gates = None
 
     def _mask_to_channel(self, mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         return mask.unsqueeze(1).to(dtype=dtype)
@@ -70,13 +72,13 @@ class WNO1DEncoder(nn.Module):
 
         if self.enable_dynamic_threshold:
             assert self.approx_gate is not None
-            assert self.detail_gate is not None
+            assert self.detail_gates is not None
 
             approx_thr, lam_approx = self.approx_gate(pack.approx)
             details_thr = []
             lam_all = [lam_approx]
-            for detail in pack.details:
-                d_thr, lam_detail = self.detail_gate(detail)
+            for i, detail in enumerate(pack.details):
+                d_thr, lam_detail = self.detail_gates[i](detail)
                 details_thr.append(d_thr)
                 lam_all.append(lam_detail)
 

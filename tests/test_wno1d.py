@@ -15,6 +15,8 @@ def test_wno1d_shapes_all_scales() -> None:
         assert h_pool.shape == (2, 16)
         assert "lambda_mean" in aux
         assert "lambda_max" in aux
+        assert aux["lambda_mean"].shape == (2,)
+        assert aux["lambda_max"].shape == (2,)
 
 
 def test_wno1d_zero_mask_outputs_zero() -> None:
@@ -23,12 +25,14 @@ def test_wno1d_zero_mask_outputs_zero() -> None:
     mask = torch.zeros(2, length)
     encoder = WNO1DEncoder(in_dim=6, hidden_dim=16, init_lambda=1.0)
 
-    h_seq, h_pool, _ = encoder(x, mask)
+    h_seq, h_pool, aux = encoder(x, mask)
 
     assert torch.isfinite(h_seq).all()
     assert torch.isfinite(h_pool).all()
     assert torch.allclose(h_seq, torch.zeros_like(h_seq), atol=1e-7)
     assert torch.allclose(h_pool, torch.zeros_like(h_pool), atol=1e-7)
+    assert aux["lambda_mean"].shape == (2,)
+    assert aux["lambda_max"].shape == (2,)
 
 
 def test_wno1d_partial_mask_safe() -> None:
@@ -39,12 +43,14 @@ def test_wno1d_partial_mask_safe() -> None:
     mask[1, 5:20] = 1
 
     encoder = WNO1DEncoder(in_dim=6, hidden_dim=16, init_lambda=1.0)
-    h_seq, h_pool, _ = encoder(x, mask)
+    h_seq, h_pool, aux = encoder(x, mask)
 
     assert h_seq.shape == (2, length, 16)
     assert h_pool.shape == (2, 16)
     assert torch.isfinite(h_seq).all()
     assert torch.isfinite(h_pool).all()
+    assert aux["lambda_mean"].shape == (2,)
+    assert aux["lambda_max"].shape == (2,)
 
 
 def test_wno1d_disable_threshold() -> None:
@@ -64,3 +70,5 @@ def test_wno1d_disable_threshold() -> None:
     assert h_pool.shape == (2, 16)
     assert "lambda_mean" in aux
     assert "lambda_max" in aux
+    assert aux["lambda_mean"].shape == (2,)
+    assert aux["lambda_max"].shape == (2,)
