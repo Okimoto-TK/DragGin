@@ -24,26 +24,25 @@ def _expand_paths(raw_paths: list[str]) -> list[str]:
 def main() -> None:
     parser = argparse.ArgumentParser(description="Module 7 training CLI")
     parser.add_argument("--train-shards", nargs="+", required=True, help="train shard paths (supports glob)")
-    parser.add_argument("--val-shards", nargs="+", required=True, help="val shard paths (supports glob)")
+    parser.add_argument("--val-shards", nargs="+", default=None, help="val shard paths (supports glob)")
+    parser.add_argument("--val-ratio", type=float, default=0.15, help="val split ratio if --val-shards is omitted")
     parser.add_argument("--batch-size", type=int, required=True)
-    parser.add_argument("--grad-accum-steps", type=int, required=True)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--num-epochs", type=int, required=True)
     parser.add_argument("--lr", type=float, required=True)
     parser.add_argument("--weight-decay", type=float, required=True)
     parser.add_argument("--hidden-dim", type=int, required=True)
     parser.add_argument("--num-heads", type=int, required=True)
-    parser.add_argument("--dropout", type=float, required=True)
+    parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--exp-name", type=str, required=True)
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--y-key", type=str, default="y")
     args = parser.parse_args()
 
     train_shards = _expand_paths(args.train_shards)
-    val_shards = _expand_paths(args.val_shards)
+    val_shards = _expand_paths(args.val_shards or [])
     if len(train_shards) == 0:
         raise ValueError("No train shards found.")
-    if len(val_shards) == 0:
-        raise ValueError("No val shards found.")
 
     cfg = TrainConfig(
         train_shards=train_shards,
@@ -59,6 +58,7 @@ def main() -> None:
         exp_name=args.exp_name,
         out_dir=args.out_dir,
         y_key=args.y_key,
+        val_ratio=args.val_ratio,
     )
     output = run_training(cfg)
 

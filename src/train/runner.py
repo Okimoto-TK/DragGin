@@ -14,7 +14,7 @@ import torch
 from torch import nn
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset
+from torch.utils.data import DataLoader, Dataset, Subset
 from torch.utils.tensorboard import SummaryWriter
 
 from src.model.fusion import MultiScaleFusion
@@ -176,6 +176,8 @@ class TrainConfig:
     init_lambda_macro: float = 0.3
     use_seq_context: bool = False
     clip_grad_norm: float | None = None
+    val_ratio: float = 0.15
+    split_seed: int = 42
 
 
 def _to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -222,8 +224,25 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
     curve_path = metrics_dir / "curve.json"
     history: dict[str, list[dict[str, float | int]]] = {"train": [], "val": []}
 
-    train_ds = NpyShardDataset(config.train_shards, y_key=config.y_key)
-    val_ds = NpyShardDataset(config.val_shards, y_key=config.y_key)
+    base_train_ds = NpyShardDataset(config.train_shards, y_key=config.y_key)
+    if config.val_shards:
+        train_ds: Dataset[Any] = base_train_ds
+        val_ds: Dataset[Any] = NpyShardDataset(config.val_shards, y_key=config.y_key)
+    else:
+        total = len(base_train_ds)
+        if total < 2:
+            raise ValueError("At least 2 samples are required when val_shards is not provided.")
+        ratio = float(min(max(config.val_ratio, 0.0), 0.99))
+        val_size = int(round(total * ratio))
+        val_size = max(1, min(total - 1, val_size))
+        g = torch.Generator()
+        g.manual_seed(int(config.split_seed))
+        perm = torch.randperm(total, generator=g).tolist()
+        val_indices = perm[:val_size]
+        train_indices = perm[val_size:]
+        train_ds = Subset(base_train_ds, train_indices)
+        val_ds = Subset(base_train_ds, val_indices)
+
     train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, collate_fn=collate_batch)
     val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False, collate_fn=collate_batch)
 
@@ -452,23 +471,24 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
 def _parse_args() -> TrainConfig:
     parser = argparse.ArgumentParser(description="Train multi-scale regressor")
     parser.add_argument("--train-shards", nargs="+", required=True)
-    parser.add_argument("--val-shards", nargs="+", required=True)
+    parser.add_argument("--val-shards", nargs="+", default=None)
     parser.add_argument("--batch-size", type=int, required=True)
-    parser.add_argument("--grad-accum-steps", type=int, required=True)
+    parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--num-epochs", type=int, required=True)
     parser.add_argument("--lr", type=float, required=True)
     parser.add_argument("--weight-decay", type=float, required=True)
     parser.add_argument("--hidden-dim", type=int, required=True)
     parser.add_argument("--num-heads", type=int, required=True)
-    parser.add_argument("--dropout", type=float, required=True)
+    parser.add_argument("--dropout", type=float, default=0.1)
     parser.add_argument("--exp-name", type=str, required=True)
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--y-key", type=str, default="y")
+    parser.add_argument("--val-ratio", type=float, default=0.15)
 
     args = parser.parse_args()
     return TrainConfig(
         train_shards=args.train_shards,
-        val_shards=args.val_shards,
+        val_shards=args.val_shards or [],
         batch_size=args.batch_size,
         grad_accum_steps=args.grad_accum_steps,
         num_epochs=args.num_epochs,
@@ -480,6 +500,7 @@ def _parse_args() -> TrainConfig:
         exp_name=args.exp_name,
         out_dir=args.out_dir,
         y_key=args.y_key,
+        val_ratio=args.val_ratio,
     )
 
 

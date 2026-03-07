@@ -111,6 +111,32 @@ def test_train_one_epoch_smoke(tmp_path: Path) -> None:
     assert len(data["val"]) == 1
 
 
+
+
+def test_train_one_epoch_with_val_ratio_split(tmp_path: Path) -> None:
+    train_path = _write_shard(tmp_path / "train_only.npy", n=10)
+
+    cfg = TrainConfig(
+        train_shards=[train_path],
+        val_shards=[],
+        val_ratio=0.2,
+        batch_size=2,
+        grad_accum_steps=1,
+        num_epochs=1,
+        lr=1e-3,
+        weight_decay=1e-4,
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.1,
+        exp_name="smoke_ratio",
+        out_dir=str(tmp_path / "out_ratio"),
+    )
+    result = run_training(cfg)
+
+    assert result["feedback"]["meta"]["status"] == "ok"
+    assert result["feedback"]["data"]["train_samples"] == 8
+    assert result["feedback"]["data"]["val_samples"] == 2
+
 def test_empty_valid_mask_batch_safe() -> None:
     batch = _synthetic_batch(batch_size=2)
     batch["loss_mask"] = torch.zeros(2, dtype=torch.bool)
