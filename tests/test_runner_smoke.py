@@ -5,7 +5,14 @@ import numpy as np
 import torch
 
 from src.model.head import masked_huber_loss
-from src.train.runner import MultiScaleRegressor, NpyShardDataset, TrainConfig, collate_batch, run_training
+from src.train.runner import (
+    MultiScaleRegressor,
+    NpyShardDataset,
+    ShardBatchIterator,
+    TrainConfig,
+    collate_batch,
+    run_training,
+)
 
 
 def _write_shard(path: Path, n: int = 3) -> str:
@@ -136,6 +143,58 @@ def test_train_one_epoch_with_val_ratio_split(tmp_path: Path) -> None:
     assert result["feedback"]["meta"]["status"] == "ok"
     assert result["feedback"]["data"]["train_samples"] == 8
     assert result["feedback"]["data"]["val_samples"] == 2
+
+
+def test_shard_batch_iterator_no_buffer_does_not_preload(tmp_path: Path) -> None:
+    shard_paths = [_write_shard(tmp_path / f"train_{i}.npy", n=2) for i in range(3)]
+    iterator = ShardBatchIterator(shard_paths=shard_paths, batch_size=2, y_key="y", shuffle=True, buffer=False)
+    assert iterator._buffered_shards is None
+
+
+def test_shard_and_row_order_shuffle_each_epoch(tmp_path: Path) -> None:
+    shard_paths = [_write_shard(tmp_path / f"train_{i}.npy", n=5) for i in range(3)]
+    iterator = ShardBatchIterator(shard_paths=shard_paths, batch_size=2, y_key="y", shuffle=True, buffer=False)
+
+    first_order = None
+    second_order = None
+    first_rows = None
+    second_rows = None
+
+    for _ in iterator:
+        pass
+    first_order = list(iterator.last_shard_order)
+    first_rows = dict(iterator.last_row_orders)
+
+    for _ in iterator:
+        pass
+    second_order = list(iterator.last_shard_order)
+    second_rows = dict(iterator.last_row_orders)
+
+    # In rare cases random permutations can match exactly, so allow one retry.
+    if first_order == second_order and all(first_rows[p] == second_rows[p] for p in first_rows):
+        for _ in iterator:
+            pass
+        second_order = list(iterator.last_shard_order)
+        second_rows = dict(iterator.last_row_orders)
+
+    assert first_order != second_order or any(first_rows[p] != second_rows[p] for p in first_rows)
+
+
+def test_shard_batch_iterator_batch_shapes(tmp_path: Path) -> None:
+    shard_path = _write_shard(tmp_path / "shape.npy", n=3)
+    iterator = ShardBatchIterator([shard_path], batch_size=2, y_key="y", shuffle=False, buffer=False)
+    first_batch = next(iter(iterator))
+
+    assert first_batch["x_micro"].shape == (2, 48, 6)
+    assert first_batch["x_mezzo"].shape == (2, 40, 6)
+    assert first_batch["x_macro"].shape == (2, 30, 6)
+    assert first_batch["mask_micro"].shape == (2, 48)
+    assert first_batch["mask_mezzo"].shape == (2, 40)
+    assert first_batch["mask_macro"].shape == (2, 30)
+    assert first_batch["y"].shape == (2,)
+    assert first_batch["dp_ok"].shape == (2,)
+    assert first_batch["label_ok"].shape == (2,)
+    assert first_batch["loss_mask"].shape == (2,)
 
 def test_empty_valid_mask_batch_safe() -> None:
     batch = _synthetic_batch(batch_size=2)

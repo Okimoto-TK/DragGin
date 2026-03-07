@@ -4,6 +4,7 @@ import argparse
 import bisect
 import json
 import logging
+import math
 import traceback
 from dataclasses import dataclass
 from pathlib import Path
@@ -14,7 +15,7 @@ import torch
 from torch import nn
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim import AdamW
-from torch.utils.data import DataLoader, Dataset, Subset
+from torch.utils.data import Dataset
 from torch.utils.tensorboard import SummaryWriter
 
 from src.model.fusion import MultiScaleFusion
@@ -72,6 +73,148 @@ class NpyShardDataset(Dataset):
             "label_ok": torch.as_tensor(shard["label_ok"][row_idx], dtype=torch.bool),
             "loss_mask": torch.as_tensor(shard["loss_mask"][row_idx], dtype=torch.bool),
         }
+
+
+class ShardBatchIterator:
+    def __init__(
+        self,
+        shard_paths: list[str],
+        batch_size: int,
+        y_key: str = "y",
+        shuffle: bool = True,
+        buffer: bool = False,
+        row_indices_by_shard: dict[int, np.ndarray] | None = None,
+    ) -> None:
+        self.shard_paths = [str(path) for path in shard_paths]
+        self.batch_size = int(batch_size)
+        self.y_key = y_key
+        self.shuffle = bool(shuffle)
+        self.buffer = bool(buffer)
+        self.row_indices_by_shard = row_indices_by_shard or {}
+        self._rng = np.random.default_rng()
+        self._sizes = [self._get_shard_size(path) for path in self.shard_paths]
+        self._total_rows = int(sum(self._selected_rows_count(i) for i in range(len(self.shard_paths))))
+        self._buffered_shards: list[dict[str, Any]] | None = None
+        self.last_shard_order: list[str] = []
+        self.last_row_orders: dict[str, list[int]] = {}
+
+        if self.buffer:
+            self._buffered_shards = [self._load_shard(path) for path in self.shard_paths]
+
+    def _get_shard_size(self, path: str) -> int:
+        shard = self._load_shard(path)
+        n_rows = int(len(shard["codes"]))
+        del shard
+        return n_rows
+
+    def _selected_rows_count(self, shard_idx: int) -> int:
+        rows = self.row_indices_by_shard.get(shard_idx)
+        if rows is None:
+            return int(self._sizes[shard_idx])
+        return int(len(rows))
+
+    def _load_shard(self, path: str) -> dict[str, Any]:
+        shard = np.load(path, allow_pickle=True).item()
+        if self.y_key not in shard:
+            raise KeyError(f"y_key '{self.y_key}' not found in shard: {path}")
+        return shard
+
+    def __len__(self) -> int:
+        if self._total_rows == 0:
+            return 0
+        return int(math.ceil(self._total_rows / max(1, self.batch_size)))
+
+    def __iter__(self):
+        if not self.shard_paths:
+            return
+        shard_indices = np.arange(len(self.shard_paths), dtype=np.int64)
+        if self.shuffle:
+            shard_indices = self._rng.permutation(shard_indices)
+        self.last_shard_order = [self.shard_paths[int(i)] for i in shard_indices.tolist()]
+        self.last_row_orders = {}
+
+        batch_samples: list[dict[str, Any]] = []
+        for shard_idx in shard_indices.tolist():
+            selected_rows = self.row_indices_by_shard.get(shard_idx)
+            if selected_rows is None:
+                row_indices = np.arange(self._sizes[shard_idx], dtype=np.int64)
+            else:
+                row_indices = np.asarray(selected_rows, dtype=np.int64).copy()
+
+            if row_indices.size == 0:
+                continue
+            if self.shuffle:
+                row_indices = self._rng.permutation(row_indices)
+
+            path = self.shard_paths[shard_idx]
+            self.last_row_orders[path] = row_indices.tolist()
+            shard = self._buffered_shards[shard_idx] if self._buffered_shards is not None else self._load_shard(path)
+
+            for row_idx in row_indices.tolist():
+                batch_samples.append(
+                    {
+                        "code": str(shard["codes"][row_idx]),
+                        "asof_date": str(shard["asof_dates"][row_idx]),
+                        "x_micro": torch.as_tensor(shard["X_micro"][row_idx], dtype=torch.float32),
+                        "x_mezzo": torch.as_tensor(shard["X_mezzo"][row_idx], dtype=torch.float32),
+                        "x_macro": torch.as_tensor(shard["X_macro"][row_idx], dtype=torch.float32),
+                        "mask_micro": torch.as_tensor(shard["mask_micro"][row_idx], dtype=torch.bool),
+                        "mask_mezzo": torch.as_tensor(shard["mask_mezzo"][row_idx], dtype=torch.bool),
+                        "mask_macro": torch.as_tensor(shard["mask_macro"][row_idx], dtype=torch.bool),
+                        "y": torch.as_tensor(shard[self.y_key][row_idx], dtype=torch.float32),
+                        "dp_ok": torch.as_tensor(shard["dp_ok"][row_idx], dtype=torch.bool),
+                        "label_ok": torch.as_tensor(shard["label_ok"][row_idx], dtype=torch.bool),
+                        "loss_mask": torch.as_tensor(shard["loss_mask"][row_idx], dtype=torch.bool),
+                    }
+                )
+                if len(batch_samples) == self.batch_size:
+                    yield collate_batch(batch_samples)
+                    batch_samples = []
+
+            if self._buffered_shards is None:
+                del shard
+
+        if batch_samples:
+            yield collate_batch(batch_samples)
+
+
+def _build_row_splits(
+    shard_paths: list[str], val_ratio: float, split_seed: int, y_key: str
+) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray], int, int]:
+    shard_sizes: list[int] = []
+    for path in shard_paths:
+        shard = np.load(path, allow_pickle=True).item()
+        if y_key not in shard:
+            raise KeyError(f"y_key '{y_key}' not found in shard: {path}")
+        shard_sizes.append(int(len(shard["codes"])))
+        del shard
+
+    offsets = [0]
+    for size in shard_sizes:
+        offsets.append(offsets[-1] + size)
+    total = offsets[-1]
+    if total < 2:
+        raise ValueError("At least 2 samples are required when val_shards is not provided.")
+
+    ratio = float(min(max(val_ratio, 0.0), 0.99))
+    val_size = int(round(total * ratio))
+    val_size = max(1, min(total - 1, val_size))
+
+    g = torch.Generator()
+    g.manual_seed(int(split_seed))
+    perm = torch.randperm(total, generator=g).tolist()
+    val_indices = perm[:val_size]
+    train_indices = perm[val_size:]
+
+    def _to_rows(global_indices: list[int]) -> dict[int, np.ndarray]:
+        grouped: dict[int, list[int]] = {}
+        for idx in global_indices:
+            shard_idx = bisect.bisect_right(offsets, idx) - 1
+            row_idx = idx - offsets[shard_idx]
+            grouped.setdefault(shard_idx, []).append(int(row_idx))
+        return {k: np.asarray(v, dtype=np.int64) for k, v in grouped.items()}
+
+    return _to_rows(train_indices), _to_rows(val_indices), len(train_indices), len(val_indices)
 
 
 def collate_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
@@ -178,6 +321,7 @@ class TrainConfig:
     clip_grad_norm: float | None = None
     val_ratio: float = 0.15
     split_seed: int = 42
+    buffer: bool = False
 
 
 def _to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -224,27 +368,48 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
     curve_path = metrics_dir / "curve.json"
     history: dict[str, list[dict[str, float | int]]] = {"train": [], "val": []}
 
-    base_train_ds = NpyShardDataset(config.train_shards, y_key=config.y_key)
+    train_sample_count = 0
+    val_sample_count = 0
     if config.val_shards:
-        train_ds: Dataset[Any] = base_train_ds
-        val_ds: Dataset[Any] = NpyShardDataset(config.val_shards, y_key=config.y_key)
+        train_loader = ShardBatchIterator(
+            config.train_shards,
+            batch_size=config.batch_size,
+            y_key=config.y_key,
+            shuffle=True,
+            buffer=config.buffer,
+        )
+        val_loader = ShardBatchIterator(
+            config.val_shards,
+            batch_size=config.batch_size,
+            y_key=config.y_key,
+            shuffle=False,
+            buffer=config.buffer,
+        )
+        train_sample_count = train_loader._total_rows
+        val_sample_count = val_loader._total_rows
     else:
-        total = len(base_train_ds)
-        if total < 2:
-            raise ValueError("At least 2 samples are required when val_shards is not provided.")
-        ratio = float(min(max(config.val_ratio, 0.0), 0.99))
-        val_size = int(round(total * ratio))
-        val_size = max(1, min(total - 1, val_size))
-        g = torch.Generator()
-        g.manual_seed(int(config.split_seed))
-        perm = torch.randperm(total, generator=g).tolist()
-        val_indices = perm[:val_size]
-        train_indices = perm[val_size:]
-        train_ds = Subset(base_train_ds, train_indices)
-        val_ds = Subset(base_train_ds, val_indices)
-
-    train_loader = DataLoader(train_ds, batch_size=config.batch_size, shuffle=True, collate_fn=collate_batch)
-    val_loader = DataLoader(val_ds, batch_size=config.batch_size, shuffle=False, collate_fn=collate_batch)
+        train_rows, val_rows, train_sample_count, val_sample_count = _build_row_splits(
+            config.train_shards,
+            val_ratio=config.val_ratio,
+            split_seed=config.split_seed,
+            y_key=config.y_key,
+        )
+        train_loader = ShardBatchIterator(
+            config.train_shards,
+            batch_size=config.batch_size,
+            y_key=config.y_key,
+            shuffle=True,
+            buffer=config.buffer,
+            row_indices_by_shard=train_rows,
+        )
+        val_loader = ShardBatchIterator(
+            config.train_shards,
+            batch_size=config.batch_size,
+            y_key=config.y_key,
+            shuffle=False,
+            buffer=config.buffer,
+            row_indices_by_shard=val_rows,
+        )
 
     model = MultiScaleRegressor(
         in_dim=config.in_dim,
@@ -276,8 +441,16 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
         for epoch in range(config.num_epochs):
             model.train()
             optimizer.zero_grad(set_to_none=True)
+            epoch_train_iter = iter(train_loader)
+            logger.info(
+                "epoch=%d train_shard_iter_start buffer=%s train_shards=%d sample_shards=%s",
+                epoch + 1,
+                str(config.buffer).lower(),
+                len(config.train_shards),
+                [Path(p).name for p in train_loader.last_shard_order[:3]],
+            )
 
-            for batch_idx, raw_batch in enumerate(train_loader):
+            for batch_idx, raw_batch in enumerate(epoch_train_iter):
                 batch = _to_device(raw_batch, device)
 
                 with autocast(enabled=use_amp):
@@ -408,8 +581,8 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 "epochs_completed": int(epochs_completed),
             },
             "data": {
-                "train_samples": int(len(train_ds)),
-                "val_samples": int(len(val_ds)),
+                "train_samples": int(train_sample_count),
+                "val_samples": int(val_sample_count),
                 "final_train_valid_ratio": float(last_train_row.get("valid_ratio", 0.0)),
                 "final_val_loss": float(last_val_row.get("loss", 0.0)),
             },
@@ -440,8 +613,8 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 "epochs_completed": int(epochs_completed),
             },
             "data": {
-                "train_samples": int(len(train_ds)),
-                "val_samples": int(len(val_ds)),
+                "train_samples": int(train_sample_count),
+                "val_samples": int(val_sample_count),
                 "final_train_valid_ratio": float(last_train_row.get("valid_ratio", 0.0)),
                 "final_val_loss": float(last_val_row.get("loss", 0.0)),
             },
@@ -484,6 +657,7 @@ def _parse_args() -> TrainConfig:
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--y-key", type=str, default="y")
     parser.add_argument("--val-ratio", type=float, default=0.15)
+    parser.add_argument("--buffer", action="store_true")
 
     args = parser.parse_args()
     return TrainConfig(
@@ -501,6 +675,7 @@ def _parse_args() -> TrainConfig:
         out_dir=args.out_dir,
         y_key=args.y_key,
         val_ratio=args.val_ratio,
+        buffer=args.buffer,
     )
 
 
