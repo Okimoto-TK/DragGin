@@ -173,3 +173,39 @@ def test_disable_free_branch() -> None:
     )
 
     assert torch.allclose(fused_seq, guided_seq, atol=1e-5)
+
+
+def test_free_branch_partial_mask_safe() -> None:
+    torch.manual_seed(42)
+    bsz, hidden = 2, 14
+    model = MultiScaleFusion(hidden_dim=hidden, num_heads=2)
+
+    micro_seq = torch.randn(bsz, 48, hidden)
+    mezzo_seq = torch.randn(bsz, 40, hidden)
+    macro_seq = torch.randn(bsz, 30, hidden)
+    micro_pool = torch.randn(bsz, hidden)
+    mezzo_pool = torch.randn(bsz, hidden)
+    macro_pool = torch.randn(bsz, hidden)
+
+    mask_micro = torch.randint(0, 2, (bsz, 48), dtype=torch.bool)
+    mask_mezzo = torch.ones(bsz, 40, dtype=torch.bool)
+    mask_macro = torch.ones(bsz, 30, dtype=torch.bool)
+
+    fused_seq, fused_pool, aux = model(
+        micro_seq,
+        mezzo_seq,
+        macro_seq,
+        micro_pool,
+        mezzo_pool,
+        macro_pool,
+        mask_micro,
+        mask_mezzo,
+        mask_macro,
+    )
+
+    assert fused_seq.shape == (bsz, 30, hidden)
+    assert fused_pool.shape == (bsz, hidden)
+    assert aux["free_pool"].shape == (bsz, hidden)
+    assert torch.isfinite(fused_seq).all()
+    assert torch.isfinite(fused_pool).all()
+    assert torch.isfinite(aux["free_pool"]).all()
