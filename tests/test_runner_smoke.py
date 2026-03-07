@@ -196,6 +196,42 @@ def test_shard_batch_iterator_batch_shapes(tmp_path: Path) -> None:
     assert first_batch["label_ok"].shape == (2,)
     assert first_batch["loss_mask"].shape == (2,)
 
+
+
+def test_shard_batch_iterator_multiprocess_shapes(tmp_path: Path) -> None:
+    shard_paths = [_write_shard(tmp_path / f"mp_{i}.npy", n=3) for i in range(2)]
+    iterator = ShardBatchIterator(
+        shard_paths=shard_paths,
+        batch_size=2,
+        y_key="y",
+        shuffle=False,
+        buffer=False,
+        num_workers=2,
+    )
+    first_batch = next(iter(iterator))
+    assert first_batch["x_micro"].shape == (2, 48, 6)
+    assert first_batch["x_mezzo"].shape == (2, 40, 6)
+    assert first_batch["x_macro"].shape == (2, 30, 6)
+
+
+
+
+def test_shard_batch_iterator_multiprocess_buffer_shapes(tmp_path: Path) -> None:
+    shard_paths = [_write_shard(tmp_path / f"mp_buf_{i}.npy", n=3) for i in range(2)]
+    iterator = ShardBatchIterator(
+        shard_paths=shard_paths,
+        batch_size=2,
+        y_key="y",
+        shuffle=False,
+        buffer=True,
+        num_workers=2,
+    )
+    first_batch = next(iter(iterator))
+    assert first_batch["x_micro"].shape == (2, 48, 6)
+    assert first_batch["x_mezzo"].shape == (2, 40, 6)
+    assert first_batch["x_macro"].shape == (2, 30, 6)
+
+
 def test_empty_valid_mask_batch_safe() -> None:
     batch = _synthetic_batch(batch_size=2)
     batch["loss_mask"] = torch.zeros(2, dtype=torch.bool)

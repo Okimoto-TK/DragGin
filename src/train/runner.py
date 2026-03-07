@@ -6,6 +6,8 @@ import json
 import logging
 import math
 import traceback
+from collections import deque
+from concurrent.futures import Future, ProcessPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -75,6 +77,15 @@ class NpyShardDataset(Dataset):
         }
 
 
+def _load_shard_payload(path: str, y_key: str) -> dict[str, Any]:
+    shard = np.load(path, allow_pickle=True).item()
+    if y_key not in shard:
+        raise KeyError(f"y_key '{y_key}' not found in shard: {path}")
+    return shard
+
+
+
+
 class ShardBatchIterator:
     def __init__(
         self,
@@ -84,6 +95,7 @@ class ShardBatchIterator:
         shuffle: bool = True,
         buffer: bool = False,
         row_indices_by_shard: dict[int, np.ndarray] | None = None,
+        num_workers: int = 1,
     ) -> None:
         self.shard_paths = [str(path) for path in shard_paths]
         self.batch_size = int(batch_size)
@@ -91,6 +103,7 @@ class ShardBatchIterator:
         self.shuffle = bool(shuffle)
         self.buffer = bool(buffer)
         self.row_indices_by_shard = row_indices_by_shard or {}
+        self.num_workers = max(1, int(num_workers))
         self._rng = np.random.default_rng()
         self._sizes = [self._get_shard_size(path) for path in self.shard_paths]
         self._total_rows = int(sum(self._selected_rows_count(i) for i in range(len(self.shard_paths))))
@@ -99,7 +112,11 @@ class ShardBatchIterator:
         self.last_row_orders: dict[str, list[int]] = {}
 
         if self.buffer:
-            self._buffered_shards = [self._load_shard(path) for path in self.shard_paths]
+            if self.num_workers > 1 and len(self.shard_paths) > 0:
+                with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
+                    self._buffered_shards = list(executor.map(_load_shard_payload, self.shard_paths, [self.y_key] * len(self.shard_paths)))
+            else:
+                self._buffered_shards = [self._load_shard(path) for path in self.shard_paths]
 
     def _get_shard_size(self, path: str) -> int:
         shard = self._load_shard(path)
@@ -114,10 +131,7 @@ class ShardBatchIterator:
         return int(len(rows))
 
     def _load_shard(self, path: str) -> dict[str, Any]:
-        shard = np.load(path, allow_pickle=True).item()
-        if self.y_key not in shard:
-            raise KeyError(f"y_key '{self.y_key}' not found in shard: {path}")
-        return shard
+        return _load_shard_payload(path, self.y_key)
 
     def __len__(self) -> int:
         if self._total_rows == 0:
@@ -130,26 +144,31 @@ class ShardBatchIterator:
         shard_indices = np.arange(len(self.shard_paths), dtype=np.int64)
         if self.shuffle:
             shard_indices = self._rng.permutation(shard_indices)
-        self.last_shard_order = [self.shard_paths[int(i)] for i in shard_indices.tolist()]
+        ordered_indices = shard_indices.tolist()
+        self.last_shard_order = [self.shard_paths[int(i)] for i in ordered_indices]
         self.last_row_orders = {}
 
-        batch_samples: list[dict[str, Any]] = []
-        for shard_idx in shard_indices.tolist():
+        row_orders: dict[int, np.ndarray] = {}
+        for shard_idx in ordered_indices:
             selected_rows = self.row_indices_by_shard.get(shard_idx)
             if selected_rows is None:
                 row_indices = np.arange(self._sizes[shard_idx], dtype=np.int64)
             else:
                 row_indices = np.asarray(selected_rows, dtype=np.int64).copy()
-
             if row_indices.size == 0:
                 continue
             if self.shuffle:
                 row_indices = self._rng.permutation(row_indices)
-
+            row_orders[shard_idx] = row_indices
             path = self.shard_paths[shard_idx]
             self.last_row_orders[path] = row_indices.tolist()
-            shard = self._buffered_shards[shard_idx] if self._buffered_shards is not None else self._load_shard(path)
 
+        batch_samples: list[dict[str, Any]] = []
+
+        def _consume_shard(shard_idx: int, shard: dict[str, Any]) -> list[dict[str, Any]]:
+            nonlocal batch_samples
+            emitted: list[dict[str, Any]] = []
+            row_indices = row_orders[shard_idx]
             for row_idx in row_indices.tolist():
                 batch_samples.append(
                     {
@@ -168,14 +187,49 @@ class ShardBatchIterator:
                     }
                 )
                 if len(batch_samples) == self.batch_size:
-                    yield collate_batch(batch_samples)
+                    emitted.append(collate_batch(batch_samples))
                     batch_samples = []
+            return emitted
 
-            if self._buffered_shards is None:
+        if self._buffered_shards is not None:
+            for shard_idx in ordered_indices:
+                if shard_idx not in row_orders:
+                    continue
+                for out_batch in _consume_shard(shard_idx, self._buffered_shards[shard_idx]):
+                    yield out_batch
+        elif self.num_workers > 1:
+            pending: deque[tuple[int, Future[dict[str, Any]]]] = deque()
+            loadable_indices = [idx for idx in ordered_indices if idx in row_orders]
+            with ProcessPoolExecutor(max_workers=self.num_workers) as executor:
+                ptr = 0
+                while ptr < len(loadable_indices) and len(pending) < self.num_workers:
+                    shard_idx = loadable_indices[ptr]
+                    pending.append((shard_idx, executor.submit(_load_shard_payload, self.shard_paths[shard_idx], self.y_key)))
+                    ptr += 1
+
+                while pending:
+                    shard_idx, fut = pending.popleft()
+                    shard = fut.result()
+                    for out_batch in _consume_shard(shard_idx, shard):
+                        yield out_batch
+                    del shard
+
+                    if ptr < len(loadable_indices):
+                        next_idx = loadable_indices[ptr]
+                        pending.append((next_idx, executor.submit(_load_shard_payload, self.shard_paths[next_idx], self.y_key)))
+                        ptr += 1
+        else:
+            for shard_idx in ordered_indices:
+                if shard_idx not in row_orders:
+                    continue
+                shard = self._load_shard(self.shard_paths[shard_idx])
+                for out_batch in _consume_shard(shard_idx, shard):
+                    yield out_batch
                 del shard
 
         if batch_samples:
             yield collate_batch(batch_samples)
+
 
 
 def _build_row_splits(
@@ -322,6 +376,7 @@ class TrainConfig:
     val_ratio: float = 0.15
     split_seed: int = 42
     buffer: bool = False
+    num_workers: int = 1
 
 
 def _to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
@@ -377,6 +432,7 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
             y_key=config.y_key,
             shuffle=True,
             buffer=config.buffer,
+            num_workers=config.num_workers,
         )
         val_loader = ShardBatchIterator(
             config.val_shards,
@@ -384,6 +440,7 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
             y_key=config.y_key,
             shuffle=False,
             buffer=config.buffer,
+            num_workers=config.num_workers,
         )
         train_sample_count = train_loader._total_rows
         val_sample_count = val_loader._total_rows
@@ -401,6 +458,7 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
             shuffle=True,
             buffer=config.buffer,
             row_indices_by_shard=train_rows,
+            num_workers=config.num_workers,
         )
         val_loader = ShardBatchIterator(
             config.train_shards,
@@ -409,6 +467,7 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
             shuffle=False,
             buffer=config.buffer,
             row_indices_by_shard=val_rows,
+            num_workers=config.num_workers,
         )
 
     model = MultiScaleRegressor(
@@ -443,9 +502,10 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
             optimizer.zero_grad(set_to_none=True)
             epoch_train_iter = iter(train_loader)
             logger.info(
-                "epoch=%d train_shard_iter_start buffer=%s train_shards=%d sample_shards=%s",
+                "epoch=%d train_shard_iter_start buffer=%s workers=%d train_shards=%d sample_shards=%s",
                 epoch + 1,
                 str(config.buffer).lower(),
+                int(config.num_workers),
                 len(config.train_shards),
                 [Path(p).name for p in train_loader.last_shard_order[:3]],
             )
@@ -658,6 +718,7 @@ def _parse_args() -> TrainConfig:
     parser.add_argument("--y-key", type=str, default="y")
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--buffer", action="store_true")
+    parser.add_argument("--num-workers", type=int, default=1)
 
     args = parser.parse_args()
     return TrainConfig(
@@ -676,6 +737,7 @@ def _parse_args() -> TrainConfig:
         y_key=args.y_key,
         val_ratio=args.val_ratio,
         buffer=args.buffer,
+        num_workers=max(1, int(args.num_workers)),
     )
 
 
