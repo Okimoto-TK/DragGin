@@ -529,6 +529,10 @@ def _write_yaml(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
 
+def _weighted_metric_value(metric: torch.Tensor, num_valid: int) -> float:
+    return float(metric.detach().item()) * float(max(0, int(num_valid)))
+
+
 def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, Any]:
     out_dir = Path(config.out_dir)
     logs_dir = out_dir / "logs"
@@ -608,6 +612,8 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
         use_seq_context=config.use_seq_context,
     )
 
+    gate_reg_enabled = bool(model.fusion.gated.enable_free_branch)
+
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
         torch.backends.cudnn.benchmark = True
@@ -682,8 +688,14 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                     loss, metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
                     gate = aux["fusion"]["gate"]
                     gate_std = gate.std(unbiased=False)
-                    gate_std_penalty = torch.relu(torch.as_tensor(config.gate_std_target, dtype=gate_std.dtype, device=gate_std.device) - gate_std) ** 2
-                    total_loss = loss + float(config.gate_std_reg) * gate_std_penalty
+                    if gate_reg_enabled:
+                        gate_std_penalty = torch.relu(
+                            torch.as_tensor(config.gate_std_target, dtype=gate_std.dtype, device=gate_std.device) - gate_std
+                        ) ** 2
+                        total_loss = loss + float(config.gate_std_reg) * gate_std_penalty
+                    else:
+                        gate_std_penalty = torch.zeros((), dtype=loss.dtype, device=loss.device)
+                        total_loss = loss
                     scaled_loss = total_loss / max(1, config.grad_accum_steps)
 
                 if scaled_loss.requires_grad:
@@ -769,11 +781,11 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                     _train_on_batch(batch, batch_idx)
 
             model.eval()
-            val_loss_sum = 0.0
-            val_huber_sum = 0.0
-            val_mae_sum = 0.0
-            val_mse_sum = 0.0
-            val_batches = 0
+            val_loss_weighted_sum = 0.0
+            val_huber_weighted_sum = 0.0
+            val_mae_weighted_sum = 0.0
+            val_mse_weighted_sum = 0.0
+            val_num_valid_total = 0
             with torch.no_grad():
                 if device.type == "cuda" and config.prefetch_cuda:
                     val_prefetcher = CUDAPrefetcher(val_loader, device=device, pin_memory=config.pin_memory)
@@ -784,30 +796,32 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                         with autocast(enabled=use_amp):
                             y_hat, _ = model(batch)
                             val_loss, val_metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
-                        val_loss_sum += float(val_loss.detach().item())
-                        val_huber_sum += float(val_metrics["huber"].detach().item())
-                        val_mae_sum += float(val_metrics["mae"].detach().item())
-                        val_mse_sum += float(val_metrics["mse"].detach().item())
-                        val_batches += 1
+                        num_valid = int(val_metrics["num_valid"])
+                        val_num_valid_total += num_valid
+                        val_loss_weighted_sum += _weighted_metric_value(val_loss, num_valid)
+                        val_huber_weighted_sum += _weighted_metric_value(val_metrics["huber"], num_valid)
+                        val_mae_weighted_sum += _weighted_metric_value(val_metrics["mae"], num_valid)
+                        val_mse_weighted_sum += _weighted_metric_value(val_metrics["mse"], num_valid)
                 else:
                     for raw_batch in val_loader:
                         batch = _to_device(raw_batch, device, pin_memory=config.pin_memory)
                         with autocast(enabled=use_amp):
                             y_hat, _ = model(batch)
                             val_loss, val_metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
-                        val_loss_sum += float(val_loss.detach().item())
-                        val_huber_sum += float(val_metrics["huber"].detach().item())
-                        val_mae_sum += float(val_metrics["mae"].detach().item())
-                        val_mse_sum += float(val_metrics["mse"].detach().item())
-                        val_batches += 1
+                        num_valid = int(val_metrics["num_valid"])
+                        val_num_valid_total += num_valid
+                        val_loss_weighted_sum += _weighted_metric_value(val_loss, num_valid)
+                        val_huber_weighted_sum += _weighted_metric_value(val_metrics["huber"], num_valid)
+                        val_mae_weighted_sum += _weighted_metric_value(val_metrics["mae"], num_valid)
+                        val_mse_weighted_sum += _weighted_metric_value(val_metrics["mse"], num_valid)
 
-            denom = max(1, val_batches)
+            denom = max(1, int(val_num_valid_total))
             val_row = {
                 "epoch": int(epoch + 1),
-                "loss": float(val_loss_sum / denom),
-                "huber": float(val_huber_sum / denom),
-                "mae": float(val_mae_sum / denom),
-                "mse": float(val_mse_sum / denom),
+                "loss": float(val_loss_weighted_sum / denom),
+                "huber": float(val_huber_weighted_sum / denom),
+                "mae": float(val_mae_weighted_sum / denom),
+                "mse": float(val_mse_weighted_sum / denom),
             }
             history["val"].append(val_row)
             last_val_row = val_row

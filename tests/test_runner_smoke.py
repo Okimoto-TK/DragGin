@@ -12,6 +12,7 @@ from src.train.runner import (
     TrainConfig,
     collate_batch,
     run_training,
+    _weighted_metric_value,
 )
 
 
@@ -125,6 +126,35 @@ def test_train_one_epoch_smoke(tmp_path: Path) -> None:
 
 
 
+
+
+
+def test_gate_std_penalty_zero_when_free_branch_disabled(tmp_path: Path) -> None:
+    train_path = _write_shard(tmp_path / "train_no_free.npy", n=4)
+    val_path = _write_shard(tmp_path / "val_no_free.npy", n=2)
+
+    cfg = TrainConfig(
+        train_shards=[train_path],
+        val_shards=[val_path],
+        batch_size=2,
+        grad_accum_steps=1,
+        num_epochs=1,
+        lr=1e-3,
+        weight_decay=1e-4,
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        exp_name="no_free_branch",
+        out_dir=str(tmp_path / "out_no_free"),
+        enable_free_branch=False,
+    )
+    run_training(cfg)
+
+    data = json.loads((Path(cfg.out_dir) / "metrics" / "curve.json").read_text(encoding="utf-8"))
+    assert len(data["train"]) >= 1
+    for row in data["train"]:
+        assert float(row["gate_std_penalty"]) == 0.0
+        assert float(row["total_loss"]) == float(row["loss"])
 
 def test_train_one_epoch_all_invalid_train_mask_does_not_crash(tmp_path: Path) -> None:
     train_path = _write_shard(tmp_path / "train_all_invalid.npy", n=4, all_loss_mask_false=True)
@@ -363,6 +393,21 @@ def test_shard_batch_iterator_multiprocess_buffer_shapes(tmp_path: Path) -> None
     assert first_batch["x_mezzo"].shape == (2, 40, 6)
     assert first_batch["x_macro"].shape == (2, 30, 6)
 
+
+
+
+def test_weighted_metric_value_matches_num_valid_weighting() -> None:
+    batch1_loss = torch.tensor(1.0)
+    batch2_loss = torch.tensor(9.0)
+    batch1_valid = 8
+    batch2_valid = 2
+
+    weighted_sum = _weighted_metric_value(batch1_loss, batch1_valid) + _weighted_metric_value(batch2_loss, batch2_valid)
+    weighted_mean = weighted_sum / float(batch1_valid + batch2_valid)
+    simple_batch_mean = (float(batch1_loss.item()) + float(batch2_loss.item())) / 2.0
+
+    assert weighted_mean == 2.6
+    assert weighted_mean != simple_batch_mean
 
 def test_empty_valid_mask_batch_safe() -> None:
     batch = _synthetic_batch(batch_size=2)
