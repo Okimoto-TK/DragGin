@@ -416,6 +416,8 @@ class TrainConfig:
     dropout: float
     exp_name: str
     out_dir: str
+    gate_std_target: float = 0.10
+    gate_std_reg: float = 1e-3
     y_key: str = "y"
     in_dim: int = 6
     enable_dynamic_threshold: bool = True
@@ -631,6 +633,16 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
         checkpoint = torch.load(checkpoint_path, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        for pg in optimizer.param_groups:
+            pg["lr"] = float(config.lr)
+            pg["weight_decay"] = float(config.weight_decay)
+            if "initial_lr" in pg:
+                pg["initial_lr"] = float(config.lr)
+        logger.info(
+            "resume_override_optim_hparams lr=%s weight_decay=%s",
+            [float(pg["lr"]) for pg in optimizer.param_groups],
+            [float(pg["weight_decay"]) for pg in optimizer.param_groups],
+        )
         scaler_state = checkpoint.get("scaler_state_dict")
         if isinstance(scaler_state, dict):
             scaler.load_state_dict(scaler_state)
@@ -668,7 +680,11 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 with autocast(enabled=use_amp):
                     y_hat, aux = model(batch)
                     loss, metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
-                    scaled_loss = loss / max(1, config.grad_accum_steps)
+                    gate = aux["fusion"]["gate"]
+                    gate_std = gate.std(unbiased=False)
+                    gate_std_penalty = torch.relu(torch.as_tensor(config.gate_std_target, dtype=gate_std.dtype, device=gate_std.device) - gate_std) ** 2
+                    total_loss = loss + float(config.gate_std_reg) * gate_std_penalty
+                    scaled_loss = total_loss / max(1, config.grad_accum_steps)
 
                 if scaled_loss.requires_grad:
                     scaler.scale(scaled_loss).backward()
@@ -692,11 +708,10 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 batch_size_current = int(batch["y"].shape[0])
                 num_valid = int(metrics["num_valid"])
                 valid_ratio = float(num_valid / max(1, batch_size_current))
-                gate = aux["fusion"]["gate"]
-
                 train_row = {
                     "step": int(global_step),
                     "loss": float(loss.detach().item()),
+                    "total_loss": float(total_loss.detach().item()),
                     "huber": float(metrics["huber"].detach().item()),
                     "mae": float(metrics["mae"].detach().item()),
                     "mse": float(metrics["mse"].detach().item()),
@@ -707,12 +722,15 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                     "mezzo_lambda_mean": float(aux["mezzo"]["lambda_mean"].mean().detach().item()),
                     "macro_lambda_mean": float(aux["macro"]["lambda_mean"].mean().detach().item()),
                     "gate_mean": float(gate.mean().detach().item()),
-                    "gate_std": float(gate.std(unbiased=False).detach().item()),
+                    "gate_std": float(gate_std.detach().item()),
+                    "gate_std_penalty": float(gate_std_penalty.detach().item()),
                 }
                 history["train"].append(train_row)
                 last_train_row = train_row
 
                 writer.add_scalar("train/loss", train_row["loss"], global_step)
+                writer.add_scalar("train/total_loss", train_row["total_loss"], global_step)
+                writer.add_scalar("train/gate_std_penalty", train_row["gate_std_penalty"], global_step)
                 writer.add_scalar("train/huber", train_row["huber"], global_step)
                 writer.add_scalar("train/mae", train_row["mae"], global_step)
                 writer.add_scalar("train/mse", train_row["mse"], global_step)
@@ -905,6 +923,8 @@ def _parse_args() -> TrainConfig:
     parser.add_argument("--num-epochs", type=int, required=True)
     parser.add_argument("--lr", type=float, required=True)
     parser.add_argument("--weight-decay", type=float, required=True)
+    parser.add_argument("--gate-std-target", type=float, default=0.10)
+    parser.add_argument("--gate-std-reg", type=float, default=1e-3)
     parser.add_argument("--hidden-dim", type=int, required=True)
     parser.add_argument("--num-heads", type=int, required=True)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -932,6 +952,8 @@ def _parse_args() -> TrainConfig:
         num_epochs=args.num_epochs,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        gate_std_target=args.gate_std_target,
+        gate_std_reg=args.gate_std_reg,
         hidden_dim=args.hidden_dim,
         num_heads=args.num_heads,
         dropout=args.dropout,

@@ -31,6 +31,8 @@ def main() -> None:
     parser.add_argument("--num-epochs", type=int, required=True)
     parser.add_argument("--lr", type=float, required=True)
     parser.add_argument("--weight-decay", type=float, required=True)
+    parser.add_argument("--gate-std-target", type=float, default=0.10)
+    parser.add_argument("--gate-std-reg", type=float, default=1e-3)
     parser.add_argument("--hidden-dim", type=int, required=True)
     parser.add_argument("--num-heads", type=int, required=True)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -62,6 +64,8 @@ def main() -> None:
         num_epochs=args.num_epochs,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        gate_std_target=args.gate_std_target,
+        gate_std_reg=args.gate_std_reg,
         hidden_dim=args.hidden_dim,
         num_heads=args.num_heads,
         dropout=args.dropout,

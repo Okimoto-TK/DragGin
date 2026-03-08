@@ -228,6 +228,55 @@ def test_resume_from_checkpoint_and_save_every(tmp_path: Path) -> None:
     assert int(resumed_latest["epoch"]) == 2
 
 
+def test_resume_overrides_optimizer_lr_and_weight_decay(tmp_path: Path) -> None:
+    train_path = _write_shard(tmp_path / "resume_lr_train.npy", n=6)
+    val_path = _write_shard(tmp_path / "resume_lr_val.npy", n=4)
+
+    out_dir = tmp_path / "out_resume_lr"
+    first_cfg = TrainConfig(
+        train_shards=[train_path],
+        val_shards=[val_path],
+        batch_size=2,
+        grad_accum_steps=1,
+        num_epochs=1,
+        lr=1e-3,
+        weight_decay=1e-4,
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        exp_name="resume_lr_run",
+        out_dir=str(out_dir),
+    )
+    run_training(first_cfg)
+
+    ckpt_dir = out_dir / "checkpoints" / first_cfg.exp_name
+    latest_path = ckpt_dir / "latest.ckpt"
+    assert latest_path.exists()
+
+    new_lr = 5e-4
+    new_weight_decay = 5e-5
+    second_cfg = TrainConfig(
+        train_shards=[train_path],
+        val_shards=[val_path],
+        batch_size=2,
+        grad_accum_steps=1,
+        num_epochs=1,
+        lr=new_lr,
+        weight_decay=new_weight_decay,
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        exp_name="resume_lr_run",
+        out_dir=str(out_dir),
+        checkpoint=str(latest_path),
+    )
+    run_training(second_cfg)
+
+    resumed_latest = torch.load(latest_path, map_location="cpu")
+    optimizer_state = resumed_latest["optimizer_state_dict"]
+    assert float(optimizer_state["param_groups"][0]["lr"]) == new_lr
+    assert float(optimizer_state["param_groups"][0]["weight_decay"]) == new_weight_decay
+
 def test_shard_batch_iterator_no_buffer_does_not_preload(tmp_path: Path) -> None:
     shard_paths = [_write_shard(tmp_path / f"train_{i}.npy", n=2) for i in range(3)]
     iterator = ShardBatchIterator(shard_paths=shard_paths, batch_size=2, y_key="y", shuffle=True, buffer=False)

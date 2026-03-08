@@ -11,6 +11,8 @@ def _masked_mean(seq: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 def _force_gate_constant(module: GatedFusion, bias: float) -> None:
     with torch.no_grad():
+        module.gate_norm.weight.fill_(1.0)
+        module.gate_norm.bias.zero_()
         for param in module.gate_mlp.parameters():
             param.zero_()
         module.gate_mlp[-1].bias.fill_(bias)
@@ -46,6 +48,7 @@ def test_fusion_shapes() -> None:
     assert fused_seq.shape == (2, 30, hidden)
     assert fused_pool.shape == (2, hidden)
     assert aux["gate"].shape == (2, 1)
+    assert aux["gate_logits"].shape == (2, 1)
 
 
 def test_gate_one_returns_guided() -> None:

@@ -20,11 +20,14 @@ class GatedFusion(nn.Module):
         self,
         hidden_dim: int,
         enable_free_branch: bool = True,
+        gate_temperature: float = 2.0,
     ) -> None:
         super().__init__()
         self.enable_free_branch = enable_free_branch
+        self.gate_temperature = float(gate_temperature)
+        self.gate_norm = nn.LayerNorm(6 * hidden_dim)
         self.gate_mlp = nn.Sequential(
-            nn.Linear(3 * hidden_dim, hidden_dim),
+            nn.Linear(6 * hidden_dim, hidden_dim),
             nn.GELU(),
             nn.Linear(hidden_dim, 1),
         )
@@ -40,8 +43,19 @@ class GatedFusion(nn.Module):
         micro_pool: torch.Tensor,
         mask_macro: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, dict]:
-        gate_in = torch.cat([macro_pool, micro_pool, mezzo_pool], dim=-1)
-        g = torch.sigmoid(self.gate_mlp(gate_in))
+        gate_in = torch.cat(
+            [
+                macro_pool,
+                micro_pool,
+                mezzo_pool,
+                guided_pool,
+                free_pool,
+                torch.abs(guided_pool - free_pool),
+            ],
+            dim=-1,
+        )
+        gate_logits = self.gate_mlp(self.gate_norm(gate_in))
+        g = torch.sigmoid(self.gate_temperature * gate_logits)
 
         if self.enable_free_branch:
             alpha = g.unsqueeze(1)
@@ -55,6 +69,7 @@ class GatedFusion(nn.Module):
 
         aux = {
             "gate": g,
+            "gate_logits": gate_logits,
             "guided_pool": guided_pool,
             "free_pool": free_pool,
         }
@@ -68,11 +83,16 @@ class MultiScaleFusion(nn.Module):
         num_heads: int = 4,
         dropout: float = 0.0,
         enable_free_branch: bool = True,
+        gate_temperature: float = 2.0,
     ) -> None:
         super().__init__()
         self.guided = CrossScaleAttention(hidden_dim=hidden_dim, num_heads=num_heads, dropout=dropout)
         self.free = MicroSelfAttention(hidden_dim=hidden_dim, num_heads=num_heads, dropout=dropout)
-        self.gated = GatedFusion(hidden_dim=hidden_dim, enable_free_branch=enable_free_branch)
+        self.gated = GatedFusion(
+            hidden_dim=hidden_dim,
+            enable_free_branch=enable_free_branch,
+            gate_temperature=gate_temperature,
+        )
 
     def forward(
         self,
