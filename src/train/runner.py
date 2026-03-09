@@ -16,6 +16,7 @@ import torch
 from torch import nn
 from torch.cuda.amp import GradScaler, autocast
 from torch.optim import AdamW
+from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import Dataset
 from torch.utils.tensorboard import SummaryWriter
 
@@ -404,7 +405,8 @@ class MultiScaleRegressor(nn.Module):
             mask_macro=batch["mask_macro"],
             force_gate_value=force_gate_value,
         )
-        y_hat = self.head(fused_seq=fused_seq, fused_pool=fused_pool)
+        y_hat = self.head(fused_seq=fused_seq, fused_pool=fused_pool, mask_macro=batch["mask_macro"])
+        aux_fusion["fused_pool"] = fused_pool
         return y_hat, {"micro": aux_micro, "mezzo": aux_mezzo, "macro": aux_macro, "fusion": aux_fusion}
 
 
@@ -438,6 +440,13 @@ class TrainConfig:
     init_lambda_macro: float = 0.3
     use_seq_context: bool = False
     clip_grad_norm: float | None = None
+    gate_lr: float | None = None
+    gate_clip_grad_norm: float | None = 0.2
+    scheduler_name: str = "plateau"
+    scheduler_factor: float = 0.5
+    scheduler_patience: int = 6
+    scheduler_min_lr: float = 1e-6
+    finite_skip_max_warn: int = 20
     val_ratio: float = 0.15
     split_seed: int = 42
     buffer: bool = False
@@ -461,6 +470,7 @@ def _build_checkpoint_payload(
     scaler: GradScaler,
     history: dict[str, list[dict[str, float | int]]],
     best_val: dict[str, float],
+    scheduler: ReduceLROnPlateau | None = None,
 ) -> dict[str, Any]:
     return {
         "epoch": int(epoch),
@@ -470,6 +480,7 @@ def _build_checkpoint_payload(
         "scaler_state_dict": scaler.state_dict(),
         "history": history,
         "best_val": best_val,
+        "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
     }
 
 
@@ -542,6 +553,38 @@ def _write_yaml(path: Path, payload: dict[str, Any]) -> None:
 
 def _weighted_metric_value(metric: torch.Tensor, num_valid: int) -> float:
     return float(metric.detach().item()) * float(max(0, int(num_valid)))
+
+
+
+
+def _is_finite_tensor(x: torch.Tensor | None) -> bool:
+    if x is None:
+        return True
+    return bool(torch.isfinite(x).all().item())
+
+
+def _safe_scalar(value: float | int) -> float | None:
+    v = float(value)
+    return v if math.isfinite(v) else None
+
+
+def _safe_add_scalar(writer: SummaryWriter, tag: str, value: float | int, step: int) -> None:
+    safe = _safe_scalar(value)
+    if safe is not None:
+        writer.add_scalar(tag, safe, step)
+
+
+def _all_grads_finite(model: nn.Module) -> bool:
+    for p in model.parameters():
+        if p.grad is not None and not _is_finite_tensor(p.grad):
+            return False
+    return True
+
+
+def _resolve_gate_lr(config: TrainConfig) -> float:
+    if config.gate_lr is not None:
+        return float(config.gate_lr)
+    return float(config.lr) * 0.3
 
 
 def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, Any]:
@@ -636,8 +679,26 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
     model.to(device)
     if device.type == "cuda" and config.enable_compile and hasattr(torch, "compile"):
         model = torch.compile(model, mode=config.compile_mode)
-    optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    scheduler = None
+
+    gate_lr = _resolve_gate_lr(config)
+    gate_params = list(gate_last_layer.parameters())
+    gate_param_ids = {id(p) for p in gate_params}
+    main_params = [p for p in model.parameters() if id(p) not in gate_param_ids]
+    optimizer = AdamW(
+        [
+            {"params": main_params, "lr": float(config.lr), "weight_decay": float(config.weight_decay), "name": "main"},
+            {"params": gate_params, "lr": float(gate_lr), "weight_decay": float(config.weight_decay), "name": "gate_last"},
+        ]
+    )
+    scheduler: ReduceLROnPlateau | None = None
+    if str(config.scheduler_name).lower() == "plateau":
+        scheduler = ReduceLROnPlateau(
+            optimizer,
+            mode="min",
+            factor=float(config.scheduler_factor),
+            patience=max(1, int(config.scheduler_patience)),
+            min_lr=float(config.scheduler_min_lr),
+        )
     use_amp = device.type == "cuda"
     scaler = GradScaler(enabled=use_amp)
 
@@ -652,13 +713,23 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
         checkpoint = torch.load(checkpoint_path, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
-        for pg in optimizer.param_groups:
-            pg["lr"] = float(config.lr)
+        scheduler_state = checkpoint.get("scheduler_state_dict")
+        if scheduler is not None and isinstance(scheduler_state, dict):
+            scheduler.load_state_dict(scheduler_state)
+
+        resume_main_lr = float(config.lr)
+        resume_gate_lr = _resolve_gate_lr(config)
+        for idx, pg in enumerate(optimizer.param_groups):
+            is_gate_group = bool(pg.get("name") == "gate_last") or idx == len(optimizer.param_groups) - 1
+            pg["lr"] = float(resume_gate_lr if is_gate_group else resume_main_lr)
             pg["weight_decay"] = float(config.weight_decay)
             if "initial_lr" in pg:
-                pg["initial_lr"] = float(config.lr)
+                pg["initial_lr"] = float(pg["lr"])
+        if scheduler is not None:
+            scheduler.min_lrs = [float(config.scheduler_min_lr)] * len(optimizer.param_groups)
+            scheduler._last_lr = [float(pg["lr"]) for pg in optimizer.param_groups]
         logger.info(
-            "resume_override_optim_hparams lr=%s weight_decay=%s",
+            "resume_override_optim_hparams lrs=%s weight_decay=%s",
             [float(pg["lr"]) for pg in optimizer.param_groups],
             [float(pg["weight_decay"]) for pg in optimizer.param_groups],
         )
@@ -677,6 +748,19 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 if key in best_val_ckpt:
                     best_val[key] = float(best_val_ckpt[key])
         logger.info("resumed_from=%s start_epoch=%d global_step=%d", str(checkpoint_path), start_epoch, global_step)
+    logger.info(
+        "optimizer_param_groups=%s",
+        [
+            {
+                "idx": idx,
+                "name": str(pg.get("name", f"group_{idx}")),
+                "lr": float(pg["lr"]),
+                "weight_decay": float(pg.get("weight_decay", 0.0)),
+                "num_params": int(len(pg.get("params", []))),
+            }
+            for idx, pg in enumerate(optimizer.param_groups)
+        ],
+    )
     last_train_row: dict[str, Any] = {}
     last_val_row: dict[str, Any] = {"loss": 0.0}
 
@@ -694,50 +778,83 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 [Path(p).name for p in train_loader.last_shard_order[:3]],
             )
 
+            finite_skip_warn_count = 0
+
+            def _warn_finite_skip(reason: str, batch: dict[str, Any], batch_idx: int) -> None:
+                nonlocal finite_skip_warn_count
+                if finite_skip_warn_count >= int(config.finite_skip_max_warn):
+                    return
+                finite_skip_warn_count += 1
+                code = batch.get("code", [])
+                asof = batch.get("asof_date", [])
+                code0 = code[0] if isinstance(code, list | tuple) and len(code) > 0 else "n/a"
+                asof0 = asof[0] if isinstance(asof, list | tuple) and len(asof) > 0 else "n/a"
+                logger.warning(
+                    "skip_non_finite epoch=%d step=%d batch_idx=%d reason=%s code=%s asof_date=%s",
+                    epoch + 1,
+                    global_step,
+                    batch_idx,
+                    reason,
+                    str(code0),
+                    str(asof0),
+                )
+
             def _train_on_batch(batch: dict[str, Any], batch_idx: int) -> None:
                 nonlocal global_step, last_train_row
                 force_gate_value = 0.5 if global_step < int(config.gate_warmup_steps) else None
-                with autocast(enabled=use_amp):
-                    y_hat, aux = model(batch, force_gate_value=force_gate_value)
-                    loss, metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
-                    gate = aux["fusion"]["gate"]
-                    gate_logits = aux["fusion"]["gate_logits"]
-                    guided_pool = aux["fusion"]["guided_pool"]
-                    free_pool = aux["fusion"]["free_pool"]
-                    gate_mean = gate.mean()
-                    gate_std = gate.std(unbiased=False)
-                    if gate_reg_enabled:
-                        gate_target = torch.as_tensor(config.gate_std_target, dtype=gate_std.dtype, device=gate_std.device)
-                        gate_std_penalty = torch.relu(
-                            gate_target - gate_std
-                        ) ** 2
-                        gate_mean_target = torch.as_tensor(
-                            config.gate_mean_target,
-                            dtype=gate_mean.dtype,
-                            device=gate_mean.device,
-                        )
-                        gate_mean_penalty = (
-                            gate_mean - gate_mean_target
-                        ) ** 2
-                        gate_eps = torch.as_tensor(1e-6, dtype=gate.dtype, device=gate.device)
-                        gate_clamped = gate.clamp(gate_eps, 1.0 - gate_eps)
-                        gate_entropy = -(
-                            gate_clamped * torch.log(gate_clamped)
-                            + (1.0 - gate_clamped) * torch.log(1.0 - gate_clamped)
-                        ).mean()
-                        gate_entropy_penalty = -gate_entropy
-                        total_loss = (
-                            loss
-                            + float(config.gate_std_reg) * gate_std_penalty
-                            + float(config.gate_mean_reg) * gate_mean_penalty
-                            + float(config.gate_entropy_reg) * gate_entropy_penalty
-                        )
-                    else:
-                        gate_std_penalty = torch.zeros((), dtype=loss.dtype, device=loss.device)
-                        gate_mean_penalty = torch.zeros((), dtype=loss.dtype, device=loss.device)
-                        gate_entropy_penalty = torch.zeros((), dtype=loss.dtype, device=loss.device)
-                        total_loss = loss
-                    scaled_loss = total_loss / max(1, config.grad_accum_steps)
+                try:
+                    with autocast(enabled=use_amp):
+                        y_hat, aux = model(batch, force_gate_value=force_gate_value)
+                        loss, metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
+                        gate = aux["fusion"]["gate"]
+                        gate_logits = aux["fusion"]["gate_logits"]
+                        guided_pool = aux["fusion"]["guided_pool"]
+                        free_pool = aux["fusion"]["free_pool"]
+                        fused_pool = aux["fusion"].get("fused_pool", None)
+                        gate_mean = gate.mean()
+                        gate_std = gate.std(unbiased=False)
+                        if gate_reg_enabled:
+                            gate_target = torch.as_tensor(config.gate_std_target, dtype=gate_std.dtype, device=gate_std.device)
+                            gate_std_penalty = torch.relu(gate_target - gate_std) ** 2
+                            gate_mean_target = torch.as_tensor(config.gate_mean_target, dtype=gate_mean.dtype, device=gate_mean.device)
+                            gate_mean_penalty = (gate_mean - gate_mean_target) ** 2
+                            gate_eps = torch.as_tensor(1e-6, dtype=gate.dtype, device=gate.device)
+                            gate_clamped = gate.clamp(gate_eps, 1.0 - gate_eps)
+                            gate_entropy = -(gate_clamped * torch.log(gate_clamped) + (1.0 - gate_clamped) * torch.log(1.0 - gate_clamped)).mean()
+                            gate_entropy_penalty = -gate_entropy
+                            total_loss = (
+                                loss
+                                + float(config.gate_std_reg) * gate_std_penalty
+                                + float(config.gate_mean_reg) * gate_mean_penalty
+                                + float(config.gate_entropy_reg) * gate_entropy_penalty
+                            )
+                        else:
+                            gate_std_penalty = torch.zeros((), dtype=loss.dtype, device=loss.device)
+                            gate_mean_penalty = torch.zeros((), dtype=loss.dtype, device=loss.device)
+                            gate_entropy_penalty = torch.zeros((), dtype=loss.dtype, device=loss.device)
+                            total_loss = loss
+                        scaled_loss = total_loss / max(1, config.grad_accum_steps)
+                except RuntimeError as exc:
+                    _warn_finite_skip(reason=f"forward_runtime_error:{exc}", batch=batch, batch_idx=batch_idx)
+                    optimizer.zero_grad(set_to_none=True)
+                    return
+
+                if not _is_finite_tensor(y_hat):
+                    _warn_finite_skip(reason="y_hat_non_finite", batch=batch, batch_idx=batch_idx)
+                    optimizer.zero_grad(set_to_none=True)
+                    return
+                for name, tensor in {
+                    "gate_logits": gate_logits,
+                    "gate": gate,
+                    "guided_pool": guided_pool,
+                    "free_pool": free_pool,
+                    "fused_pool": fused_pool,
+                    "total_loss": total_loss,
+                }.items():
+                    if not _is_finite_tensor(tensor):
+                        _warn_finite_skip(reason=f"{name}_non_finite", batch=batch, batch_idx=batch_idx)
+                        optimizer.zero_grad(set_to_none=True)
+                        return
 
                 if scaled_loss.requires_grad:
                     scaler.scale(scaled_loss).backward()
@@ -746,22 +863,38 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 if not should_step:
                     return
 
-                if config.clip_grad_norm is not None and scaled_loss.requires_grad:
+                has_non_finite = False
+                if scaled_loss.requires_grad:
                     scaler.unscale_(optimizer)
-                    torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_grad_norm)
+                    if not _all_grads_finite(model):
+                        has_non_finite = True
+                    gate_weight_grad = gate_last_layer.weight.grad
+                    gate_bias_grad = gate_last_layer.bias.grad
+                    if not _is_finite_tensor(gate_weight_grad) or not _is_finite_tensor(gate_bias_grad):
+                        has_non_finite = True
+                    if has_non_finite:
+                        _warn_finite_skip(reason="non_finite_grad", batch=batch, batch_idx=batch_idx)
+                        optimizer.zero_grad(set_to_none=True)
+                        return
+                    if config.clip_grad_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_grad_norm)
+                    if config.gate_clip_grad_norm is not None:
+                        torch.nn.utils.clip_grad_norm_(gate_last_layer.parameters(), config.gate_clip_grad_norm)
 
                 gate_last_grad_norm = 0.0
                 if gate_last_layer.weight.grad is not None:
                     gate_last_grad_norm = float(gate_last_layer.weight.grad.detach().norm().item())
                 elif gate_last_layer.bias.grad is not None:
                     gate_last_grad_norm = float(gate_last_layer.bias.grad.detach().norm().item())
+                if not math.isfinite(gate_last_grad_norm):
+                    _warn_finite_skip(reason="gate_last_grad_norm_non_finite", batch=batch, batch_idx=batch_idx)
+                    optimizer.zero_grad(set_to_none=True)
+                    return
 
                 if scaled_loss.requires_grad:
                     scaler.step(optimizer)
                     scaler.update()
                 optimizer.zero_grad(set_to_none=True)
-                if scheduler is not None:
-                    scheduler.step()
                 global_step += 1
 
                 batch_size_current = int(batch["y"].shape[0])
@@ -800,43 +933,41 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                     "guided_free_gap": guided_free_gap,
                     "force_gate_value": float(force_gate_value) if force_gate_value is not None else -1.0,
                 }
+                finite_row = all(_safe_scalar(v) is not None for v in train_row.values() if isinstance(v, float | int))
+                if not finite_row:
+                    _warn_finite_skip(reason="train_row_non_finite", batch=batch, batch_idx=batch_idx)
+                    return
                 history["train"].append(train_row)
                 last_train_row = train_row
 
-                writer.add_scalar("train/loss", train_row["loss"], global_step)
-                writer.add_scalar("train/total_loss", train_row["total_loss"], global_step)
-                writer.add_scalar("train/gate_std_penalty", train_row["gate_std_penalty"], global_step)
-                writer.add_scalar("train/gate_mean_penalty", train_row["gate_mean_penalty"], global_step)
-                writer.add_scalar("train/gate_entropy_penalty", train_row["gate_entropy_penalty"], global_step)
-                writer.add_scalar("train/huber", train_row["huber"], global_step)
-                writer.add_scalar("train/mae", train_row["mae"], global_step)
-                writer.add_scalar("train/mse", train_row["mse"], global_step)
-                writer.add_scalar("train/lr", train_row["lr"], global_step)
-                writer.add_scalar("train/force_gate_value", train_row["force_gate_value"], global_step)
-                writer.add_scalar("train/gate_last_grad_norm", train_row["gate_last_grad_norm"], global_step)
-                writer.add_scalar("data/num_valid", train_row["num_valid"], global_step)
-                writer.add_scalar("data/valid_ratio", train_row["valid_ratio"], global_step)
-                writer.add_scalar("model/micro_lambda_mean", train_row["micro_lambda_mean"], global_step)
-                writer.add_scalar("model/mezzo_lambda_mean", train_row["mezzo_lambda_mean"], global_step)
-                writer.add_scalar("model/macro_lambda_mean", train_row["macro_lambda_mean"], global_step)
-                writer.add_scalar("model/gate_mean", train_row["gate_mean"], global_step)
-                writer.add_scalar("model/gate_std", train_row["gate_std"], global_step)
-                writer.add_scalar("model/gate_logits_mean", train_row["gate_logits_mean"], global_step)
-                writer.add_scalar("model/gate_logits_std", train_row["gate_logits_std"], global_step)
-                writer.add_scalar("model/gate_last_bias", train_row["gate_last_bias"], global_step)
-                writer.add_scalar("model/gate_last_weight_norm", train_row["gate_last_weight_norm"], global_step)
-                writer.add_scalar("model/guided_pool_norm", train_row["guided_pool_norm"], global_step)
-                writer.add_scalar("model/free_pool_norm", train_row["free_pool_norm"], global_step)
-                writer.add_scalar("model/guided_free_gap", train_row["guided_free_gap"], global_step)
+                _safe_add_scalar(writer, "train/loss", train_row["loss"], global_step)
+                _safe_add_scalar(writer, "train/total_loss", train_row["total_loss"], global_step)
+                _safe_add_scalar(writer, "train/gate_std_penalty", train_row["gate_std_penalty"], global_step)
+                _safe_add_scalar(writer, "train/gate_mean_penalty", train_row["gate_mean_penalty"], global_step)
+                _safe_add_scalar(writer, "train/gate_entropy_penalty", train_row["gate_entropy_penalty"], global_step)
+                _safe_add_scalar(writer, "train/huber", train_row["huber"], global_step)
+                _safe_add_scalar(writer, "train/mae", train_row["mae"], global_step)
+                _safe_add_scalar(writer, "train/mse", train_row["mse"], global_step)
+                _safe_add_scalar(writer, "train/lr", train_row["lr"], global_step)
+                _safe_add_scalar(writer, "train/force_gate_value", train_row["force_gate_value"], global_step)
+                _safe_add_scalar(writer, "train/gate_last_grad_norm", train_row["gate_last_grad_norm"], global_step)
+                _safe_add_scalar(writer, "data/num_valid", train_row["num_valid"], global_step)
+                _safe_add_scalar(writer, "data/valid_ratio", train_row["valid_ratio"], global_step)
+                _safe_add_scalar(writer, "model/micro_lambda_mean", train_row["micro_lambda_mean"], global_step)
+                _safe_add_scalar(writer, "model/mezzo_lambda_mean", train_row["mezzo_lambda_mean"], global_step)
+                _safe_add_scalar(writer, "model/macro_lambda_mean", train_row["macro_lambda_mean"], global_step)
+                _safe_add_scalar(writer, "model/gate_mean", train_row["gate_mean"], global_step)
+                _safe_add_scalar(writer, "model/gate_std", train_row["gate_std"], global_step)
+                _safe_add_scalar(writer, "model/gate_logits_mean", train_row["gate_logits_mean"], global_step)
+                _safe_add_scalar(writer, "model/gate_logits_std", train_row["gate_logits_std"], global_step)
+                _safe_add_scalar(writer, "model/gate_last_bias", train_row["gate_last_bias"], global_step)
+                _safe_add_scalar(writer, "model/gate_last_weight_norm", train_row["gate_last_weight_norm"], global_step)
+                _safe_add_scalar(writer, "model/guided_pool_norm", train_row["guided_pool_norm"], global_step)
+                _safe_add_scalar(writer, "model/free_pool_norm", train_row["free_pool_norm"], global_step)
+                _safe_add_scalar(writer, "model/guided_free_gap", train_row["guided_free_gap"], global_step)
 
                 if global_step % max(1, config.log_every) == 0:
-                    logger.info(
-                        "epoch=%d step=%d train_loss=%.6f valid_ratio=%.4f",
-                        epoch + 1,
-                        global_step,
-                        train_row["loss"],
-                        train_row["valid_ratio"],
-                    )
+                    logger.info("epoch=%d step=%d train_loss=%.6f valid_ratio=%.4f", epoch + 1, global_step, train_row["loss"], train_row["valid_ratio"])
                 if global_step % max(1, config.curve_save_every) == 0:
                     curve_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
 
@@ -897,14 +1028,17 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 "mae": float(val_mae_weighted_sum / denom),
                 "mse": float(val_mse_weighted_sum / denom),
             }
+            if not all(_safe_scalar(v) is not None for v in val_row.values()):
+                logger.warning("skip_non_finite_val epoch=%d values=%s", epoch + 1, val_row)
+                continue
             history["val"].append(val_row)
             last_val_row = val_row
             epochs_completed = epoch + 1
 
-            writer.add_scalar("val/loss", val_row["loss"], epochs_completed)
-            writer.add_scalar("val/huber", val_row["huber"], epochs_completed)
-            writer.add_scalar("val/mae", val_row["mae"], epochs_completed)
-            writer.add_scalar("val/mse", val_row["mse"], epochs_completed)
+            _safe_add_scalar(writer, "val/loss", val_row["loss"], epochs_completed)
+            _safe_add_scalar(writer, "val/huber", val_row["huber"], epochs_completed)
+            _safe_add_scalar(writer, "val/mae", val_row["mae"], epochs_completed)
+            _safe_add_scalar(writer, "val/mse", val_row["mse"], epochs_completed)
             logger.info(
                 "epoch=%d val_loss=%.6f val_huber=%.6f val_mae=%.6f val_mse=%.6f",
                 epochs_completed,
@@ -914,6 +1048,9 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 val_row["mse"],
             )
             curve_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+
+            if scheduler is not None and math.isfinite(val_row["loss"]):
+                scheduler.step(val_row["loss"])
 
             is_best = val_row["loss"] <= best_val["loss"]
             for key in ("loss", "huber", "mae", "mse"):
@@ -927,6 +1064,7 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 scaler=scaler,
                 history=history,
                 best_val=best_val,
+                scheduler=scheduler,
             )
             _save_checkpoint(latest_ckpt_path, checkpoint_payload)
             if is_best:

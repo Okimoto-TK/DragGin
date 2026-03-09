@@ -25,7 +25,13 @@ class GatedFusion(nn.Module):
         super().__init__()
         self.enable_free_branch = enable_free_branch
         self.gate_temperature = float(gate_temperature)
+        self.macro_pool_norm = nn.LayerNorm(hidden_dim)
+        self.micro_pool_norm = nn.LayerNorm(hidden_dim)
+        self.mezzo_pool_norm = nn.LayerNorm(hidden_dim)
+        self.guided_pool_norm = nn.LayerNorm(hidden_dim)
+        self.free_pool_norm = nn.LayerNorm(hidden_dim)
         self.gate_norm = nn.LayerNorm(6 * hidden_dim)
+        self.output_pool_norm = nn.LayerNorm(hidden_dim)
         self.gate_mlp = nn.Sequential(
             nn.Linear(6 * hidden_dim, hidden_dim),
             nn.GELU(),
@@ -46,19 +52,30 @@ class GatedFusion(nn.Module):
         mask_macro: torch.Tensor,
         force_gate_value: float | None = None,
     ) -> tuple[torch.Tensor, torch.Tensor, dict]:
+        macro_pool_n = self.macro_pool_norm(macro_pool)
+        micro_pool_n = self.micro_pool_norm(micro_pool)
+        mezzo_pool_n = self.mezzo_pool_norm(mezzo_pool)
+        guided_pool_n = self.guided_pool_norm(guided_pool)
+        free_pool_n = self.free_pool_norm(free_pool)
+        guided_free_gap = torch.abs(guided_pool_n - free_pool_n)
+
         gate_in = torch.cat(
             [
-                macro_pool,
-                micro_pool,
-                mezzo_pool,
-                guided_pool,
-                free_pool,
-                torch.abs(guided_pool - free_pool),
+                macro_pool_n,
+                micro_pool_n,
+                mezzo_pool_n,
+                guided_pool_n,
+                free_pool_n,
+                guided_free_gap,
             ],
             dim=-1,
         )
         gate_logits = self.gate_mlp(self.gate_norm(gate_in))
+        if not torch.isfinite(gate_logits).all():
+            raise RuntimeError("non-finite gate_logits")
         g = torch.sigmoid(self.gate_temperature * gate_logits)
+        if not torch.isfinite(g).all():
+            raise RuntimeError("non-finite gate")
         if force_gate_value is not None:
             g = torch.full_like(g, float(force_gate_value))
 
@@ -70,13 +87,20 @@ class GatedFusion(nn.Module):
 
         macro_w = mask_macro.to(dtype=fused_seq.dtype).unsqueeze(-1)
         fused_seq = fused_seq * macro_w
-        fused_pool = _masked_mean(fused_seq, mask_macro)
+        fused_pool = self.output_pool_norm(_masked_mean(fused_seq, mask_macro))
+        if not torch.isfinite(fused_pool).all():
+            raise RuntimeError("non-finite fused_pool")
 
         aux = {
             "gate": g,
             "gate_logits": gate_logits,
             "guided_pool": guided_pool,
             "free_pool": free_pool,
+            "guided_pool_normed": guided_pool_n,
+            "free_pool_normed": free_pool_n,
+            "macro_pool_normed": macro_pool_n,
+            "mezzo_pool_normed": mezzo_pool_n,
+            "micro_pool_normed": micro_pool_n,
         }
         return fused_seq, fused_pool, aux
 

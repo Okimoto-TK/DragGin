@@ -1,3 +1,4 @@
+import pytest
 import torch
 from torch import nn
 
@@ -274,3 +275,55 @@ def test_free_branch_partial_mask_safe() -> None:
     assert torch.isfinite(fused_seq).all()
     assert torch.isfinite(fused_pool).all()
     assert torch.isfinite(aux["free_pool"]).all()
+
+
+def test_gated_fusion_has_pool_norm_layers_and_shape_unchanged() -> None:
+    hidden = 8
+    module = GatedFusion(hidden_dim=hidden)
+    assert isinstance(module.macro_pool_norm, nn.LayerNorm)
+    assert isinstance(module.micro_pool_norm, nn.LayerNorm)
+    assert isinstance(module.mezzo_pool_norm, nn.LayerNorm)
+    assert isinstance(module.guided_pool_norm, nn.LayerNorm)
+    assert isinstance(module.free_pool_norm, nn.LayerNorm)
+
+    bsz, seq_len = 2, 5
+    guided_seq = torch.randn(bsz, seq_len, hidden)
+    free_seq = torch.randn(bsz, seq_len, hidden)
+    pooled = torch.randn(bsz, hidden)
+    mask_macro = torch.ones(bsz, seq_len, dtype=torch.bool)
+    fused_seq, fused_pool, _ = module(
+        guided_seq=guided_seq,
+        guided_pool=pooled,
+        free_seq=free_seq,
+        free_pool=pooled,
+        macro_pool=pooled,
+        mezzo_pool=pooled,
+        micro_pool=pooled,
+        mask_macro=mask_macro,
+    )
+    assert fused_seq.shape == (bsz, seq_len, hidden)
+    assert fused_pool.shape == (bsz, hidden)
+
+
+def test_gated_fusion_raises_on_non_finite_gate_logits() -> None:
+    hidden = 4
+    module = GatedFusion(hidden_dim=hidden)
+    bsz, seq_len = 1, 3
+    guided_seq = torch.randn(bsz, seq_len, hidden)
+    free_seq = torch.randn(bsz, seq_len, hidden)
+    pooled = torch.randn(bsz, hidden)
+    pooled[0, 0] = float("inf")
+    mask_macro = torch.ones(bsz, seq_len, dtype=torch.bool)
+
+    with pytest.raises(RuntimeError, match="non-finite gate_logits"):
+        module(
+            guided_seq=guided_seq,
+            guided_pool=pooled,
+            free_seq=free_seq,
+            free_pool=pooled,
+            macro_pool=pooled,
+            mezzo_pool=pooled,
+            micro_pool=pooled,
+            mask_macro=mask_macro,
+        )
+

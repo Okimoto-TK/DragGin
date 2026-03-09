@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import torch
 
-from src.model.head.regression import RegressionHead, masked_huber_loss
+from src.model.head.regression import RegressionHead, masked_huber_loss, masked_mean
 
 
 def test_regression_head_output_shape() -> None:
@@ -82,3 +82,12 @@ def test_use_seq_context_flag() -> None:
     assert y_hat_ctx.shape == (3,)
     assert torch.isfinite(y_hat_no_ctx).all()
     assert torch.isfinite(y_hat_ctx).all()
+
+
+def test_masked_mean_for_seq_context() -> None:
+    seq = torch.tensor([[[1.0, 3.0], [5.0, 7.0], [100.0, 200.0]]])
+    mask = torch.tensor([[True, True, False]])
+    out = masked_mean(seq, mask)
+    expected = torch.tensor([[3.0, 5.0]])
+    assert torch.allclose(out, expected)
+
