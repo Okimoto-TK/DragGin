@@ -1,0 +1,21 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+
+numpy>=2.3,<2.5
+pandas>=2.3,<2.4
+pyarrow>=23,<24
+polars>=1.38,<2
+parquet_tools>=0.2,<0.3
+
+torch==2.10.0+cu128
+torchvision==0.25.0+cu128
+
+tensorboard>=2.20,<2.21
+tqdm>=4.67,<5
+
+requests>=2.32,<3
+beautifulsoup4>=4.14,<5
+lxml>=6.0,<7
+websocket-client>=1.9,<2
+
+boto3>=1.42,<1.43
+tushare>=1.4,<1.5

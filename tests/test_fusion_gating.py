@@ -1,4 +1,5 @@
 import torch
+from torch import nn
 
 from src.model.fusion.gated_fusion import GatedFusion, MultiScaleFusion
 
@@ -11,6 +12,8 @@ def _masked_mean(seq: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
 
 def _force_gate_constant(module: GatedFusion, bias: float) -> None:
     with torch.no_grad():
+        module.gate_norm.weight.fill_(1.0)
+        module.gate_norm.bias.zero_()
         for param in module.gate_mlp.parameters():
             param.zero_()
         module.gate_mlp[-1].bias.fill_(bias)
@@ -46,6 +49,7 @@ def test_fusion_shapes() -> None:
     assert fused_seq.shape == (2, 30, hidden)
     assert fused_pool.shape == (2, hidden)
     assert aux["gate"].shape == (2, 1)
+    assert aux["gate_logits"].shape == (2, 1)
 
 
 def test_gate_one_returns_guided() -> None:
@@ -174,6 +178,67 @@ def test_disable_free_branch() -> None:
 
     assert torch.allclose(fused_seq, guided_seq, atol=1e-5)
 
+
+
+
+class _IdentityAttention(nn.Module):
+    def forward(
+        self,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        key_padding_mask: torch.Tensor | None = None,
+        need_weights: bool = False,
+    ) -> tuple[torch.Tensor, None]:
+        del key, value, key_padding_mask, need_weights
+        return query, None
+
+
+def test_free_pool_masked_mean_equals_mean_when_all_bins_valid() -> None:
+    bsz, seq_len, hidden = 2, 48, 4
+    target_len = 6
+    model = MultiScaleFusion(hidden_dim=hidden, num_heads=2)
+    model.free.attn = _IdentityAttention()
+
+    micro_seq = torch.randn(bsz, seq_len, hidden)
+    mask_micro = torch.ones(bsz, seq_len, dtype=torch.bool)
+
+    free_seq, free_pool = model.free(micro_seq=micro_seq, mask_micro=mask_micro, target_len=target_len)
+
+    assert torch.allclose(free_pool, free_seq.mean(dim=1), atol=1e-6)
+
+
+def test_free_pool_masked_mean_ignores_invalid_bins() -> None:
+    bsz, seq_len, hidden = 1, 48, 2
+    target_len = 6
+    model = MultiScaleFusion(hidden_dim=hidden, num_heads=2)
+    model.free.attn = _IdentityAttention()
+
+    micro_seq = torch.ones(bsz, seq_len, hidden)
+    mask_micro = torch.zeros(bsz, seq_len, dtype=torch.bool)
+    mask_micro[:, :24] = True
+
+    free_seq, free_pool = model.free(micro_seq=micro_seq, mask_micro=mask_micro, target_len=target_len)
+
+    simple_mean = free_seq.mean(dim=1)
+    assert torch.allclose(free_pool, torch.ones_like(free_pool), atol=1e-6)
+    assert torch.allclose(simple_mean, torch.full_like(simple_mean, 0.5), atol=1e-6)
+
+
+def test_free_pool_all_invalid_is_finite() -> None:
+    bsz, seq_len, hidden = 2, 48, 3
+    target_len = 6
+    model = MultiScaleFusion(hidden_dim=hidden, num_heads=1)
+    model.free.attn = _IdentityAttention()
+
+    micro_seq = torch.randn(bsz, seq_len, hidden)
+    mask_micro = torch.zeros(bsz, seq_len, dtype=torch.bool)
+
+    free_seq, free_pool = model.free(micro_seq=micro_seq, mask_micro=mask_micro, target_len=target_len)
+
+    assert torch.isfinite(free_seq).all()
+    assert torch.isfinite(free_pool).all()
+    assert torch.allclose(free_pool, torch.zeros_like(free_pool), atol=1e-6)
 
 def test_free_branch_partial_mask_safe() -> None:
     torch.manual_seed(42)

@@ -352,6 +352,7 @@ class MultiScaleRegressor(nn.Module):
         init_lambda_micro: float = 1.5,
         init_lambda_mezzo: float = 0.8,
         init_lambda_macro: float = 0.3,
+        gate_temperature: float = 1.0,
         use_seq_context: bool = False,
     ) -> None:
         super().__init__()
@@ -379,10 +380,15 @@ class MultiScaleRegressor(nn.Module):
             num_heads=num_heads,
             dropout=dropout,
             enable_free_branch=enable_free_branch,
+            gate_temperature=gate_temperature,
         )
         self.head = RegressionHead(hidden_dim=hidden_dim, use_seq_context=use_seq_context, dropout=dropout)
 
-    def forward(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, Any]]:
+    def forward(
+        self,
+        batch: dict[str, torch.Tensor],
+        force_gate_value: float | None = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         micro_seq, micro_pool, aux_micro = self.micro_encoder(batch["x_micro"], batch["mask_micro"])
         mezzo_seq, mezzo_pool, aux_mezzo = self.mezzo_encoder(batch["x_mezzo"], batch["mask_mezzo"])
         macro_seq, macro_pool, aux_macro = self.macro_encoder(batch["x_macro"], batch["mask_macro"])
@@ -397,6 +403,7 @@ class MultiScaleRegressor(nn.Module):
             mask_micro=batch["mask_micro"],
             mask_mezzo=batch["mask_mezzo"],
             mask_macro=batch["mask_macro"],
+            force_gate_value=force_gate_value,
         )
         y_hat = self.head(fused_seq=fused_seq, fused_pool=fused_pool)
         return y_hat, {"micro": aux_micro, "mezzo": aux_mezzo, "macro": aux_macro, "fusion": aux_fusion}
@@ -416,6 +423,13 @@ class TrainConfig:
     dropout: float
     exp_name: str
     out_dir: str
+    gate_temperature: float = 1.0
+    gate_std_target: float = 0.10
+    gate_std_reg: float = 1e-2
+    gate_mean_target: float = 0.50
+    gate_mean_reg: float = 1e-2
+    gate_entropy_reg: float = 5e-3
+    gate_warmup_steps: int = 500
     y_key: str = "y"
     in_dim: int = 6
     enable_dynamic_threshold: bool = True
@@ -527,6 +541,10 @@ def _write_yaml(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
 
+def _weighted_metric_value(metric: torch.Tensor, num_valid: int) -> float:
+    return float(metric.detach().item()) * float(max(0, int(num_valid)))
+
+
 def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, Any]:
     out_dir = Path(config.out_dir)
     logs_dir = out_dir / "logs"
@@ -603,8 +621,12 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
         init_lambda_micro=config.init_lambda_micro,
         init_lambda_mezzo=config.init_lambda_mezzo,
         init_lambda_macro=config.init_lambda_macro,
+        gate_temperature=config.gate_temperature,
         use_seq_context=config.use_seq_context,
     )
+    gate_last_layer = model.fusion.gated.gate_mlp[-1]
+
+    gate_reg_enabled = bool(model.fusion.gated.enable_free_branch)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
@@ -631,6 +653,16 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
         checkpoint = torch.load(checkpoint_path, map_location=device)
         model.load_state_dict(checkpoint["model_state_dict"])
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        for pg in optimizer.param_groups:
+            pg["lr"] = float(config.lr)
+            pg["weight_decay"] = float(config.weight_decay)
+            if "initial_lr" in pg:
+                pg["initial_lr"] = float(config.lr)
+        logger.info(
+            "resume_override_optim_hparams lr=%s weight_decay=%s",
+            [float(pg["lr"]) for pg in optimizer.param_groups],
+            [float(pg["weight_decay"]) for pg in optimizer.param_groups],
+        )
         scaler_state = checkpoint.get("scaler_state_dict")
         if isinstance(scaler_state, dict):
             scaler.load_state_dict(scaler_state)
@@ -665,10 +697,48 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
 
             def _train_on_batch(batch: dict[str, Any], batch_idx: int) -> None:
                 nonlocal global_step, last_train_row
+                force_gate_value = 0.5 if global_step < int(config.gate_warmup_steps) else None
                 with autocast(enabled=use_amp):
-                    y_hat, aux = model(batch)
+                    y_hat, aux = model(batch, force_gate_value=force_gate_value)
                     loss, metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
-                    scaled_loss = loss / max(1, config.grad_accum_steps)
+                    gate = aux["fusion"]["gate"]
+                    gate_logits = aux["fusion"]["gate_logits"]
+                    guided_pool = aux["fusion"]["guided_pool"]
+                    free_pool = aux["fusion"]["free_pool"]
+                    gate_mean = gate.mean()
+                    gate_std = gate.std(unbiased=False)
+                    if gate_reg_enabled:
+                        gate_target = torch.as_tensor(config.gate_std_target, dtype=gate_std.dtype, device=gate_std.device)
+                        gate_std_penalty = torch.relu(
+                            gate_target - gate_std
+                        ) ** 2
+                        gate_mean_target = torch.as_tensor(
+                            config.gate_mean_target,
+                            dtype=gate_mean.dtype,
+                            device=gate_mean.device,
+                        )
+                        gate_mean_penalty = (
+                            gate_mean - gate_mean_target
+                        ) ** 2
+                        gate_eps = torch.as_tensor(1e-6, dtype=gate.dtype, device=gate.device)
+                        gate_clamped = gate.clamp(gate_eps, 1.0 - gate_eps)
+                        gate_entropy = -(
+                            gate_clamped * torch.log(gate_clamped)
+                            + (1.0 - gate_clamped) * torch.log(1.0 - gate_clamped)
+                        ).mean()
+                        gate_entropy_penalty = -gate_entropy
+                        total_loss = (
+                            loss
+                            + float(config.gate_std_reg) * gate_std_penalty
+                            + float(config.gate_mean_reg) * gate_mean_penalty
+                            + float(config.gate_entropy_reg) * gate_entropy_penalty
+                        )
+                    else:
+                        gate_std_penalty = torch.zeros((), dtype=loss.dtype, device=loss.device)
+                        gate_mean_penalty = torch.zeros((), dtype=loss.dtype, device=loss.device)
+                        gate_entropy_penalty = torch.zeros((), dtype=loss.dtype, device=loss.device)
+                        total_loss = loss
+                    scaled_loss = total_loss / max(1, config.grad_accum_steps)
 
                 if scaled_loss.requires_grad:
                     scaler.scale(scaled_loss).backward()
@@ -681,6 +751,12 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_grad_norm)
 
+                gate_last_grad_norm = 0.0
+                if gate_last_layer.weight.grad is not None:
+                    gate_last_grad_norm = float(gate_last_layer.weight.grad.detach().norm().item())
+                elif gate_last_layer.bias.grad is not None:
+                    gate_last_grad_norm = float(gate_last_layer.bias.grad.detach().norm().item())
+
                 if scaled_loss.requires_grad:
                     scaler.step(optimizer)
                     scaler.update()
@@ -692,11 +768,15 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 batch_size_current = int(batch["y"].shape[0])
                 num_valid = int(metrics["num_valid"])
                 valid_ratio = float(num_valid / max(1, batch_size_current))
-                gate = aux["fusion"]["gate"]
-
+                gate_last_weight_norm = float(gate_last_layer.weight.detach().norm().item())
+                gate_last_bias = float(gate_last_layer.bias.detach().mean().item())
+                guided_pool_norm = float(guided_pool.detach().norm(dim=-1).mean().item())
+                free_pool_norm = float(free_pool.detach().norm(dim=-1).mean().item())
+                guided_free_gap = float(torch.abs(guided_pool - free_pool).mean().detach().item())
                 train_row = {
                     "step": int(global_step),
                     "loss": float(loss.detach().item()),
+                    "total_loss": float(total_loss.detach().item()),
                     "huber": float(metrics["huber"].detach().item()),
                     "mae": float(metrics["mae"].detach().item()),
                     "mse": float(metrics["mse"].detach().item()),
@@ -706,17 +786,35 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                     "micro_lambda_mean": float(aux["micro"]["lambda_mean"].mean().detach().item()),
                     "mezzo_lambda_mean": float(aux["mezzo"]["lambda_mean"].mean().detach().item()),
                     "macro_lambda_mean": float(aux["macro"]["lambda_mean"].mean().detach().item()),
-                    "gate_mean": float(gate.mean().detach().item()),
-                    "gate_std": float(gate.std(unbiased=False).detach().item()),
+                    "gate_mean": float(gate_mean.detach().item()),
+                    "gate_std": float(gate_std.detach().item()),
+                    "gate_logits_mean": float(gate_logits.mean().detach().item()),
+                    "gate_logits_std": float(gate_logits.std(unbiased=False).detach().item()),
+                    "gate_std_penalty": float(gate_std_penalty.detach().item()),
+                    "gate_mean_penalty": float(gate_mean_penalty.detach().item()),
+                    "gate_entropy_penalty": float(gate_entropy_penalty.detach().item()),
+                    "gate_last_bias": gate_last_bias,
+                    "gate_last_weight_norm": gate_last_weight_norm,
+                    "gate_last_grad_norm": gate_last_grad_norm,
+                    "guided_pool_norm": guided_pool_norm,
+                    "free_pool_norm": free_pool_norm,
+                    "guided_free_gap": guided_free_gap,
+                    "force_gate_value": float(force_gate_value) if force_gate_value is not None else -1.0,
                 }
                 history["train"].append(train_row)
                 last_train_row = train_row
 
                 writer.add_scalar("train/loss", train_row["loss"], global_step)
+                writer.add_scalar("train/total_loss", train_row["total_loss"], global_step)
+                writer.add_scalar("train/gate_std_penalty", train_row["gate_std_penalty"], global_step)
+                writer.add_scalar("train/gate_mean_penalty", train_row["gate_mean_penalty"], global_step)
+                writer.add_scalar("train/gate_entropy_penalty", train_row["gate_entropy_penalty"], global_step)
                 writer.add_scalar("train/huber", train_row["huber"], global_step)
                 writer.add_scalar("train/mae", train_row["mae"], global_step)
                 writer.add_scalar("train/mse", train_row["mse"], global_step)
                 writer.add_scalar("train/lr", train_row["lr"], global_step)
+                writer.add_scalar("train/force_gate_value", train_row["force_gate_value"], global_step)
+                writer.add_scalar("train/gate_last_grad_norm", train_row["gate_last_grad_norm"], global_step)
                 writer.add_scalar("data/num_valid", train_row["num_valid"], global_step)
                 writer.add_scalar("data/valid_ratio", train_row["valid_ratio"], global_step)
                 writer.add_scalar("model/micro_lambda_mean", train_row["micro_lambda_mean"], global_step)
@@ -724,6 +822,13 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 writer.add_scalar("model/macro_lambda_mean", train_row["macro_lambda_mean"], global_step)
                 writer.add_scalar("model/gate_mean", train_row["gate_mean"], global_step)
                 writer.add_scalar("model/gate_std", train_row["gate_std"], global_step)
+                writer.add_scalar("model/gate_logits_mean", train_row["gate_logits_mean"], global_step)
+                writer.add_scalar("model/gate_logits_std", train_row["gate_logits_std"], global_step)
+                writer.add_scalar("model/gate_last_bias", train_row["gate_last_bias"], global_step)
+                writer.add_scalar("model/gate_last_weight_norm", train_row["gate_last_weight_norm"], global_step)
+                writer.add_scalar("model/guided_pool_norm", train_row["guided_pool_norm"], global_step)
+                writer.add_scalar("model/free_pool_norm", train_row["free_pool_norm"], global_step)
+                writer.add_scalar("model/guided_free_gap", train_row["guided_free_gap"], global_step)
 
                 if global_step % max(1, config.log_every) == 0:
                     logger.info(
@@ -751,11 +856,11 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                     _train_on_batch(batch, batch_idx)
 
             model.eval()
-            val_loss_sum = 0.0
-            val_huber_sum = 0.0
-            val_mae_sum = 0.0
-            val_mse_sum = 0.0
-            val_batches = 0
+            val_loss_weighted_sum = 0.0
+            val_huber_weighted_sum = 0.0
+            val_mae_weighted_sum = 0.0
+            val_mse_weighted_sum = 0.0
+            val_num_valid_total = 0
             with torch.no_grad():
                 if device.type == "cuda" and config.prefetch_cuda:
                     val_prefetcher = CUDAPrefetcher(val_loader, device=device, pin_memory=config.pin_memory)
@@ -766,30 +871,32 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                         with autocast(enabled=use_amp):
                             y_hat, _ = model(batch)
                             val_loss, val_metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
-                        val_loss_sum += float(val_loss.detach().item())
-                        val_huber_sum += float(val_metrics["huber"].detach().item())
-                        val_mae_sum += float(val_metrics["mae"].detach().item())
-                        val_mse_sum += float(val_metrics["mse"].detach().item())
-                        val_batches += 1
+                        num_valid = int(val_metrics["num_valid"])
+                        val_num_valid_total += num_valid
+                        val_loss_weighted_sum += _weighted_metric_value(val_loss, num_valid)
+                        val_huber_weighted_sum += _weighted_metric_value(val_metrics["huber"], num_valid)
+                        val_mae_weighted_sum += _weighted_metric_value(val_metrics["mae"], num_valid)
+                        val_mse_weighted_sum += _weighted_metric_value(val_metrics["mse"], num_valid)
                 else:
                     for raw_batch in val_loader:
                         batch = _to_device(raw_batch, device, pin_memory=config.pin_memory)
                         with autocast(enabled=use_amp):
                             y_hat, _ = model(batch)
                             val_loss, val_metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
-                        val_loss_sum += float(val_loss.detach().item())
-                        val_huber_sum += float(val_metrics["huber"].detach().item())
-                        val_mae_sum += float(val_metrics["mae"].detach().item())
-                        val_mse_sum += float(val_metrics["mse"].detach().item())
-                        val_batches += 1
+                        num_valid = int(val_metrics["num_valid"])
+                        val_num_valid_total += num_valid
+                        val_loss_weighted_sum += _weighted_metric_value(val_loss, num_valid)
+                        val_huber_weighted_sum += _weighted_metric_value(val_metrics["huber"], num_valid)
+                        val_mae_weighted_sum += _weighted_metric_value(val_metrics["mae"], num_valid)
+                        val_mse_weighted_sum += _weighted_metric_value(val_metrics["mse"], num_valid)
 
-            denom = max(1, val_batches)
+            denom = max(1, int(val_num_valid_total))
             val_row = {
                 "epoch": int(epoch + 1),
-                "loss": float(val_loss_sum / denom),
-                "huber": float(val_huber_sum / denom),
-                "mae": float(val_mae_sum / denom),
-                "mse": float(val_mse_sum / denom),
+                "loss": float(val_loss_weighted_sum / denom),
+                "huber": float(val_huber_weighted_sum / denom),
+                "mae": float(val_mae_weighted_sum / denom),
+                "mse": float(val_mse_weighted_sum / denom),
             }
             history["val"].append(val_row)
             last_val_row = val_row
@@ -905,6 +1012,13 @@ def _parse_args() -> TrainConfig:
     parser.add_argument("--num-epochs", type=int, required=True)
     parser.add_argument("--lr", type=float, required=True)
     parser.add_argument("--weight-decay", type=float, required=True)
+    parser.add_argument("--gate-temperature", type=float, default=1.0)
+    parser.add_argument("--gate-std-target", type=float, default=0.10)
+    parser.add_argument("--gate-std-reg", type=float, default=1e-2)
+    parser.add_argument("--gate-mean-target", type=float, default=0.50)
+    parser.add_argument("--gate-mean-reg", type=float, default=1e-2)
+    parser.add_argument("--gate-entropy-reg", type=float, default=5e-3)
+    parser.add_argument("--gate-warmup-steps", type=int, default=500)
     parser.add_argument("--hidden-dim", type=int, required=True)
     parser.add_argument("--num-heads", type=int, required=True)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -932,6 +1046,13 @@ def _parse_args() -> TrainConfig:
         num_epochs=args.num_epochs,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        gate_temperature=args.gate_temperature,
+        gate_std_target=args.gate_std_target,
+        gate_std_reg=args.gate_std_reg,
+        gate_mean_target=args.gate_mean_target,
+        gate_mean_reg=args.gate_mean_reg,
+        gate_entropy_reg=args.gate_entropy_reg,
+        gate_warmup_steps=max(0, int(args.gate_warmup_steps)),
         hidden_dim=args.hidden_dim,
         num_heads=args.num_heads,
         dropout=args.dropout,
