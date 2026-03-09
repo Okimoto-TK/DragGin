@@ -87,9 +87,11 @@ class GatedFusion(nn.Module):
 
         macro_w = mask_macro.to(dtype=fused_seq.dtype).unsqueeze(-1)
         fused_seq = fused_seq * macro_w
-        fused_pool = self.output_pool_norm(_masked_mean(fused_seq, mask_macro))
-        if not torch.isfinite(fused_pool).all():
+        fused_pool_raw = _masked_mean(fused_seq, mask_macro)
+        fused_pool_stable = self.output_pool_norm(fused_pool_raw)
+        if not torch.isfinite(fused_pool_stable).all():
             raise RuntimeError("non-finite fused_pool")
+        fused_pool = fused_pool_raw
 
         aux = {
             "gate": g,

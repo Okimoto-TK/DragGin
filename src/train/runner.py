@@ -864,8 +864,10 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                     return
 
                 has_non_finite = False
+                did_unscale = False
                 if scaled_loss.requires_grad:
                     scaler.unscale_(optimizer)
+                    did_unscale = True
                     if not _all_grads_finite(model):
                         has_non_finite = True
                     gate_weight_grad = gate_last_layer.weight.grad
@@ -875,6 +877,7 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                     if has_non_finite:
                         _warn_finite_skip(reason="non_finite_grad", batch=batch, batch_idx=batch_idx)
                         optimizer.zero_grad(set_to_none=True)
+                        scaler.update()
                         return
                     if config.clip_grad_norm is not None:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_grad_norm)
@@ -889,6 +892,8 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 if not math.isfinite(gate_last_grad_norm):
                     _warn_finite_skip(reason="gate_last_grad_norm_non_finite", batch=batch, batch_idx=batch_idx)
                     optimizer.zero_grad(set_to_none=True)
+                    if did_unscale:
+                        scaler.update()
                     return
 
                 if scaled_loss.requires_grad:
