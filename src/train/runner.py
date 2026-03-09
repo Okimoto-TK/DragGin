@@ -163,32 +163,30 @@ class ShardBatchIterator:
             path = self.shard_paths[shard_idx]
             self.last_row_orders[path] = row_indices.tolist()
 
-        batch_samples: list[dict[str, Any]] = []
+        batch_chunks: list[tuple[dict[str, Any], np.ndarray]] = []
+        buffered_rows = 0
+
+        def _materialize_batch(chunks: list[tuple[dict[str, Any], np.ndarray]]) -> dict[str, Any]:
+            if len(chunks) == 1:
+                shard, rows = chunks[0]
+                return _batch_from_shard_rows(shard=shard, rows=rows, y_key=self.y_key)
+            return _batch_from_shard_chunks(chunks=chunks, y_key=self.y_key)
 
         def _consume_shard(shard_idx: int, shard: dict[str, Any]) -> list[dict[str, Any]]:
-            nonlocal batch_samples
+            nonlocal batch_chunks, buffered_rows
             emitted: list[dict[str, Any]] = []
             row_indices = row_orders[shard_idx]
-            for row_idx in row_indices.tolist():
-                batch_samples.append(
-                    {
-                        "code": str(shard["codes"][row_idx]),
-                        "asof_date": str(shard["asof_dates"][row_idx]),
-                        "x_micro": torch.as_tensor(shard["X_micro"][row_idx], dtype=torch.float32),
-                        "x_mezzo": torch.as_tensor(shard["X_mezzo"][row_idx], dtype=torch.float32),
-                        "x_macro": torch.as_tensor(shard["X_macro"][row_idx], dtype=torch.float32),
-                        "mask_micro": torch.as_tensor(shard["mask_micro"][row_idx], dtype=torch.bool),
-                        "mask_mezzo": torch.as_tensor(shard["mask_mezzo"][row_idx], dtype=torch.bool),
-                        "mask_macro": torch.as_tensor(shard["mask_macro"][row_idx], dtype=torch.bool),
-                        "y": torch.as_tensor(shard[self.y_key][row_idx], dtype=torch.float32),
-                        "dp_ok": torch.as_tensor(shard["dp_ok"][row_idx], dtype=torch.bool),
-                        "label_ok": torch.as_tensor(shard["label_ok"][row_idx], dtype=torch.bool),
-                        "loss_mask": torch.as_tensor(shard["loss_mask"][row_idx], dtype=torch.bool),
-                    }
-                )
-                if len(batch_samples) == self.batch_size:
-                    emitted.append(collate_batch(batch_samples))
-                    batch_samples = []
+            start = 0
+            while start < row_indices.size:
+                take = min(self.batch_size - buffered_rows, int(row_indices.size - start))
+                rows = np.ascontiguousarray(row_indices[start : start + take], dtype=np.int64)
+                batch_chunks.append((shard, rows))
+                buffered_rows += int(rows.size)
+                start += take
+                if buffered_rows == self.batch_size:
+                    emitted.append(_materialize_batch(batch_chunks))
+                    batch_chunks = []
+                    buffered_rows = 0
             return emitted
 
         if self._buffered_shards is not None:
@@ -227,8 +225,8 @@ class ShardBatchIterator:
                     yield out_batch
                 del shard
 
-        if batch_samples:
-            yield collate_batch(batch_samples)
+        if buffered_rows > 0:
+            yield _materialize_batch(batch_chunks)
 
 
 
@@ -288,6 +286,60 @@ def collate_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
     }
 
 
+def _batch_from_shard_rows(shard: dict[str, Any], rows: np.ndarray, y_key: str) -> dict[str, Any]:
+    rows = np.asarray(rows, dtype=np.int64)
+    rows_contig = np.ascontiguousarray(rows)
+    return {
+        "code": shard["codes"][rows_contig].astype(str).tolist(),
+        "asof_date": shard["asof_dates"][rows_contig].astype(str).tolist(),
+        "x_micro": torch.from_numpy(np.ascontiguousarray(shard["X_micro"][rows_contig], dtype=np.float32)),
+        "x_mezzo": torch.from_numpy(np.ascontiguousarray(shard["X_mezzo"][rows_contig], dtype=np.float32)),
+        "x_macro": torch.from_numpy(np.ascontiguousarray(shard["X_macro"][rows_contig], dtype=np.float32)),
+        "mask_micro": torch.from_numpy(np.ascontiguousarray(shard["mask_micro"][rows_contig])).to(torch.bool),
+        "mask_mezzo": torch.from_numpy(np.ascontiguousarray(shard["mask_mezzo"][rows_contig])).to(torch.bool),
+        "mask_macro": torch.from_numpy(np.ascontiguousarray(shard["mask_macro"][rows_contig])).to(torch.bool),
+        "y": torch.from_numpy(np.ascontiguousarray(shard[y_key][rows_contig], dtype=np.float32)),
+        "dp_ok": torch.from_numpy(np.ascontiguousarray(shard["dp_ok"][rows_contig])).to(torch.bool),
+        "label_ok": torch.from_numpy(np.ascontiguousarray(shard["label_ok"][rows_contig])).to(torch.bool),
+        "loss_mask": torch.from_numpy(np.ascontiguousarray(shard["loss_mask"][rows_contig])).to(torch.bool),
+    }
+
+
+def _batch_from_shard_chunks(chunks: list[tuple[dict[str, Any], np.ndarray]], y_key: str) -> dict[str, Any]:
+    codes: list[str] = []
+    asof_dates: list[str] = []
+
+    def _cat_contiguous(key: str, dtype: np.dtype[Any] | None = None) -> np.ndarray:
+        arrays = []
+        for shard, rows in chunks:
+            rows_contig = np.ascontiguousarray(rows)
+            arr = shard[key][rows_contig]
+            if dtype is not None:
+                arr = arr.astype(dtype, copy=False)
+            arrays.append(np.ascontiguousarray(arr))
+        return np.ascontiguousarray(np.concatenate(arrays, axis=0))
+
+    for shard, rows in chunks:
+        rows_contig = np.ascontiguousarray(rows)
+        codes.extend(shard["codes"][rows_contig].astype(str).tolist())
+        asof_dates.extend(shard["asof_dates"][rows_contig].astype(str).tolist())
+
+    return {
+        "code": codes,
+        "asof_date": asof_dates,
+        "x_micro": torch.from_numpy(_cat_contiguous("X_micro", np.float32)),
+        "x_mezzo": torch.from_numpy(_cat_contiguous("X_mezzo", np.float32)),
+        "x_macro": torch.from_numpy(_cat_contiguous("X_macro", np.float32)),
+        "mask_micro": torch.from_numpy(_cat_contiguous("mask_micro")).to(torch.bool),
+        "mask_mezzo": torch.from_numpy(_cat_contiguous("mask_mezzo")).to(torch.bool),
+        "mask_macro": torch.from_numpy(_cat_contiguous("mask_macro")).to(torch.bool),
+        "y": torch.from_numpy(_cat_contiguous(y_key, np.float32)),
+        "dp_ok": torch.from_numpy(_cat_contiguous("dp_ok")).to(torch.bool),
+        "label_ok": torch.from_numpy(_cat_contiguous("label_ok")).to(torch.bool),
+        "loss_mask": torch.from_numpy(_cat_contiguous("loss_mask")).to(torch.bool),
+    }
+
+
 class MultiScaleRegressor(nn.Module):
     def __init__(
         self,
@@ -300,6 +352,7 @@ class MultiScaleRegressor(nn.Module):
         init_lambda_micro: float = 1.5,
         init_lambda_mezzo: float = 0.8,
         init_lambda_macro: float = 0.3,
+        gate_temperature: float = 1.0,
         use_seq_context: bool = False,
     ) -> None:
         super().__init__()
@@ -327,10 +380,15 @@ class MultiScaleRegressor(nn.Module):
             num_heads=num_heads,
             dropout=dropout,
             enable_free_branch=enable_free_branch,
+            gate_temperature=gate_temperature,
         )
         self.head = RegressionHead(hidden_dim=hidden_dim, use_seq_context=use_seq_context, dropout=dropout)
 
-    def forward(self, batch: dict[str, torch.Tensor]) -> tuple[torch.Tensor, dict[str, Any]]:
+    def forward(
+        self,
+        batch: dict[str, torch.Tensor],
+        force_gate_value: float | None = None,
+    ) -> tuple[torch.Tensor, dict[str, Any]]:
         micro_seq, micro_pool, aux_micro = self.micro_encoder(batch["x_micro"], batch["mask_micro"])
         mezzo_seq, mezzo_pool, aux_mezzo = self.mezzo_encoder(batch["x_mezzo"], batch["mask_mezzo"])
         macro_seq, macro_pool, aux_macro = self.macro_encoder(batch["x_macro"], batch["mask_macro"])
@@ -345,6 +403,7 @@ class MultiScaleRegressor(nn.Module):
             mask_micro=batch["mask_micro"],
             mask_mezzo=batch["mask_mezzo"],
             mask_macro=batch["mask_macro"],
+            force_gate_value=force_gate_value,
         )
         y_hat = self.head(fused_seq=fused_seq, fused_pool=fused_pool)
         return y_hat, {"micro": aux_micro, "mezzo": aux_mezzo, "macro": aux_macro, "fusion": aux_fusion}
@@ -364,6 +423,13 @@ class TrainConfig:
     dropout: float
     exp_name: str
     out_dir: str
+    gate_temperature: float = 1.0
+    gate_std_target: float = 0.10
+    gate_std_reg: float = 1e-2
+    gate_mean_target: float = 0.50
+    gate_mean_reg: float = 1e-2
+    gate_entropy_reg: float = 5e-3
+    gate_warmup_steps: int = 500
     y_key: str = "y"
     in_dim: int = 6
     enable_dynamic_threshold: bool = True
@@ -377,13 +443,81 @@ class TrainConfig:
     split_seed: int = 42
     buffer: bool = False
     num_workers: int = 1
+    pin_memory: bool = False
+    prefetch_cuda: bool = False
+    enable_compile: bool = False
+    compile_mode: str = "reduce-overhead"
+    log_every: int = 10
+    curve_save_every: int = 100
+    checkpoint: str | None = None
+    save_every: int = 1
 
 
-def _to_device(batch: dict[str, Any], device: torch.device) -> dict[str, Any]:
+def _build_checkpoint_payload(
+    *,
+    epoch: int,
+    global_step: int,
+    model: nn.Module,
+    optimizer: AdamW,
+    scaler: GradScaler,
+    history: dict[str, list[dict[str, float | int]]],
+    best_val: dict[str, float],
+) -> dict[str, Any]:
+    return {
+        "epoch": int(epoch),
+        "global_step": int(global_step),
+        "model_state_dict": model.state_dict(),
+        "optimizer_state_dict": optimizer.state_dict(),
+        "scaler_state_dict": scaler.state_dict(),
+        "history": history,
+        "best_val": best_val,
+    }
+
+
+def _save_checkpoint(path: Path, payload: dict[str, Any]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(payload, path)
+
+
+class CUDAPrefetcher:
+    def __init__(self, loader: Any, device: torch.device, pin_memory: bool) -> None:
+        self.loader_iter = iter(loader)
+        self.device = device
+        self.pin_memory = pin_memory
+        self.stream = torch.cuda.Stream(device=device)
+        self.next_batch: dict[str, Any] | None = None
+        self._preload()
+
+    def _preload(self) -> None:
+        try:
+            raw_batch = next(self.loader_iter)
+        except StopIteration:
+            self.next_batch = None
+            return
+
+        with torch.cuda.stream(self.stream):
+            self.next_batch = _to_device(raw_batch, self.device, pin_memory=self.pin_memory)
+
+    def next(self) -> dict[str, Any] | None:
+        torch.cuda.current_stream(device=self.device).wait_stream(self.stream)
+        batch = self.next_batch
+        if batch is None:
+            return None
+        for value in batch.values():
+            if isinstance(value, torch.Tensor):
+                value.record_stream(torch.cuda.current_stream(device=self.device))
+        self._preload()
+        return batch
+
+
+def _to_device(batch: dict[str, Any], device: torch.device, pin_memory: bool = False) -> dict[str, Any]:
     out: dict[str, Any] = {}
     for key, value in batch.items():
         if isinstance(value, torch.Tensor):
-            out[key] = value.to(device)
+            tensor = value
+            if pin_memory and tensor.device.type == "cpu":
+                tensor = tensor.pin_memory()
+            out[key] = tensor.to(device, non_blocking=True)
         else:
             out[key] = value
     return out
@@ -407,21 +541,28 @@ def _write_yaml(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
 
 
+def _weighted_metric_value(metric: torch.Tensor, num_valid: int) -> float:
+    return float(metric.detach().item()) * float(max(0, int(num_valid)))
+
+
 def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, Any]:
     out_dir = Path(config.out_dir)
     logs_dir = out_dir / "logs"
     runs_dir = out_dir / "runs" / config.exp_name
     metrics_dir = out_dir / "metrics"
+    checkpoints_dir = out_dir / "checkpoints" / config.exp_name
     feedback_path = out_dir / "reports" / "feedback" / f"{config.exp_name}.yaml"
 
     logs_dir.mkdir(parents=True, exist_ok=True)
     runs_dir.mkdir(parents=True, exist_ok=True)
     metrics_dir.mkdir(parents=True, exist_ok=True)
+    checkpoints_dir.mkdir(parents=True, exist_ok=True)
     logger = _setup_logger(logs_dir / "train.log")
 
     writer = SummaryWriter(log_dir=str(runs_dir))
     curve_path = metrics_dir / "curve.json"
     history: dict[str, list[dict[str, float | int]]] = {"train": [], "val": []}
+    start_epoch = 0
 
     train_sample_count = 0
     val_sample_count = 0
@@ -480,11 +621,22 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
         init_lambda_micro=config.init_lambda_micro,
         init_lambda_mezzo=config.init_lambda_mezzo,
         init_lambda_macro=config.init_lambda_macro,
+        gate_temperature=config.gate_temperature,
         use_seq_context=config.use_seq_context,
     )
+    gate_last_layer = model.fusion.gated.gate_mlp[-1]
+
+    gate_reg_enabled = bool(model.fusion.gated.enable_free_branch)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type == "cuda":
+        torch.backends.cudnn.benchmark = True
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+        torch.set_float32_matmul_precision("high")
     model.to(device)
+    if device.type == "cuda" and config.enable_compile and hasattr(torch, "compile"):
+        model = torch.compile(model, mode=config.compile_mode)
     optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
     scheduler = None
     use_amp = device.type == "cuda"
@@ -493,11 +645,44 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
     global_step = 0
     epochs_completed = 0
     best_val = {"loss": float("inf"), "huber": float("inf"), "mae": float("inf"), "mse": float("inf")}
+    latest_ckpt_path = checkpoints_dir / "latest.ckpt"
+    best_ckpt_path = checkpoints_dir / "best.ckpt"
+
+    if config.checkpoint is not None:
+        checkpoint_path = Path(config.checkpoint)
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model.load_state_dict(checkpoint["model_state_dict"])
+        optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+        for pg in optimizer.param_groups:
+            pg["lr"] = float(config.lr)
+            pg["weight_decay"] = float(config.weight_decay)
+            if "initial_lr" in pg:
+                pg["initial_lr"] = float(config.lr)
+        logger.info(
+            "resume_override_optim_hparams lr=%s weight_decay=%s",
+            [float(pg["lr"]) for pg in optimizer.param_groups],
+            [float(pg["weight_decay"]) for pg in optimizer.param_groups],
+        )
+        scaler_state = checkpoint.get("scaler_state_dict")
+        if isinstance(scaler_state, dict):
+            scaler.load_state_dict(scaler_state)
+        global_step = int(checkpoint.get("global_step", 0))
+        start_epoch = int(checkpoint.get("epoch", -1)) + 1
+        epochs_completed = start_epoch
+        history_ckpt = checkpoint.get("history")
+        if isinstance(history_ckpt, dict) and "train" in history_ckpt and "val" in history_ckpt:
+            history = history_ckpt
+        best_val_ckpt = checkpoint.get("best_val")
+        if isinstance(best_val_ckpt, dict):
+            for key in ("loss", "huber", "mae", "mse"):
+                if key in best_val_ckpt:
+                    best_val[key] = float(best_val_ckpt[key])
+        logger.info("resumed_from=%s start_epoch=%d global_step=%d", str(checkpoint_path), start_epoch, global_step)
     last_train_row: dict[str, Any] = {}
     last_val_row: dict[str, Any] = {"loss": 0.0}
 
     try:
-        for epoch in range(config.num_epochs):
+        for epoch in range(start_epoch, start_epoch + config.num_epochs):
             model.train()
             optimizer.zero_grad(set_to_none=True)
             epoch_train_iter = iter(train_loader)
@@ -510,24 +695,67 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 [Path(p).name for p in train_loader.last_shard_order[:3]],
             )
 
-            for batch_idx, raw_batch in enumerate(epoch_train_iter):
-                batch = _to_device(raw_batch, device)
-
+            def _train_on_batch(batch: dict[str, Any], batch_idx: int) -> None:
+                nonlocal global_step, last_train_row
+                force_gate_value = 0.5 if global_step < int(config.gate_warmup_steps) else None
                 with autocast(enabled=use_amp):
-                    y_hat, aux = model(batch)
+                    y_hat, aux = model(batch, force_gate_value=force_gate_value)
                     loss, metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
-                    scaled_loss = loss / max(1, config.grad_accum_steps)
+                    gate = aux["fusion"]["gate"]
+                    gate_logits = aux["fusion"]["gate_logits"]
+                    guided_pool = aux["fusion"]["guided_pool"]
+                    free_pool = aux["fusion"]["free_pool"]
+                    gate_mean = gate.mean()
+                    gate_std = gate.std(unbiased=False)
+                    if gate_reg_enabled:
+                        gate_target = torch.as_tensor(config.gate_std_target, dtype=gate_std.dtype, device=gate_std.device)
+                        gate_std_penalty = torch.relu(
+                            gate_target - gate_std
+                        ) ** 2
+                        gate_mean_target = torch.as_tensor(
+                            config.gate_mean_target,
+                            dtype=gate_mean.dtype,
+                            device=gate_mean.device,
+                        )
+                        gate_mean_penalty = (
+                            gate_mean - gate_mean_target
+                        ) ** 2
+                        gate_eps = torch.as_tensor(1e-6, dtype=gate.dtype, device=gate.device)
+                        gate_clamped = gate.clamp(gate_eps, 1.0 - gate_eps)
+                        gate_entropy = -(
+                            gate_clamped * torch.log(gate_clamped)
+                            + (1.0 - gate_clamped) * torch.log(1.0 - gate_clamped)
+                        ).mean()
+                        gate_entropy_penalty = -gate_entropy
+                        total_loss = (
+                            loss
+                            + float(config.gate_std_reg) * gate_std_penalty
+                            + float(config.gate_mean_reg) * gate_mean_penalty
+                            + float(config.gate_entropy_reg) * gate_entropy_penalty
+                        )
+                    else:
+                        gate_std_penalty = torch.zeros((), dtype=loss.dtype, device=loss.device)
+                        gate_mean_penalty = torch.zeros((), dtype=loss.dtype, device=loss.device)
+                        gate_entropy_penalty = torch.zeros((), dtype=loss.dtype, device=loss.device)
+                        total_loss = loss
+                    scaled_loss = total_loss / max(1, config.grad_accum_steps)
 
                 if scaled_loss.requires_grad:
                     scaler.scale(scaled_loss).backward()
 
                 should_step = (batch_idx + 1) % max(1, config.grad_accum_steps) == 0 or (batch_idx + 1) == len(train_loader)
                 if not should_step:
-                    continue
+                    return
 
                 if config.clip_grad_norm is not None and scaled_loss.requires_grad:
                     scaler.unscale_(optimizer)
                     torch.nn.utils.clip_grad_norm_(model.parameters(), config.clip_grad_norm)
+
+                gate_last_grad_norm = 0.0
+                if gate_last_layer.weight.grad is not None:
+                    gate_last_grad_norm = float(gate_last_layer.weight.grad.detach().norm().item())
+                elif gate_last_layer.bias.grad is not None:
+                    gate_last_grad_norm = float(gate_last_layer.bias.grad.detach().norm().item())
 
                 if scaled_loss.requires_grad:
                     scaler.step(optimizer)
@@ -540,36 +768,53 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 batch_size_current = int(batch["y"].shape[0])
                 num_valid = int(metrics["num_valid"])
                 valid_ratio = float(num_valid / max(1, batch_size_current))
-                micro_lambda_mean = float(aux["micro"]["lambda_mean"].mean().detach().item())
-                mezzo_lambda_mean = float(aux["mezzo"]["lambda_mean"].mean().detach().item())
-                macro_lambda_mean = float(aux["macro"]["lambda_mean"].mean().detach().item())
-                gate = aux["fusion"]["gate"]
-                gate_mean = float(gate.mean().detach().item())
-                gate_std = float(gate.std(unbiased=False).detach().item())
-
+                gate_last_weight_norm = float(gate_last_layer.weight.detach().norm().item())
+                gate_last_bias = float(gate_last_layer.bias.detach().mean().item())
+                guided_pool_norm = float(guided_pool.detach().norm(dim=-1).mean().item())
+                free_pool_norm = float(free_pool.detach().norm(dim=-1).mean().item())
+                guided_free_gap = float(torch.abs(guided_pool - free_pool).mean().detach().item())
                 train_row = {
                     "step": int(global_step),
                     "loss": float(loss.detach().item()),
+                    "total_loss": float(total_loss.detach().item()),
                     "huber": float(metrics["huber"].detach().item()),
                     "mae": float(metrics["mae"].detach().item()),
                     "mse": float(metrics["mse"].detach().item()),
                     "lr": float(optimizer.param_groups[0]["lr"]),
                     "num_valid": int(num_valid),
                     "valid_ratio": float(valid_ratio),
-                    "micro_lambda_mean": micro_lambda_mean,
-                    "mezzo_lambda_mean": mezzo_lambda_mean,
-                    "macro_lambda_mean": macro_lambda_mean,
-                    "gate_mean": gate_mean,
-                    "gate_std": gate_std,
+                    "micro_lambda_mean": float(aux["micro"]["lambda_mean"].mean().detach().item()),
+                    "mezzo_lambda_mean": float(aux["mezzo"]["lambda_mean"].mean().detach().item()),
+                    "macro_lambda_mean": float(aux["macro"]["lambda_mean"].mean().detach().item()),
+                    "gate_mean": float(gate_mean.detach().item()),
+                    "gate_std": float(gate_std.detach().item()),
+                    "gate_logits_mean": float(gate_logits.mean().detach().item()),
+                    "gate_logits_std": float(gate_logits.std(unbiased=False).detach().item()),
+                    "gate_std_penalty": float(gate_std_penalty.detach().item()),
+                    "gate_mean_penalty": float(gate_mean_penalty.detach().item()),
+                    "gate_entropy_penalty": float(gate_entropy_penalty.detach().item()),
+                    "gate_last_bias": gate_last_bias,
+                    "gate_last_weight_norm": gate_last_weight_norm,
+                    "gate_last_grad_norm": gate_last_grad_norm,
+                    "guided_pool_norm": guided_pool_norm,
+                    "free_pool_norm": free_pool_norm,
+                    "guided_free_gap": guided_free_gap,
+                    "force_gate_value": float(force_gate_value) if force_gate_value is not None else -1.0,
                 }
                 history["train"].append(train_row)
                 last_train_row = train_row
 
                 writer.add_scalar("train/loss", train_row["loss"], global_step)
+                writer.add_scalar("train/total_loss", train_row["total_loss"], global_step)
+                writer.add_scalar("train/gate_std_penalty", train_row["gate_std_penalty"], global_step)
+                writer.add_scalar("train/gate_mean_penalty", train_row["gate_mean_penalty"], global_step)
+                writer.add_scalar("train/gate_entropy_penalty", train_row["gate_entropy_penalty"], global_step)
                 writer.add_scalar("train/huber", train_row["huber"], global_step)
                 writer.add_scalar("train/mae", train_row["mae"], global_step)
                 writer.add_scalar("train/mse", train_row["mse"], global_step)
                 writer.add_scalar("train/lr", train_row["lr"], global_step)
+                writer.add_scalar("train/force_gate_value", train_row["force_gate_value"], global_step)
+                writer.add_scalar("train/gate_last_grad_norm", train_row["gate_last_grad_norm"], global_step)
                 writer.add_scalar("data/num_valid", train_row["num_valid"], global_step)
                 writer.add_scalar("data/valid_ratio", train_row["valid_ratio"], global_step)
                 writer.add_scalar("model/micro_lambda_mean", train_row["micro_lambda_mean"], global_step)
@@ -577,41 +822,81 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 writer.add_scalar("model/macro_lambda_mean", train_row["macro_lambda_mean"], global_step)
                 writer.add_scalar("model/gate_mean", train_row["gate_mean"], global_step)
                 writer.add_scalar("model/gate_std", train_row["gate_std"], global_step)
+                writer.add_scalar("model/gate_logits_mean", train_row["gate_logits_mean"], global_step)
+                writer.add_scalar("model/gate_logits_std", train_row["gate_logits_std"], global_step)
+                writer.add_scalar("model/gate_last_bias", train_row["gate_last_bias"], global_step)
+                writer.add_scalar("model/gate_last_weight_norm", train_row["gate_last_weight_norm"], global_step)
+                writer.add_scalar("model/guided_pool_norm", train_row["guided_pool_norm"], global_step)
+                writer.add_scalar("model/free_pool_norm", train_row["free_pool_norm"], global_step)
+                writer.add_scalar("model/guided_free_gap", train_row["guided_free_gap"], global_step)
 
-                logger.info(
-                    "epoch=%d step=%d train_loss=%.6f valid_ratio=%.4f",
-                    epoch + 1,
-                    global_step,
-                    train_row["loss"],
-                    train_row["valid_ratio"],
-                )
-                curve_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+                if global_step % max(1, config.log_every) == 0:
+                    logger.info(
+                        "epoch=%d step=%d train_loss=%.6f valid_ratio=%.4f",
+                        epoch + 1,
+                        global_step,
+                        train_row["loss"],
+                        train_row["valid_ratio"],
+                    )
+                if global_step % max(1, config.curve_save_every) == 0:
+                    curve_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
+
+            if device.type == "cuda" and config.prefetch_cuda:
+                prefetcher = CUDAPrefetcher(train_loader, device=device, pin_memory=config.pin_memory)
+                batch_idx = 0
+                while True:
+                    batch = prefetcher.next()
+                    if batch is None:
+                        break
+                    _train_on_batch(batch, batch_idx)
+                    batch_idx += 1
+            else:
+                for batch_idx, raw_batch in enumerate(epoch_train_iter):
+                    batch = _to_device(raw_batch, device, pin_memory=config.pin_memory)
+                    _train_on_batch(batch, batch_idx)
 
             model.eval()
-            val_loss_sum = 0.0
-            val_huber_sum = 0.0
-            val_mae_sum = 0.0
-            val_mse_sum = 0.0
-            val_batches = 0
+            val_loss_weighted_sum = 0.0
+            val_huber_weighted_sum = 0.0
+            val_mae_weighted_sum = 0.0
+            val_mse_weighted_sum = 0.0
+            val_num_valid_total = 0
             with torch.no_grad():
-                for raw_batch in val_loader:
-                    batch = _to_device(raw_batch, device)
-                    with autocast(enabled=use_amp):
-                        y_hat, _ = model(batch)
-                        val_loss, val_metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
-                    val_loss_sum += float(val_loss.detach().item())
-                    val_huber_sum += float(val_metrics["huber"].detach().item())
-                    val_mae_sum += float(val_metrics["mae"].detach().item())
-                    val_mse_sum += float(val_metrics["mse"].detach().item())
-                    val_batches += 1
+                if device.type == "cuda" and config.prefetch_cuda:
+                    val_prefetcher = CUDAPrefetcher(val_loader, device=device, pin_memory=config.pin_memory)
+                    while True:
+                        batch = val_prefetcher.next()
+                        if batch is None:
+                            break
+                        with autocast(enabled=use_amp):
+                            y_hat, _ = model(batch)
+                            val_loss, val_metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
+                        num_valid = int(val_metrics["num_valid"])
+                        val_num_valid_total += num_valid
+                        val_loss_weighted_sum += _weighted_metric_value(val_loss, num_valid)
+                        val_huber_weighted_sum += _weighted_metric_value(val_metrics["huber"], num_valid)
+                        val_mae_weighted_sum += _weighted_metric_value(val_metrics["mae"], num_valid)
+                        val_mse_weighted_sum += _weighted_metric_value(val_metrics["mse"], num_valid)
+                else:
+                    for raw_batch in val_loader:
+                        batch = _to_device(raw_batch, device, pin_memory=config.pin_memory)
+                        with autocast(enabled=use_amp):
+                            y_hat, _ = model(batch)
+                            val_loss, val_metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
+                        num_valid = int(val_metrics["num_valid"])
+                        val_num_valid_total += num_valid
+                        val_loss_weighted_sum += _weighted_metric_value(val_loss, num_valid)
+                        val_huber_weighted_sum += _weighted_metric_value(val_metrics["huber"], num_valid)
+                        val_mae_weighted_sum += _weighted_metric_value(val_metrics["mae"], num_valid)
+                        val_mse_weighted_sum += _weighted_metric_value(val_metrics["mse"], num_valid)
 
-            denom = max(1, val_batches)
+            denom = max(1, int(val_num_valid_total))
             val_row = {
                 "epoch": int(epoch + 1),
-                "loss": float(val_loss_sum / denom),
-                "huber": float(val_huber_sum / denom),
-                "mae": float(val_mae_sum / denom),
-                "mse": float(val_mse_sum / denom),
+                "loss": float(val_loss_weighted_sum / denom),
+                "huber": float(val_huber_weighted_sum / denom),
+                "mae": float(val_mae_weighted_sum / denom),
+                "mse": float(val_mse_weighted_sum / denom),
             }
             history["val"].append(val_row)
             last_val_row = val_row
@@ -631,8 +916,25 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
             )
             curve_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
 
+            is_best = val_row["loss"] <= best_val["loss"]
             for key in ("loss", "huber", "mae", "mse"):
                 best_val[key] = min(best_val[key], val_row[key])
+
+            checkpoint_payload = _build_checkpoint_payload(
+                epoch=epoch,
+                global_step=global_step,
+                model=model,
+                optimizer=optimizer,
+                scaler=scaler,
+                history=history,
+                best_val=best_val,
+            )
+            _save_checkpoint(latest_ckpt_path, checkpoint_payload)
+            if is_best:
+                _save_checkpoint(best_ckpt_path, checkpoint_payload)
+            if epochs_completed % max(1, int(config.save_every)) == 0:
+                epoch_ckpt_path = checkpoints_dir / f"epoch_{epochs_completed:04d}.ckpt"
+                _save_checkpoint(epoch_ckpt_path, checkpoint_payload)
 
         feedback = {
             "meta": {
@@ -710,6 +1012,13 @@ def _parse_args() -> TrainConfig:
     parser.add_argument("--num-epochs", type=int, required=True)
     parser.add_argument("--lr", type=float, required=True)
     parser.add_argument("--weight-decay", type=float, required=True)
+    parser.add_argument("--gate-temperature", type=float, default=1.0)
+    parser.add_argument("--gate-std-target", type=float, default=0.10)
+    parser.add_argument("--gate-std-reg", type=float, default=1e-2)
+    parser.add_argument("--gate-mean-target", type=float, default=0.50)
+    parser.add_argument("--gate-mean-reg", type=float, default=1e-2)
+    parser.add_argument("--gate-entropy-reg", type=float, default=5e-3)
+    parser.add_argument("--gate-warmup-steps", type=int, default=500)
     parser.add_argument("--hidden-dim", type=int, required=True)
     parser.add_argument("--num-heads", type=int, required=True)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -719,6 +1028,14 @@ def _parse_args() -> TrainConfig:
     parser.add_argument("--val-ratio", type=float, default=0.15)
     parser.add_argument("--buffer", action="store_true")
     parser.add_argument("--num-workers", type=int, default=1)
+    parser.add_argument("--pin-memory", action="store_true")
+    parser.add_argument("--prefetch-cuda", action="store_true")
+    parser.add_argument("--enable-compile", action="store_true")
+    parser.add_argument("--compile-mode", type=str, default="reduce-overhead")
+    parser.add_argument("--log-every", type=int, default=10)
+    parser.add_argument("--curve-save-every", type=int, default=100)
+    parser.add_argument("--checkpoint", type=str, default=None)
+    parser.add_argument("--save-every", type=int, default=1)
 
     args = parser.parse_args()
     return TrainConfig(
@@ -729,6 +1046,13 @@ def _parse_args() -> TrainConfig:
         num_epochs=args.num_epochs,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        gate_temperature=args.gate_temperature,
+        gate_std_target=args.gate_std_target,
+        gate_std_reg=args.gate_std_reg,
+        gate_mean_target=args.gate_mean_target,
+        gate_mean_reg=args.gate_mean_reg,
+        gate_entropy_reg=args.gate_entropy_reg,
+        gate_warmup_steps=max(0, int(args.gate_warmup_steps)),
         hidden_dim=args.hidden_dim,
         num_heads=args.num_heads,
         dropout=args.dropout,
@@ -738,6 +1062,14 @@ def _parse_args() -> TrainConfig:
         val_ratio=args.val_ratio,
         buffer=args.buffer,
         num_workers=max(1, int(args.num_workers)),
+        pin_memory=bool(args.pin_memory),
+        prefetch_cuda=bool(args.prefetch_cuda),
+        enable_compile=bool(args.enable_compile),
+        compile_mode=str(args.compile_mode),
+        log_every=max(1, int(args.log_every)),
+        curve_save_every=max(1, int(args.curve_save_every)),
+        checkpoint=args.checkpoint,
+        save_every=max(1, int(args.save_every)),
     )
 
 
