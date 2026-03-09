@@ -46,5 +46,7 @@ class MicroSelfAttention(nn.Module):
         free_seq_perm = torch.where(pooled_weights > 0, free_seq_perm, torch.zeros_like(free_seq_perm))
 
         free_seq = free_seq_perm.transpose(1, 2)
-        free_pool = free_seq.mean(dim=1)
+        valid_bin_mask = (pooled_weights > 0).to(dtype=free_seq_perm.dtype).transpose(1, 2)
+        valid_bin_denom = valid_bin_mask.sum(dim=1).clamp_min(1.0)
+        free_pool = (free_seq * valid_bin_mask).sum(dim=1) / valid_bin_denom
         return free_seq, free_pool

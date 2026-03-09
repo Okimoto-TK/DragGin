@@ -31,6 +31,13 @@ def main() -> None:
     parser.add_argument("--num-epochs", type=int, required=True)
     parser.add_argument("--lr", type=float, required=True)
     parser.add_argument("--weight-decay", type=float, required=True)
+    parser.add_argument("--gate-temperature", type=float, default=1.0)
+    parser.add_argument("--gate-std-target", type=float, default=0.10)
+    parser.add_argument("--gate-std-reg", type=float, default=1e-2)
+    parser.add_argument("--gate-mean-target", type=float, default=0.50)
+    parser.add_argument("--gate-mean-reg", type=float, default=1e-2)
+    parser.add_argument("--gate-entropy-reg", type=float, default=5e-3)
+    parser.add_argument("--gate-warmup-steps", type=int, default=500)
     parser.add_argument("--hidden-dim", type=int, required=True)
     parser.add_argument("--num-heads", type=int, required=True)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -45,6 +52,8 @@ def main() -> None:
     parser.add_argument("--compile-mode", type=str, default="reduce-overhead", help="torch.compile mode")
     parser.add_argument("--log-every", type=int, default=10, help="log every N optimizer steps")
     parser.add_argument("--curve-save-every", type=int, default=100, help="save curve JSON every N optimizer steps")
+    parser.add_argument("--checkpoint", type=str, default=None, help="resume training from checkpoint path")
+    parser.add_argument("--save-every", type=int, default=1, help="save an epoch checkpoint every N epochs")
     args = parser.parse_args()
 
     train_shards = _expand_paths(args.train_shards)
@@ -60,6 +69,13 @@ def main() -> None:
         num_epochs=args.num_epochs,
         lr=args.lr,
         weight_decay=args.weight_decay,
+        gate_temperature=args.gate_temperature,
+        gate_std_target=args.gate_std_target,
+        gate_std_reg=args.gate_std_reg,
+        gate_mean_target=args.gate_mean_target,
+        gate_mean_reg=args.gate_mean_reg,
+        gate_entropy_reg=args.gate_entropy_reg,
+        gate_warmup_steps=max(0, int(args.gate_warmup_steps)),
         hidden_dim=args.hidden_dim,
         num_heads=args.num_heads,
         dropout=args.dropout,
@@ -75,6 +91,8 @@ def main() -> None:
         compile_mode=str(args.compile_mode),
         log_every=max(1, int(args.log_every)),
         curve_save_every=max(1, int(args.curve_save_every)),
+        checkpoint=args.checkpoint,
+        save_every=max(1, int(args.save_every)),
     )
     output = run_training(cfg)
 
