@@ -327,3 +327,40 @@ def test_gated_fusion_raises_on_non_finite_gate_logits() -> None:
             mask_macro=mask_macro,
         )
 
+
+
+def test_disable_free_branch_does_not_execute_free_path() -> None:
+    bsz, hidden = 2, 10
+    model = MultiScaleFusion(hidden_dim=hidden, num_heads=2, enable_free_branch=False)
+
+    def _boom(*args, **kwargs):
+        raise AssertionError("free branch should not run when disabled")
+
+    model.free.forward = _boom  # type: ignore[assignment]
+
+    micro_seq = torch.randn(bsz, 48, hidden)
+    mezzo_seq = torch.randn(bsz, 40, hidden)
+    macro_seq = torch.randn(bsz, 30, hidden)
+    micro_pool = torch.randn(bsz, hidden)
+    mezzo_pool = torch.randn(bsz, hidden)
+    macro_pool = torch.randn(bsz, hidden)
+    mask_micro = torch.ones(bsz, 48, dtype=torch.bool)
+    mask_mezzo = torch.ones(bsz, 40, dtype=torch.bool)
+    mask_macro = torch.ones(bsz, 30, dtype=torch.bool)
+
+    fused_seq, fused_pool, aux = model(
+        micro_seq,
+        mezzo_seq,
+        macro_seq,
+        micro_pool,
+        mezzo_pool,
+        macro_pool,
+        mask_micro,
+        mask_mezzo,
+        mask_macro,
+    )
+
+    assert fused_seq.shape == (bsz, 30, hidden)
+    assert fused_pool.shape == (bsz, hidden)
+    assert torch.isfinite(aux["free_pool"]).all()
+

@@ -146,7 +146,11 @@ class MultiScaleFusion(nn.Module):
             mask_micro=mask_micro,
             mask_mezzo=mask_mezzo,
         )
-        free_seq, free_pool = self.free(micro_seq=micro_seq, mask_micro=mask_micro, target_len=macro_seq.shape[1])
+        if self.gated.enable_free_branch:
+            free_seq, free_pool = self.free(micro_seq=micro_seq, mask_micro=mask_micro, target_len=macro_seq.shape[1])
+        else:
+            free_seq = guided_seq
+            free_pool = guided_pool
 
         return self.gated(
             guided_seq=guided_seq,
