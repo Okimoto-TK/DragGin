@@ -54,6 +54,13 @@ def main() -> None:
     parser.add_argument("--curve-save-every", type=int, default=100, help="save curve JSON every N optimizer steps")
     parser.add_argument("--checkpoint", type=str, default=None, help="resume training from checkpoint path")
     parser.add_argument("--save-every", type=int, default=1, help="save an epoch checkpoint every N epochs")
+    parser.add_argument("--gate-lr", type=float, default=None)
+    parser.add_argument("--gate-clip-grad-norm", type=float, default=0.2)
+    parser.add_argument("--scheduler-name", type=str, default="plateau")
+    parser.add_argument("--scheduler-factor", type=float, default=0.5)
+    parser.add_argument("--scheduler-patience", type=int, default=6)
+    parser.add_argument("--scheduler-min-lr", type=float, default=1e-6)
+    parser.add_argument("--finite-skip-max-warn", type=int, default=20)
     args = parser.parse_args()
 
     train_shards = _expand_paths(args.train_shards)
@@ -76,6 +83,13 @@ def main() -> None:
         gate_mean_reg=args.gate_mean_reg,
         gate_entropy_reg=args.gate_entropy_reg,
         gate_warmup_steps=max(0, int(args.gate_warmup_steps)),
+        gate_lr=args.gate_lr,
+        gate_clip_grad_norm=args.gate_clip_grad_norm,
+        scheduler_name=str(args.scheduler_name),
+        scheduler_factor=float(args.scheduler_factor),
+        scheduler_patience=max(1, int(args.scheduler_patience)),
+        scheduler_min_lr=float(args.scheduler_min_lr),
+        finite_skip_max_warn=max(0, int(args.finite_skip_max_warn)),
         hidden_dim=args.hidden_dim,
         num_heads=args.num_heads,
         dropout=args.dropout,

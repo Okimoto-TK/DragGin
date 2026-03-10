@@ -427,3 +427,116 @@ def test_empty_valid_mask_batch_safe() -> None:
         loss.backward()
     optimizer.step()
     assert metrics["num_valid"] == 0
+
+
+def test_checkpoint_contains_scheduler_state(tmp_path: Path) -> None:
+    train_path = _write_shard(tmp_path / "sched_train.npy", n=4)
+    val_path = _write_shard(tmp_path / "sched_val.npy", n=2)
+    cfg = TrainConfig(
+        train_shards=[train_path],
+        val_shards=[val_path],
+        batch_size=2,
+        grad_accum_steps=1,
+        num_epochs=1,
+        lr=1e-3,
+        weight_decay=1e-4,
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        exp_name="sched_state",
+        out_dir=str(tmp_path / "out_sched"),
+    )
+    run_training(cfg)
+    ckpt = torch.load(Path(cfg.out_dir) / "checkpoints" / cfg.exp_name / "latest.ckpt", map_location="cpu")
+    assert "scheduler_state_dict" in ckpt
+    assert isinstance(ckpt["scheduler_state_dict"], dict)
+
+
+def test_non_finite_loss_step_is_skipped(tmp_path: Path, monkeypatch) -> None:
+    train_path = _write_shard(tmp_path / "nan_train.npy", n=2)
+    val_path = _write_shard(tmp_path / "nan_val.npy", n=2)
+
+    def _nan_loss(y_hat, y_true, loss_mask, delta=1.0):
+        del y_true, loss_mask, delta
+        nan_loss = y_hat.mean() * 0.0 + torch.tensor(float("nan"), dtype=y_hat.dtype, device=y_hat.device)
+        return nan_loss, {"num_valid": 1, "huber": torch.zeros_like(nan_loss), "mae": torch.zeros_like(nan_loss), "mse": torch.zeros_like(nan_loss)}
+
+    monkeypatch.setattr("src.train.runner.masked_huber_loss", _nan_loss)
+    cfg = TrainConfig(
+        train_shards=[train_path],
+        val_shards=[val_path],
+        batch_size=2,
+        grad_accum_steps=1,
+        num_epochs=1,
+        lr=1e-3,
+        weight_decay=1e-4,
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        exp_name="nan_skip",
+        out_dir=str(tmp_path / "out_nan"),
+    )
+    result = run_training(cfg)
+    assert result["feedback"]["meta"]["status"] == "ok"
+    assert len(result["history"]["train"]) == 0
+
+
+def test_unscale_called_even_without_global_clip(tmp_path: Path, monkeypatch) -> None:
+    train_path = _write_shard(tmp_path / "unscale_train.npy", n=2)
+    val_path = _write_shard(tmp_path / "unscale_val.npy", n=2)
+
+    calls: list[str] = []
+
+    class _FakeScaled:
+        def __init__(self, loss):
+            self.loss = loss
+
+        def backward(self):
+            self.loss.backward()
+
+    class _FakeScaler:
+        def __init__(self, enabled=True):
+            del enabled
+
+        def scale(self, loss):
+            calls.append("scale")
+            return _FakeScaled(loss)
+
+        def unscale_(self, optimizer):
+            del optimizer
+            calls.append("unscale")
+
+        def step(self, optimizer):
+            calls.append("step")
+            optimizer.step()
+
+        def update(self):
+            calls.append("update")
+
+        def state_dict(self):
+            return {}
+
+        def load_state_dict(self, state):
+            del state
+
+    monkeypatch.setattr("src.train.runner.GradScaler", _FakeScaler)
+
+    cfg = TrainConfig(
+        train_shards=[train_path],
+        val_shards=[val_path],
+        batch_size=2,
+        grad_accum_steps=1,
+        num_epochs=1,
+        lr=1e-3,
+        weight_decay=1e-4,
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        clip_grad_norm=None,
+        exp_name="unscale_called",
+        out_dir=str(tmp_path / "out_unscale"),
+    )
+    run_training(cfg)
+    assert "unscale" in calls
+    assert calls.index("unscale") < calls.index("step")
+

@@ -6,6 +6,12 @@ import torch
 from torch import nn
 
 
+def masked_mean(seq: torch.Tensor, mask: torch.Tensor) -> torch.Tensor:
+    weights = mask.to(dtype=seq.dtype).unsqueeze(-1)
+    denom = weights.sum(dim=1).clamp_min(1.0)
+    return (seq * weights).sum(dim=1) / denom
+
+
 class RegressionHead(nn.Module):
     """Map fused Module 5 representations to scalar predictions."""
 
@@ -17,8 +23,11 @@ class RegressionHead(nn.Module):
     ) -> None:
         super().__init__()
         self.use_seq_context = use_seq_context
+        self.fused_pool_norm = nn.LayerNorm(hidden_dim)
+        self.seq_summary_norm = nn.LayerNorm(hidden_dim)
 
         input_dim = hidden_dim * 2 if use_seq_context else hidden_dim
+        self.head_input_norm = nn.LayerNorm(input_dim)
         self.proj = nn.Sequential(
             nn.Linear(input_dim, hidden_dim),
             nn.GELU(),
@@ -30,13 +39,18 @@ class RegressionHead(nn.Module):
         self,
         fused_seq: torch.Tensor,
         fused_pool: torch.Tensor,
+        mask_macro: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        head_input = fused_pool
+        head_input = self.fused_pool_norm(fused_pool)
         if self.use_seq_context:
-            seq_summary = fused_seq.mean(dim=1)
-            head_input = torch.cat([fused_pool, seq_summary], dim=-1)
+            if mask_macro is None:
+                seq_summary = fused_seq.mean(dim=1)
+            else:
+                seq_summary = masked_mean(fused_seq, mask_macro)
+            seq_summary = self.seq_summary_norm(seq_summary)
+            head_input = torch.cat([head_input, seq_summary], dim=-1)
 
-        y_hat = self.proj(head_input).squeeze(-1)
+        y_hat = self.proj(self.head_input_norm(head_input)).squeeze(-1)
         return y_hat
 
 
@@ -97,8 +111,8 @@ class RegressionModelHead(nn.Module):
             dropout=dropout,
         )
 
-    def forward(self, fused_seq: torch.Tensor, fused_pool: torch.Tensor) -> torch.Tensor:
-        return self.head(fused_seq=fused_seq, fused_pool=fused_pool)
+    def forward(self, fused_seq: torch.Tensor, fused_pool: torch.Tensor, mask_macro: torch.Tensor | None = None) -> torch.Tensor:
+        return self.head(fused_seq=fused_seq, fused_pool=fused_pool, mask_macro=mask_macro)
 
     def compute_loss(
         self,
