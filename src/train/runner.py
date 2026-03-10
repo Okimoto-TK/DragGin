@@ -584,7 +584,14 @@ def _all_grads_finite(model: nn.Module) -> bool:
 def _resolve_gate_lr(config: TrainConfig) -> float:
     if config.gate_lr is not None:
         return float(config.gate_lr)
-    return float(config.lr) * 0.3
+    return float(config.lr) * 0.5
+
+
+def _gate_reg_decay_scale(*, progress: float) -> tuple[float, float, float]:
+    """Late-phase decay for gate regularizers while keeping loss/log keys unchanged."""
+    if progress <= 0.2:
+        return 1.0, 1.0, 1.0
+    return 0.7, 0.3, 0.3
 
 
 def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, Any]:
@@ -681,13 +688,28 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
         model = torch.compile(model, mode=config.compile_mode)
 
     gate_lr = _resolve_gate_lr(config)
-    gate_params = list(gate_last_layer.parameters())
-    gate_param_ids = {id(p) for p in gate_params}
+    gate_module = model.fusion.gated.gate_mlp
+    gate_all_named_params = [(name, p) for name, p in gate_module.named_parameters() if p.requires_grad]
+    gate_last_named_params = [(name, p) for name, p in gate_all_named_params if name.startswith("2.")]
+    gate_other_named_params = [(name, p) for name, p in gate_all_named_params if not name.startswith("2.")]
+    gate_param_ids = {id(p) for _, p in gate_all_named_params}
     main_params = [p for p in model.parameters() if id(p) not in gate_param_ids]
+
     optimizer = AdamW(
         [
             {"params": main_params, "lr": float(config.lr), "weight_decay": float(config.weight_decay), "name": "main"},
-            {"params": gate_params, "lr": float(gate_lr), "weight_decay": float(config.weight_decay), "name": "gate_last"},
+            {
+                "params": [p for _, p in gate_other_named_params],
+                "lr": float(gate_lr),
+                "weight_decay": float(config.weight_decay),
+                "name": "gate_other",
+            },
+            {
+                "params": [p for _, p in gate_last_named_params],
+                "lr": float(gate_lr),
+                "weight_decay": 0.0,
+                "name": "gate_last_no_decay",
+            },
         ]
     )
     scheduler: ReduceLROnPlateau | None = None
@@ -704,6 +726,8 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
 
     global_step = 0
     epochs_completed = 0
+    train_steps_per_epoch = max(1, len(train_loader))
+    total_train_steps = max(1, train_steps_per_epoch * max(1, int(config.num_epochs)))
     best_val = {"loss": float("inf"), "huber": float("inf"), "mae": float("inf"), "mse": float("inf")}
     latest_ckpt_path = checkpoints_dir / "latest.ckpt"
     best_ckpt_path = checkpoints_dir / "best.ckpt"
@@ -720,9 +744,13 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
         resume_main_lr = float(config.lr)
         resume_gate_lr = _resolve_gate_lr(config)
         for idx, pg in enumerate(optimizer.param_groups):
-            is_gate_group = bool(pg.get("name") == "gate_last") or idx == len(optimizer.param_groups) - 1
+            group_name = str(pg.get("name", ""))
+            is_gate_group = group_name.startswith("gate_") or idx > 0
             pg["lr"] = float(resume_gate_lr if is_gate_group else resume_main_lr)
-            pg["weight_decay"] = float(config.weight_decay)
+            if group_name == "gate_last_no_decay":
+                pg["weight_decay"] = 0.0
+            else:
+                pg["weight_decay"] = float(config.weight_decay)
             if "initial_lr" in pg:
                 pg["initial_lr"] = float(pg["lr"])
         if scheduler is not None:
@@ -814,6 +842,8 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                         gate_mean = gate.mean()
                         gate_std = gate.std(unbiased=False)
                         if gate_reg_enabled:
+                            progress = min(1.0, float(global_step) / float(total_train_steps))
+                            gate_std_scale, gate_mean_scale, gate_entropy_scale = _gate_reg_decay_scale(progress=progress)
                             gate_target = torch.as_tensor(config.gate_std_target, dtype=gate_std.dtype, device=gate_std.device)
                             gate_std_penalty = torch.relu(gate_target - gate_std) ** 2
                             gate_mean_target = torch.as_tensor(config.gate_mean_target, dtype=gate_mean.dtype, device=gate_mean.device)
@@ -824,9 +854,9 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                             gate_entropy_penalty = -gate_entropy
                             total_loss = (
                                 loss
-                                + float(config.gate_std_reg) * gate_std_penalty
-                                + float(config.gate_mean_reg) * gate_mean_penalty
-                                + float(config.gate_entropy_reg) * gate_entropy_penalty
+                                + (float(config.gate_std_reg) * gate_std_scale) * gate_std_penalty
+                                + (float(config.gate_mean_reg) * gate_mean_scale) * gate_mean_penalty
+                                + (float(config.gate_entropy_reg) * gate_entropy_scale) * gate_entropy_penalty
                             )
                         else:
                             gate_std_penalty = torch.zeros((), dtype=loss.dtype, device=loss.device)

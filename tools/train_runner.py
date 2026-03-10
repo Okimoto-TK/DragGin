@@ -41,6 +41,7 @@ def main() -> None:
     parser.add_argument("--hidden-dim", type=int, required=True)
     parser.add_argument("--num-heads", type=int, required=True)
     parser.add_argument("--dropout", type=float, default=0.1)
+    parser.add_argument("--use-seq-context", action="store_true", help="enable sequence context in regression head")
     parser.add_argument("--exp-name", type=str, required=True)
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--y-key", type=str, default="y")
@@ -93,6 +94,7 @@ def main() -> None:
         hidden_dim=args.hidden_dim,
         num_heads=args.num_heads,
         dropout=args.dropout,
+        use_seq_context=bool(args.use_seq_context),
         exp_name=args.exp_name,
         out_dir=args.out_dir,
         y_key=args.y_key,
