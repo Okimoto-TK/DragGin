@@ -38,10 +38,10 @@ def main() -> None:
     parser.add_argument("--gate-mean-reg", type=float, default=1e-2)
     parser.add_argument("--gate-entropy-reg", type=float, default=5e-3)
     parser.add_argument("--gate-warmup-steps", type=int, default=500)
-    parser.add_argument("--hidden-dim", type=int, required=True)
-    parser.add_argument("--num-heads", type=int, required=True)
+    parser.add_argument("--hidden-dim", type=int, default=320)
+    parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.1)
-    parser.add_argument("--use-seq-context", action="store_true", help="enable sequence context in regression head")
+    parser.add_argument("--use-seq-context", action=argparse.BooleanOptionalAction, default=True, help="enable sequence context in regression head")
     parser.add_argument("--exp-name", type=str, required=True)
     parser.add_argument("--out-dir", type=str, required=True)
     parser.add_argument("--y-key", type=str, default="y")
@@ -53,6 +53,7 @@ def main() -> None:
     parser.add_argument("--compile-mode", type=str, default="reduce-overhead", help="torch.compile mode")
     parser.add_argument("--log-every", type=int, default=10, help="log every N optimizer steps")
     parser.add_argument("--curve-save-every", type=int, default=100, help="save curve JSON every N optimizer steps")
+    parser.add_argument("--hist-every", type=int, default=100, help="write gate histograms every N optimizer steps")
     parser.add_argument("--checkpoint", type=str, default=None, help="resume training from checkpoint path")
     parser.add_argument("--save-every", type=int, default=1, help="save an epoch checkpoint every N epochs")
     parser.add_argument("--gate-lr", type=float, default=None)
@@ -107,6 +108,7 @@ def main() -> None:
         compile_mode=str(args.compile_mode),
         log_every=max(1, int(args.log_every)),
         curve_save_every=max(1, int(args.curve_save_every)),
+        hist_every=max(1, int(args.hist_every)),
         checkpoint=args.checkpoint,
         save_every=max(1, int(args.save_every)),
     )

@@ -35,7 +35,8 @@ class GatedFusion(nn.Module):
         self.gate_mlp = nn.Sequential(
             nn.Linear(6 * hidden_dim, hidden_dim),
             nn.GELU(),
-            nn.Linear(hidden_dim, 1),
+            # Vector gate: emit one logit per hidden channel for channel-wise fusion.
+            nn.Linear(hidden_dim, hidden_dim),
         )
         nn.init.zeros_(self.gate_mlp[-1].weight)
         nn.init.zeros_(self.gate_mlp[-1].bias)
@@ -73,7 +74,9 @@ class GatedFusion(nn.Module):
         gate_logits = self.gate_mlp(self.gate_norm(gate_in))
         if not torch.isfinite(gate_logits).all():
             raise RuntimeError("non-finite gate_logits")
-        g = torch.sigmoid(self.gate_temperature * gate_logits)
+        # Temperature divides logits so larger temp softens the gate response.
+        temp = max(self.gate_temperature, 1e-6)
+        g = torch.sigmoid(gate_logits / temp)
         if not torch.isfinite(g).all():
             raise RuntimeError("non-finite gate")
         if force_gate_value is not None:

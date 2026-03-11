@@ -130,6 +130,8 @@ def test_train_one_epoch_smoke(tmp_path: Path) -> None:
 
 
 def test_gate_std_penalty_zero_when_free_branch_disabled(tmp_path: Path) -> None:
+    # Stabilize tiny-run behavior across platforms for this regression check.
+    torch.manual_seed(0)
     train_path = _write_shard(tmp_path / "train_no_free.npy", n=4)
     val_path = _write_shard(tmp_path / "val_no_free.npy", n=2)
 
@@ -148,7 +150,8 @@ def test_gate_std_penalty_zero_when_free_branch_disabled(tmp_path: Path) -> None
         out_dir=str(tmp_path / "out_no_free"),
         enable_free_branch=False,
     )
-    run_training(cfg)
+    result = run_training(cfg)
+    assert result["feedback"]["meta"]["status"] == "ok"
 
     data = json.loads((Path(cfg.out_dir) / "metrics" / "curve.json").read_text(encoding="utf-8"))
     assert len(data["train"]) >= 1
