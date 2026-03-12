@@ -1059,22 +1059,22 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 _safe_add_scalar(writer, "model/micro_lambda_mean", train_row["micro_lambda_mean"], global_step)
                 _safe_add_scalar(writer, "model/mezzo_lambda_mean", train_row["mezzo_lambda_mean"], global_step)
                 _safe_add_scalar(writer, "model/macro_lambda_mean", train_row["macro_lambda_mean"], global_step)
-                _safe_add_scalar(writer, "model/gate_mean", train_row["gate_mean"], global_step)
-                _safe_add_scalar(writer, "model/gate_std", train_row["gate_std"], global_step)
-                _safe_add_scalar(writer, "model/gate_global_std", train_row["gate_global_std"], global_step)
-                _safe_add_scalar(writer, "model/gate_channel_std", train_row["gate_channel_std"], global_step)
-                _safe_add_scalar(writer, "model/gate_sample_mean_std", train_row["gate_sample_mean_std"], global_step)
-                _safe_add_scalar(writer, "model/gate_channel_mean_std", train_row["gate_channel_mean_std"], global_step)
-                _safe_add_scalar(writer, "model/gate_saturation_frac_low", train_row["gate_saturation_frac_low"], global_step)
-                _safe_add_scalar(writer, "model/gate_saturation_frac_high", train_row["gate_saturation_frac_high"], global_step)
-                _safe_add_scalar(writer, "model/gate_mid_frac", train_row["gate_mid_frac"], global_step)
-                _safe_add_scalar(writer, "model/gate_logits_mean", train_row["gate_logits_mean"], global_step)
-                _safe_add_scalar(writer, "model/gate_logits_std", train_row["gate_logits_std"], global_step)
-                _safe_add_scalar(writer, "model/gate_last_bias", train_row["gate_last_bias"], global_step)
-                _safe_add_scalar(writer, "model/gate_last_weight_norm", train_row["gate_last_weight_norm"], global_step)
-                _safe_add_scalar(writer, "model/guided_pool_norm", train_row["guided_pool_norm"], global_step)
-                _safe_add_scalar(writer, "model/free_pool_norm", train_row["free_pool_norm"], global_step)
-                _safe_add_scalar(writer, "model/guided_free_gap", train_row["guided_free_gap"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_mean", train_row["gate_mean"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_std", train_row["gate_std"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_global_std", train_row["gate_global_std"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_channel_std", train_row["gate_channel_std"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_sample_mean_std", train_row["gate_sample_mean_std"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_channel_mean_std", train_row["gate_channel_mean_std"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_saturation_frac_low", train_row["gate_saturation_frac_low"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_saturation_frac_high", train_row["gate_saturation_frac_high"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_mid_frac", train_row["gate_mid_frac"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_logits_mean", train_row["gate_logits_mean"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_logits_std", train_row["gate_logits_std"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_last_bias", train_row["gate_last_bias"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_last_weight_norm", train_row["gate_last_weight_norm"], global_step)
+                _safe_add_scalar(writer, "train_model/guided_pool_norm", train_row["guided_pool_norm"], global_step)
+                _safe_add_scalar(writer, "train_model/free_pool_norm", train_row["free_pool_norm"], global_step)
+                _safe_add_scalar(writer, "train_model/guided_free_gap", train_row["guided_free_gap"], global_step)
 
                 if global_step % max(1, int(config.hist_every)) == 0:
                     # Histograms are interval-logged to avoid oversized TensorBoard event files.
@@ -1177,6 +1177,7 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 "mse": float(val_mse_weighted_sum / denom),
                 "gate_mean": float(val_gate_stats_acc["gate_mean"] / denom),
                 "gate_global_std": float(val_gate_stats_acc["gate_global_std"] / denom),
+                "gate_std": float(val_gate_stats_acc["gate_global_std"] / denom),
                 "gate_logits_mean": float(val_gate_stats_acc["gate_logits_mean"] / denom),
                 "gate_logits_std": float(val_gate_stats_acc["gate_logits_std"] / denom),
                 "gate_channel_std": float(val_gate_stats_acc["gate_channel_std"] / denom),
@@ -1200,19 +1201,20 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
             _safe_add_scalar(writer, "val/huber", val_row["huber"], epochs_completed)
             _safe_add_scalar(writer, "val/mae", val_row["mae"], epochs_completed)
             _safe_add_scalar(writer, "val/mse", val_row["mse"], epochs_completed)
-            _safe_add_scalar(writer, "model/gate_mean", val_row["gate_mean"], epochs_completed)
-            _safe_add_scalar(writer, "model/gate_global_std", val_row["gate_global_std"], epochs_completed)
-            _safe_add_scalar(writer, "model/gate_logits_mean", val_row["gate_logits_mean"], epochs_completed)
-            _safe_add_scalar(writer, "model/gate_logits_std", val_row["gate_logits_std"], epochs_completed)
-            _safe_add_scalar(writer, "model/gate_channel_std", val_row["gate_channel_std"], epochs_completed)
-            _safe_add_scalar(writer, "model/gate_sample_mean_std", val_row["gate_sample_mean_std"], epochs_completed)
-            _safe_add_scalar(writer, "model/gate_channel_mean_std", val_row["gate_channel_mean_std"], epochs_completed)
-            _safe_add_scalar(writer, "model/gate_saturation_frac_low", val_row["gate_saturation_frac_low"], epochs_completed)
-            _safe_add_scalar(writer, "model/gate_saturation_frac_high", val_row["gate_saturation_frac_high"], epochs_completed)
-            _safe_add_scalar(writer, "model/gate_mid_frac", val_row["gate_mid_frac"], epochs_completed)
-            _safe_add_scalar(writer, "model/guided_pool_norm", val_row["guided_pool_norm"], epochs_completed)
-            _safe_add_scalar(writer, "model/free_pool_norm", val_row["free_pool_norm"], epochs_completed)
-            _safe_add_scalar(writer, "model/guided_free_gap", val_row["guided_free_gap"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_mean", val_row["gate_mean"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_std", val_row["gate_std"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_global_std", val_row["gate_global_std"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_logits_mean", val_row["gate_logits_mean"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_logits_std", val_row["gate_logits_std"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_channel_std", val_row["gate_channel_std"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_sample_mean_std", val_row["gate_sample_mean_std"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_channel_mean_std", val_row["gate_channel_mean_std"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_saturation_frac_low", val_row["gate_saturation_frac_low"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_saturation_frac_high", val_row["gate_saturation_frac_high"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_mid_frac", val_row["gate_mid_frac"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/guided_pool_norm", val_row["guided_pool_norm"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/free_pool_norm", val_row["free_pool_norm"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/guided_free_gap", val_row["guided_free_gap"], epochs_completed)
             logger.info(
                 "epoch=%d val_loss=%.6f val_huber=%.6f val_mae=%.6f val_mse=%.6f",
                 epochs_completed,
