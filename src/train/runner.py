@@ -629,6 +629,43 @@ def _compute_gate_stats(gate: torch.Tensor, gate_logits: torch.Tensor) -> dict[s
     }
 
 
+def _compute_global_pearson(y_hat: torch.Tensor, y_true: torch.Tensor) -> float:
+    if y_hat.numel() < 2 or y_true.numel() < 2:
+        return float("nan")
+    y_hat_f = y_hat.to(dtype=torch.float32)
+    y_true_f = y_true.to(dtype=torch.float32)
+    y_hat_c = y_hat_f - y_hat_f.mean()
+    y_true_c = y_true_f - y_true_f.mean()
+    denom = torch.sqrt((y_hat_c.pow(2).sum()) * (y_true_c.pow(2).sum()))
+    if not torch.isfinite(denom) or float(denom.item()) <= 0.0:
+        return float("nan")
+    corr = (y_hat_c * y_true_c).sum() / denom
+    return float(corr.detach().item()) if torch.isfinite(corr) else float("nan")
+
+
+def _compute_mean_y_true_when_yhat_gt_threshold(
+    y_hat: torch.Tensor, y_true: torch.Tensor, threshold: float = 1.0
+) -> tuple[float, int]:
+    mask = y_hat > float(threshold)
+    count = int(mask.sum().item())
+    if count <= 0:
+        return float("nan"), 0
+    value = y_true[mask].to(dtype=torch.float32).mean()
+    return (float(value.detach().item()) if torch.isfinite(value) else float("nan")), count
+
+
+def _compute_sign_acc_when_abs_yhat_gt_threshold(
+    y_hat: torch.Tensor, y_true: torch.Tensor, threshold: float = 0.5
+) -> tuple[float, int]:
+    mask = y_hat.abs() > float(threshold)
+    count = int(mask.sum().item())
+    if count <= 0:
+        return float("nan"), 0
+    correct = (y_hat[mask] > 0) == (y_true[mask] > 0)
+    acc = correct.to(dtype=torch.float32).mean()
+    return (float(acc.detach().item()) if torch.isfinite(acc) else float("nan")), count
+
+
 def _safe_add_histogram(writer: SummaryWriter, tag: str, values: torch.Tensor, step: int) -> None:
     if values is None:
         return
@@ -1108,6 +1145,8 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
             val_mae_weighted_sum = 0.0
             val_mse_weighted_sum = 0.0
             val_num_valid_total = 0
+            val_preds_chunks: list[torch.Tensor] = []
+            val_targets_chunks: list[torch.Tensor] = []
             val_gate_stats_acc = {
                 "gate_mean": 0.0,
                 "gate_global_std": 0.0,
@@ -1136,6 +1175,10 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                         gate_stats = _compute_gate_stats(gate=aux["fusion"]["gate"], gate_logits=aux["fusion"]["gate_logits"])
                         num_valid = int(val_metrics["num_valid"])
                         val_num_valid_total += num_valid
+                        valid_mask = batch["loss_mask"].to(dtype=torch.bool)
+                        if bool(valid_mask.any()):
+                            val_preds_chunks.append(y_hat[valid_mask].detach().float().cpu())
+                            val_targets_chunks.append(batch["y"][valid_mask].detach().float().cpu())
                         val_loss_weighted_sum += _weighted_metric_value(val_loss, num_valid)
                         val_huber_weighted_sum += _weighted_metric_value(val_metrics["huber"], num_valid)
                         val_mae_weighted_sum += _weighted_metric_value(val_metrics["mae"], num_valid)
@@ -1156,6 +1199,10 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                         gate_stats = _compute_gate_stats(gate=aux["fusion"]["gate"], gate_logits=aux["fusion"]["gate_logits"])
                         num_valid = int(val_metrics["num_valid"])
                         val_num_valid_total += num_valid
+                        valid_mask = batch["loss_mask"].to(dtype=torch.bool)
+                        if bool(valid_mask.any()):
+                            val_preds_chunks.append(y_hat[valid_mask].detach().float().cpu())
+                            val_targets_chunks.append(batch["y"][valid_mask].detach().float().cpu())
                         val_loss_weighted_sum += _weighted_metric_value(val_loss, num_valid)
                         val_huber_weighted_sum += _weighted_metric_value(val_metrics["huber"], num_valid)
                         val_mae_weighted_sum += _weighted_metric_value(val_metrics["mae"], num_valid)
@@ -1169,6 +1216,21 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                             val_gate_stats_acc[key] += _weighted_metric_value(gate_stats[key], num_valid)
 
             denom = max(1, int(val_num_valid_total))
+            if len(val_preds_chunks) > 0:
+                y_hat_all = torch.cat(val_preds_chunks, dim=0)
+                y_true_all = torch.cat(val_targets_chunks, dim=0)
+            else:
+                y_hat_all = torch.empty(0, dtype=torch.float32)
+                y_true_all = torch.empty(0, dtype=torch.float32)
+
+            global_pearson = _compute_global_pearson(y_hat=y_hat_all, y_true=y_true_all)
+            y_true_mean_when_yhat_gt_1, count_yhat_gt_1 = _compute_mean_y_true_when_yhat_gt_threshold(
+                y_hat=y_hat_all, y_true=y_true_all, threshold=1.0
+            )
+            sign_acc_when_abs_yhat_gt_0_5, count_abs_yhat_gt_0_5 = _compute_sign_acc_when_abs_yhat_gt_threshold(
+                y_hat=y_hat_all, y_true=y_true_all, threshold=0.5
+            )
+
             val_row = {
                 "epoch": int(epoch + 1),
                 "loss": float(val_loss_weighted_sum / denom),
@@ -1189,8 +1251,36 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 "guided_pool_norm": float(val_gate_stats_acc["guided_pool_norm"] / denom),
                 "free_pool_norm": float(val_gate_stats_acc["free_pool_norm"] / denom),
                 "guided_free_gap": float(val_gate_stats_acc["guided_free_gap"] / denom),
+                "global_pearson": float(global_pearson),
+                "y_true_mean_when_yhat_gt_1": float(y_true_mean_when_yhat_gt_1),
+                "count_yhat_gt_1": int(count_yhat_gt_1),
+                "sign_acc_when_abs_yhat_gt_0_5": float(sign_acc_when_abs_yhat_gt_0_5),
+                "count_abs_yhat_gt_0_5": int(count_abs_yhat_gt_0_5),
             }
-            if not all(_safe_scalar(v) is not None for v in val_row.values()):
+            required_val_keys = (
+                "epoch",
+                "loss",
+                "huber",
+                "mae",
+                "mse",
+                "gate_mean",
+                "gate_global_std",
+                "gate_std",
+                "gate_logits_mean",
+                "gate_logits_std",
+                "gate_channel_std",
+                "gate_sample_mean_std",
+                "gate_channel_mean_std",
+                "gate_saturation_frac_low",
+                "gate_saturation_frac_high",
+                "gate_mid_frac",
+                "guided_pool_norm",
+                "free_pool_norm",
+                "guided_free_gap",
+                "count_yhat_gt_1",
+                "count_abs_yhat_gt_0_5",
+            )
+            if not all(_safe_scalar(val_row[k]) is not None for k in required_val_keys):
                 logger.warning("skip_non_finite_val epoch=%d values=%s", epoch + 1, val_row)
                 continue
             history["val"].append(val_row)
@@ -1201,6 +1291,11 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
             _safe_add_scalar(writer, "val/huber", val_row["huber"], epochs_completed)
             _safe_add_scalar(writer, "val/mae", val_row["mae"], epochs_completed)
             _safe_add_scalar(writer, "val/mse", val_row["mse"], epochs_completed)
+            _safe_add_scalar(writer, "val/global_pearson", val_row["global_pearson"], epochs_completed)
+            _safe_add_scalar(writer, "val/y_true_mean_when_yhat_gt_1", val_row["y_true_mean_when_yhat_gt_1"], epochs_completed)
+            _safe_add_scalar(writer, "val/count_yhat_gt_1", val_row["count_yhat_gt_1"], epochs_completed)
+            _safe_add_scalar(writer, "val/sign_acc_when_abs_yhat_gt_0_5", val_row["sign_acc_when_abs_yhat_gt_0_5"], epochs_completed)
+            _safe_add_scalar(writer, "val/count_abs_yhat_gt_0_5", val_row["count_abs_yhat_gt_0_5"], epochs_completed)
             _safe_add_scalar(writer, "val_model/gate_mean", val_row["gate_mean"], epochs_completed)
             _safe_add_scalar(writer, "val_model/gate_std", val_row["gate_std"], epochs_completed)
             _safe_add_scalar(writer, "val_model/gate_global_std", val_row["gate_global_std"], epochs_completed)
@@ -1216,12 +1311,15 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
             _safe_add_scalar(writer, "val_model/free_pool_norm", val_row["free_pool_norm"], epochs_completed)
             _safe_add_scalar(writer, "val_model/guided_free_gap", val_row["guided_free_gap"], epochs_completed)
             logger.info(
-                "epoch=%d val_loss=%.6f val_huber=%.6f val_mae=%.6f val_mse=%.6f",
+                "epoch=%d val_loss=%.6f val_huber=%.6f val_mae=%.6f val_mse=%.6f pearson=%.6f ytrue@pred>1=%.6f sign_acc@|pred|>0.5=%.6f",
                 epochs_completed,
                 val_row["loss"],
                 val_row["huber"],
                 val_row["mae"],
                 val_row["mse"],
+                val_row["global_pearson"],
+                val_row["y_true_mean_when_yhat_gt_1"],
+                val_row["sign_acc_when_abs_yhat_gt_0_5"],
             )
             curve_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
 
