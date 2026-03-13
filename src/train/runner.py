@@ -269,6 +269,82 @@ def _build_row_splits(
     return _to_rows(train_indices), _to_rows(val_indices), len(train_indices), len(val_indices)
 
 
+def _build_date_row_splits(
+    shard_paths: list[str], val_ratio: float, val_embargo_days: int, y_key: str
+) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray], dict[str, int]]:
+    per_shard_dates: list[np.ndarray] = []
+    shard_sizes: list[int] = []
+    all_dates: set[str] = set()
+    for path in shard_paths:
+        shard = np.load(path, allow_pickle=True).item()
+        if y_key not in shard:
+            raise KeyError(f"y_key '{y_key}' not found in shard: {path}")
+        asof_dates = shard["asof_dates"].astype(str)
+        per_shard_dates.append(asof_dates)
+        shard_sizes.append(int(len(asof_dates)))
+        all_dates.update(asof_dates.tolist())
+        del shard
+
+    total = int(sum(shard_sizes))
+    if total < 2:
+        raise ValueError("At least 2 samples are required when val_shards is not provided.")
+
+    unique_dates = sorted(all_dates)
+    embargo_days = max(0, int(val_embargo_days))
+    ratio = float(min(max(val_ratio, 0.0), 0.99))
+    if len(unique_dates) <= embargo_days + 1:
+        raise ValueError(
+            "Insufficient unique asof_dates for date split with embargo: "
+            f"unique_dates={len(unique_dates)} embargo_days={embargo_days}"
+        )
+
+    usable_for_train_val = len(unique_dates) - embargo_days
+    val_dates_count = int(round(usable_for_train_val * ratio))
+    val_dates_count = max(1, min(usable_for_train_val - 1, val_dates_count))
+    train_dates_count = usable_for_train_val - val_dates_count
+
+    train_dates = set(unique_dates[:train_dates_count])
+    gap_dates = set(unique_dates[train_dates_count : train_dates_count + embargo_days])
+    val_dates = set(unique_dates[train_dates_count + embargo_days :])
+
+    train_rows: dict[int, np.ndarray] = {}
+    val_rows: dict[int, np.ndarray] = {}
+    train_sample_count = 0
+    val_sample_count = 0
+
+    for shard_idx, asof_dates in enumerate(per_shard_dates):
+        shard_train_rows: list[int] = []
+        shard_val_rows: list[int] = []
+        for row_idx, asof in enumerate(asof_dates.tolist()):
+            if asof in train_dates:
+                shard_train_rows.append(row_idx)
+            elif asof in val_dates:
+                shard_val_rows.append(row_idx)
+
+        if shard_train_rows:
+            train_rows[shard_idx] = np.asarray(shard_train_rows, dtype=np.int64)
+            train_sample_count += len(shard_train_rows)
+        if shard_val_rows:
+            val_rows[shard_idx] = np.asarray(shard_val_rows, dtype=np.int64)
+            val_sample_count += len(shard_val_rows)
+
+    if train_sample_count < 1 or val_sample_count < 1:
+        raise ValueError(
+            "Date split produced empty train/val samples. "
+            f"train={train_sample_count} val={val_sample_count}"
+        )
+
+    stats = {
+        "unique_dates": len(unique_dates),
+        "train_dates": len(train_dates),
+        "gap_dates": len(gap_dates),
+        "val_dates": len(val_dates),
+        "train_sample_count": int(train_sample_count),
+        "val_sample_count": int(val_sample_count),
+    }
+    return train_rows, val_rows, stats
+
+
 def collate_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "code": [sample["code"] for sample in samples],
@@ -448,6 +524,8 @@ class TrainConfig:
     scheduler_min_lr: float = 1e-6
     finite_skip_max_warn: int = 20
     val_ratio: float = 0.15
+    split_mode: str = "date"
+    val_embargo_days: int = 30
     split_seed: int = 42
     buffer: bool = False
     num_workers: int = 1
@@ -696,6 +774,7 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
 
     train_sample_count = 0
     val_sample_count = 0
+    split_stats: dict[str, int] | None = None
     if config.val_shards:
         train_loader = ShardBatchIterator(
             config.train_shards,
@@ -716,12 +795,22 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
         train_sample_count = train_loader._total_rows
         val_sample_count = val_loader._total_rows
     else:
-        train_rows, val_rows, train_sample_count, val_sample_count = _build_row_splits(
-            config.train_shards,
-            val_ratio=config.val_ratio,
-            split_seed=config.split_seed,
-            y_key=config.y_key,
-        )
+        if str(config.split_mode).lower() == "date":
+            train_rows, val_rows, split_stats = _build_date_row_splits(
+                config.train_shards,
+                val_ratio=config.val_ratio,
+                val_embargo_days=config.val_embargo_days,
+                y_key=config.y_key,
+            )
+            train_sample_count = int(split_stats["train_sample_count"])
+            val_sample_count = int(split_stats["val_sample_count"])
+        else:
+            train_rows, val_rows, train_sample_count, val_sample_count = _build_row_splits(
+                config.train_shards,
+                val_ratio=config.val_ratio,
+                split_seed=config.split_seed,
+                y_key=config.y_key,
+            )
         train_loader = ShardBatchIterator(
             config.train_shards,
             batch_size=config.batch_size,
@@ -739,6 +828,36 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
             buffer=config.buffer,
             row_indices_by_shard=val_rows,
             num_workers=config.num_workers,
+        )
+
+    if config.val_shards:
+        logger.info(
+            "dataset_split mode=explicit_val_shards val_ratio=%.4f val_embargo_days=%d train_sample_count=%d val_sample_count=%d",
+            float(config.val_ratio),
+            int(config.val_embargo_days),
+            int(train_sample_count),
+            int(val_sample_count),
+        )
+    elif split_stats is not None:
+        logger.info(
+            "dataset_split mode=date val_ratio=%.4f val_embargo_days=%d unique_dates=%d train_dates=%d gap_dates=%d val_dates=%d train_sample_count=%d val_sample_count=%d",
+            float(config.val_ratio),
+            int(config.val_embargo_days),
+            int(split_stats["unique_dates"]),
+            int(split_stats["train_dates"]),
+            int(split_stats["gap_dates"]),
+            int(split_stats["val_dates"]),
+            int(train_sample_count),
+            int(val_sample_count),
+        )
+    else:
+        logger.info(
+            "dataset_split mode=code val_ratio=%.4f val_embargo_days=%d split_seed=%d train_sample_count=%d val_sample_count=%d",
+            float(config.val_ratio),
+            int(config.val_embargo_days),
+            int(config.split_seed),
+            int(train_sample_count),
+            int(val_sample_count),
         )
 
     model = MultiScaleRegressor(
@@ -1412,4 +1531,3 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
         if raise_on_error:
             raise
         return {"history": history, "feedback": crash_feedback}
-
