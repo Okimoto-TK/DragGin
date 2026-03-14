@@ -26,6 +26,8 @@ def main() -> None:
     parser.add_argument("--train-shards", nargs="+", required=True, help="train shard paths (supports glob)")
     parser.add_argument("--val-shards", nargs="+", default=None, help="val shard paths (supports glob)")
     parser.add_argument("--val-ratio", type=float, default=0.15, help="val split ratio if --val-shards is omitted")
+    parser.add_argument("--split-mode", type=str, default="date", choices=["date", "code"], help="split mode when --val-shards is omitted")
+    parser.add_argument("--val-embargo-days", type=int, default=30, help="embargo trading days between train and val in date split")
     parser.add_argument("--batch-size", type=int, required=True)
     parser.add_argument("--grad-accum-steps", type=int, default=1)
     parser.add_argument("--num-epochs", type=int, required=True)
@@ -100,6 +102,8 @@ def main() -> None:
         out_dir=args.out_dir,
         y_key=args.y_key,
         val_ratio=args.val_ratio,
+        split_mode=str(args.split_mode),
+        val_embargo_days=max(0, int(args.val_embargo_days)),
         buffer=args.buffer,
         num_workers=max(1, int(args.num_workers)),
         pin_memory=bool(args.pin_memory),
