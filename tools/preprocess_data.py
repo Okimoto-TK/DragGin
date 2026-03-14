@@ -234,6 +234,29 @@ _DAILY_PARQUET_COLUMNS = [
     "code", "trade_date", "date", "open", "high", "low", "close", "adj_factor", "volume", "vol", "pct_chg",
 ]
 
+_MONEYFLOW_PARQUET_COLUMNS = [
+    "ts_code",
+    "trade_date",
+    "buy_sm_vol",
+    "buy_sm_amount",
+    "sell_sm_vol",
+    "sell_sm_amount",
+    "buy_md_vol",
+    "buy_md_amount",
+    "sell_md_vol",
+    "sell_md_amount",
+    "buy_lg_vol",
+    "buy_lg_amount",
+    "sell_lg_vol",
+    "sell_lg_amount",
+    "buy_elg_vol",
+    "buy_elg_amount",
+    "sell_elg_vol",
+    "sell_elg_amount",
+    "net_mf_vol",
+    "net_mf_amount",
+]
+
 
 def _process_daily_file(pq_file: Path) -> dict[str, list[pd.DataFrame]]:
     try:
@@ -245,6 +268,41 @@ def _process_daily_file(pq_file: Path) -> dict[str, list[pd.DataFrame]]:
             return {}
     if "code" not in df.columns: return {}
     norm = _normalize_daily(df)
+    return _split_by_code(norm)
+
+
+def _normalize_moneyflow(df: pd.DataFrame) -> pd.DataFrame:
+    code_col = _pick_column(df, ["code", "ts_code"])
+    date_col = _pick_column(df, ["trade_date", "date"])
+    if code_col is None or date_col is None:
+        return pd.DataFrame()
+
+    out = df.copy()
+    out = out.rename(columns={code_col: "code", date_col: "trade_date"})
+    out["code"] = out["code"].astype(str)
+    out["trade_date"] = _normalize_trade_date(out["trade_date"])
+    out = out.dropna(subset=["code", "trade_date"])
+
+    numeric_cols = [c for c in out.columns if c not in {"code", "trade_date"}]
+    for col in numeric_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    out = out.sort_values(["code", "trade_date"]).drop_duplicates(subset=["code", "trade_date"], keep="last")
+    out = out.reset_index(drop=True)
+    return out
+
+
+def _process_moneyflow_file(pq_file: Path) -> dict[str, list[pd.DataFrame]]:
+    try:
+        df = pd.read_parquet(pq_file, columns=_MONEYFLOW_PARQUET_COLUMNS)
+    except Exception:
+        try:
+            df = pd.read_parquet(pq_file)
+        except Exception:
+            return {}
+    if "ts_code" not in df.columns and "code" not in df.columns:
+        return {}
+    norm = _normalize_moneyflow(df)
     return _split_by_code(norm)
 
 
@@ -290,6 +348,25 @@ def _process_daily_chunk(chunk_files: list[Path], chunk_id: int, out_dir: Path) 
     return processed_codes
 
 
+def _process_moneyflow_chunk(chunk_files: list[Path], chunk_id: int, out_dir: Path) -> list[str]:
+    per_code_mf = defaultdict(list)
+    for f in chunk_files:
+        out = _process_moneyflow_file(f)
+        for code, dfs in out.items():
+            per_code_mf[code].extend(dfs)
+
+    processed_codes = []
+    for code, dfs in per_code_mf.items():
+        if dfs:
+            code_dir = out_dir / str(code)
+            code_dir.mkdir(parents=True, exist_ok=True)
+            mf = pd.concat(dfs, ignore_index=True)
+            mf.to_parquet(code_dir / f"mf_part_{chunk_id}.parquet", index=False)
+            processed_codes.append(code)
+
+    return processed_codes
+
+
 # =====================================================================
 # Phase 2: 直接合并各股票目录内的切片小文件 (Reduce)
 # =====================================================================
@@ -327,6 +404,19 @@ def _combine_and_write_code(code: str, out_dir: Path) -> set[pd.Timestamp]:
             m5 = m5.sort_values("dt").reset_index(drop=True)
             m5.to_parquet(code_dir / "5min.parquet", index=False)
         for p in parts_5m:
+            try:
+                p.unlink()
+            except OSError:
+                pass
+
+    parts_mf = list(code_dir.glob("mf_part_*.parquet"))
+    if parts_mf:
+        dfs = [pd.read_parquet(p) for p in parts_mf]
+        if dfs:
+            mf = pd.concat(dfs, ignore_index=True)
+            mf = mf.sort_values("trade_date").drop_duplicates(subset=["trade_date"], keep="last").reset_index(drop=True)
+            mf.to_parquet(code_dir / "moneyflow.parquet", index=False)
+        for p in parts_mf:
             try:
                 p.unlink()
             except OSError:
@@ -394,6 +484,8 @@ def _write_breakpoint_files(breakpoints: pd.DataFrame, out_dir: Path) -> None:
 def preprocess(raw_dir: Path, out_dir: Path, max_workers: int = 4) -> None:
     csv_files = sorted(raw_dir.glob("*.csv"))
     pq_files = sorted(raw_dir.glob("*.parquet"))
+    moneyflow_files = [p for p in pq_files if p.stem.endswith("_mf")]
+    daily_files = [p for p in pq_files if p not in moneyflow_files]
 
     all_codes: set[str] = set()
 
@@ -407,11 +499,19 @@ def preprocess(raw_dir: Path, out_dir: Path, max_workers: int = 4) -> None:
                 all_codes.update(future.result())
 
     chunk_size_1d = 200
-    pq_chunks = [pq_files[i:i + chunk_size_1d] for i in range(0, len(pq_files), chunk_size_1d)]
+    pq_chunks = [daily_files[i:i + chunk_size_1d] for i in range(0, len(daily_files), chunk_size_1d)]
     if pq_chunks:
         with ProcessPoolExecutor(max_workers=max_workers) as executor:
             futures = [executor.submit(_process_daily_chunk, chunk, i, out_dir) for i, chunk in enumerate(pq_chunks)]
             for future in tqdm(as_completed(futures), total=len(futures), desc="Phase 1: Parsing Daily chunks"):
+                all_codes.update(future.result())
+
+    chunk_size_mf = 200
+    mf_chunks = [moneyflow_files[i:i + chunk_size_mf] for i in range(0, len(moneyflow_files), chunk_size_mf)]
+    if mf_chunks:
+        with ProcessPoolExecutor(max_workers=max_workers) as executor:
+            futures = [executor.submit(_process_moneyflow_chunk, chunk, i, out_dir) for i, chunk in enumerate(mf_chunks)]
+            for future in tqdm(as_completed(futures), total=len(futures), desc="Phase 1: Parsing Moneyflow chunks"):
                 all_codes.update(future.result())
 
     # 2. Reduce 阶段：每只股票只要读取自身目录下的数十个切片即可 (抛弃全局跨文件搜寻，速度起飞)

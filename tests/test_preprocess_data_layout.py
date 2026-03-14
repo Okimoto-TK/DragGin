@@ -207,3 +207,52 @@ def test_preprocess_accepts_datetime_trade_time(tmp_path: Path) -> None:
     assert m5["time"].tolist() == ["09:35"]
     assert m5["open"].tolist() == [11.44]
 
+
+def test_preprocess_parses_moneyflow_parquet_to_per_code_file(tmp_path: Path) -> None:
+    raw = tmp_path / "raw"
+    out = tmp_path / "out"
+    raw.mkdir()
+    out.mkdir()
+
+    pd.DataFrame(
+        {
+            "code": ["AAA"],
+            "trade_time": ["2024-01-02 09:35"],
+            "close": [1.2],
+            "open": [1.1],
+            "high": [1.3],
+            "low": [1.0],
+            "vol": [110],
+            "date": ["20240102"],
+        }
+    ).to_csv(raw / "bars.csv", index=False)
+
+    pd.DataFrame(
+        {
+            "code": ["AAA"],
+            "date": ["20240102"],
+            "adj_factor": [1.0],
+            "open": [10.0],
+            "high": [11.0],
+            "low": [9.0],
+            "close": [10.5],
+            "volume": [1000.0],
+        }
+    ).to_parquet(raw / "daily.parquet", index=False)
+
+    pd.DataFrame(
+        {
+            "ts_code": ["AAA", "AAA", "BBB"],
+            "trade_date": ["20240102", "20240103", "20240102"],
+            "net_mf_amount": [10.0, 20.0, 30.0],
+        }
+    ).to_parquet(raw / "20240102_mf.parquet", index=False)
+
+    preprocess(raw, out)
+
+    assert (out / "AAA" / "moneyflow.parquet").exists()
+    assert (out / "BBB" / "moneyflow.parquet").exists()
+
+    mf_aaa = pd.read_parquet(out / "AAA" / "moneyflow.parquet")
+    assert mf_aaa["trade_date"].astype(str).tolist() == ["2024-01-02", "2024-01-03"]
+    assert mf_aaa["net_mf_amount"].tolist() == [10.0, 20.0]
