@@ -4,8 +4,15 @@ import argparse
 import os
 import time
 from pathlib import Path
+from typing import Iterable
 
 import pandas as pd
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    def tqdm(iterable: Iterable, **_: object) -> Iterable:
+        return iterable
 
 
 MONEYFLOW_FIELDS = [
@@ -40,7 +47,11 @@ def _get_pro_client(token: str):
 
 
 def _iter_trade_dates(start_date: str, end_date: str) -> list[str]:
-    dates = pd.date_range(start=pd.to_datetime(start_date, format="%Y%m%d"), end=pd.to_datetime(end_date, format="%Y%m%d"), freq="D")
+    dates = pd.date_range(
+        start=pd.to_datetime(start_date, format="%Y%m%d"),
+        end=pd.to_datetime(end_date, format="%Y%m%d"),
+        freq="D",
+    )
     return [d.strftime("%Y%m%d") for d in dates]
 
 
@@ -77,7 +88,8 @@ def fetch_moneyflow_range(start_date: str, end_date: str, out_dir: Path, sleep_s
     out_dir.mkdir(parents=True, exist_ok=True)
     pro = _get_pro_client(token)
 
-    for trade_date in _iter_trade_dates(start_date, end_date):
+    trade_dates = _iter_trade_dates(start_date, end_date)
+    for trade_date in tqdm(trade_dates, total=len(trade_dates), desc="Fetching Moneyflow daily parquets"):
         out_file = out_dir / f"{trade_date}_mf.parquet"
         df = _fetch_moneyflow_by_date(pro=pro, trade_date=trade_date, sleep_seconds=sleep_seconds)
         df.to_parquet(out_file, index=False)
