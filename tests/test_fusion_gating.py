@@ -49,8 +49,8 @@ def test_fusion_shapes() -> None:
 
     assert fused_seq.shape == (2, 30, hidden)
     assert fused_pool.shape == (2, hidden)
-    assert aux["gate"].shape == (2, 1)
-    assert aux["gate_logits"].shape == (2, 1)
+    assert aux["gate"].shape == (2, hidden)
+    assert aux["gate_logits"].shape == (2, hidden)
 
 
 def test_gate_one_returns_guided() -> None:

@@ -269,6 +269,82 @@ def _build_row_splits(
     return _to_rows(train_indices), _to_rows(val_indices), len(train_indices), len(val_indices)
 
 
+def _build_date_row_splits(
+    shard_paths: list[str], val_ratio: float, val_embargo_days: int, y_key: str
+) -> tuple[dict[int, np.ndarray], dict[int, np.ndarray], dict[str, int]]:
+    per_shard_dates: list[np.ndarray] = []
+    shard_sizes: list[int] = []
+    all_dates: set[str] = set()
+    for path in shard_paths:
+        shard = np.load(path, allow_pickle=True).item()
+        if y_key not in shard:
+            raise KeyError(f"y_key '{y_key}' not found in shard: {path}")
+        asof_dates = shard["asof_dates"].astype(str)
+        per_shard_dates.append(asof_dates)
+        shard_sizes.append(int(len(asof_dates)))
+        all_dates.update(asof_dates.tolist())
+        del shard
+
+    total = int(sum(shard_sizes))
+    if total < 2:
+        raise ValueError("At least 2 samples are required when val_shards is not provided.")
+
+    unique_dates = sorted(all_dates)
+    embargo_days = max(0, int(val_embargo_days))
+    ratio = float(min(max(val_ratio, 0.0), 0.99))
+    if len(unique_dates) <= embargo_days + 1:
+        raise ValueError(
+            "Insufficient unique asof_dates for date split with embargo: "
+            f"unique_dates={len(unique_dates)} embargo_days={embargo_days}"
+        )
+
+    usable_for_train_val = len(unique_dates) - embargo_days
+    val_dates_count = int(round(usable_for_train_val * ratio))
+    val_dates_count = max(1, min(usable_for_train_val - 1, val_dates_count))
+    train_dates_count = usable_for_train_val - val_dates_count
+
+    train_dates = set(unique_dates[:train_dates_count])
+    gap_dates = set(unique_dates[train_dates_count : train_dates_count + embargo_days])
+    val_dates = set(unique_dates[train_dates_count + embargo_days :])
+
+    train_rows: dict[int, np.ndarray] = {}
+    val_rows: dict[int, np.ndarray] = {}
+    train_sample_count = 0
+    val_sample_count = 0
+
+    for shard_idx, asof_dates in enumerate(per_shard_dates):
+        shard_train_rows: list[int] = []
+        shard_val_rows: list[int] = []
+        for row_idx, asof in enumerate(asof_dates.tolist()):
+            if asof in train_dates:
+                shard_train_rows.append(row_idx)
+            elif asof in val_dates:
+                shard_val_rows.append(row_idx)
+
+        if shard_train_rows:
+            train_rows[shard_idx] = np.asarray(shard_train_rows, dtype=np.int64)
+            train_sample_count += len(shard_train_rows)
+        if shard_val_rows:
+            val_rows[shard_idx] = np.asarray(shard_val_rows, dtype=np.int64)
+            val_sample_count += len(shard_val_rows)
+
+    if train_sample_count < 1 or val_sample_count < 1:
+        raise ValueError(
+            "Date split produced empty train/val samples. "
+            f"train={train_sample_count} val={val_sample_count}"
+        )
+
+    stats = {
+        "unique_dates": len(unique_dates),
+        "train_dates": len(train_dates),
+        "gap_dates": len(gap_dates),
+        "val_dates": len(val_dates),
+        "train_sample_count": int(train_sample_count),
+        "val_sample_count": int(val_sample_count),
+    }
+    return train_rows, val_rows, stats
+
+
 def collate_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
     return {
         "code": [sample["code"] for sample in samples],
@@ -353,7 +429,7 @@ class MultiScaleRegressor(nn.Module):
         init_lambda_mezzo: float = 0.8,
         init_lambda_macro: float = 0.3,
         gate_temperature: float = 1.0,
-        use_seq_context: bool = False,
+        use_seq_context: bool = True,
     ) -> None:
         super().__init__()
         self.micro_encoder = WNO1DEncoder(
@@ -438,7 +514,7 @@ class TrainConfig:
     init_lambda_micro: float = 1.5
     init_lambda_mezzo: float = 0.8
     init_lambda_macro: float = 0.3
-    use_seq_context: bool = False
+    use_seq_context: bool = True
     clip_grad_norm: float | None = None
     gate_lr: float | None = None
     gate_clip_grad_norm: float | None = 0.2
@@ -448,6 +524,8 @@ class TrainConfig:
     scheduler_min_lr: float = 1e-6
     finite_skip_max_warn: int = 20
     val_ratio: float = 0.15
+    split_mode: str = "date"
+    val_embargo_days: int = 30
     split_seed: int = 42
     buffer: bool = False
     num_workers: int = 1
@@ -457,6 +535,7 @@ class TrainConfig:
     compile_mode: str = "reduce-overhead"
     log_every: int = 10
     curve_save_every: int = 100
+    hist_every: int = 100
     checkpoint: str | None = None
     save_every: int = 1
 
@@ -588,10 +667,90 @@ def _resolve_gate_lr(config: TrainConfig) -> float:
 
 
 def _gate_reg_decay_scale(*, progress: float) -> tuple[float, float, float]:
-    """Late-phase decay for gate regularizers while keeping loss/log keys unchanged."""
+    """Late-phase decay for gate regularizers to reduce over-constraint near convergence."""
     if progress <= 0.2:
         return 1.0, 1.0, 1.0
     return 0.7, 0.3, 0.3
+
+
+
+
+def _compute_gate_stats(gate: torch.Tensor, gate_logits: torch.Tensor) -> dict[str, torch.Tensor]:
+    """Compute scalar statistics on vector gates (global over B,H unless stated otherwise)."""
+    gate_mean = gate.mean()
+    gate_global_std = gate.std(unbiased=False)
+    gate_logits_mean = gate_logits.mean()
+    gate_logits_std = gate_logits.std(unbiased=False)
+
+    # mean_b(std_h(g)): channel variation within each sample.
+    gate_channel_std = gate.std(dim=-1, unbiased=False).mean()
+    # std_b(mean_h(g)): sample-level preference variation.
+    gate_sample_mean_std = gate.mean(dim=-1).std(unbiased=False)
+    # std_h(mean_b(g)): long-term channel preference divergence.
+    gate_channel_mean_std = gate.mean(dim=0).std(unbiased=False)
+
+    gate_saturation_frac_low = (gate < 0.1).to(dtype=gate.dtype).mean()
+    gate_saturation_frac_high = (gate > 0.9).to(dtype=gate.dtype).mean()
+    gate_mid_frac = ((gate >= 0.25) & (gate <= 0.75)).to(dtype=gate.dtype).mean()
+
+    return {
+        "gate_mean": gate_mean,
+        "gate_global_std": gate_global_std,
+        "gate_logits_mean": gate_logits_mean,
+        "gate_logits_std": gate_logits_std,
+        "gate_channel_std": gate_channel_std,
+        "gate_sample_mean_std": gate_sample_mean_std,
+        "gate_channel_mean_std": gate_channel_mean_std,
+        "gate_saturation_frac_low": gate_saturation_frac_low,
+        "gate_saturation_frac_high": gate_saturation_frac_high,
+        "gate_mid_frac": gate_mid_frac,
+    }
+
+
+def _compute_global_pearson(y_hat: torch.Tensor, y_true: torch.Tensor) -> float:
+    if y_hat.numel() < 2 or y_true.numel() < 2:
+        return float("nan")
+    y_hat_f = y_hat.to(dtype=torch.float32)
+    y_true_f = y_true.to(dtype=torch.float32)
+    y_hat_c = y_hat_f - y_hat_f.mean()
+    y_true_c = y_true_f - y_true_f.mean()
+    denom = torch.sqrt((y_hat_c.pow(2).sum()) * (y_true_c.pow(2).sum()))
+    if not torch.isfinite(denom) or float(denom.item()) <= 0.0:
+        return float("nan")
+    corr = (y_hat_c * y_true_c).sum() / denom
+    return float(corr.detach().item()) if torch.isfinite(corr) else float("nan")
+
+
+def _compute_mean_y_true_when_yhat_gt_threshold(
+    y_hat: torch.Tensor, y_true: torch.Tensor, threshold: float = 1.0
+) -> tuple[float, int]:
+    mask = y_hat > float(threshold)
+    count = int(mask.sum().item())
+    if count <= 0:
+        return float("nan"), 0
+    value = y_true[mask].to(dtype=torch.float32).mean()
+    return (float(value.detach().item()) if torch.isfinite(value) else float("nan")), count
+
+
+def _compute_sign_acc_when_abs_yhat_gt_threshold(
+    y_hat: torch.Tensor, y_true: torch.Tensor, threshold: float = 0.5
+) -> tuple[float, int]:
+    mask = y_hat.abs() > float(threshold)
+    count = int(mask.sum().item())
+    if count <= 0:
+        return float("nan"), 0
+    correct = (y_hat[mask] > 0) == (y_true[mask] > 0)
+    acc = correct.to(dtype=torch.float32).mean()
+    return (float(acc.detach().item()) if torch.isfinite(acc) else float("nan")), count
+
+
+def _safe_add_histogram(writer: SummaryWriter, tag: str, values: torch.Tensor, step: int) -> None:
+    if values is None:
+        return
+    det = values.detach()
+    if det.numel() == 0 or not torch.isfinite(det).all():
+        return
+    writer.add_histogram(tag, det.to(dtype=torch.float32).flatten().cpu(), step)
 
 
 def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, Any]:
@@ -615,6 +774,7 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
 
     train_sample_count = 0
     val_sample_count = 0
+    split_stats: dict[str, int] | None = None
     if config.val_shards:
         train_loader = ShardBatchIterator(
             config.train_shards,
@@ -635,12 +795,22 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
         train_sample_count = train_loader._total_rows
         val_sample_count = val_loader._total_rows
     else:
-        train_rows, val_rows, train_sample_count, val_sample_count = _build_row_splits(
-            config.train_shards,
-            val_ratio=config.val_ratio,
-            split_seed=config.split_seed,
-            y_key=config.y_key,
-        )
+        if str(config.split_mode).lower() == "date":
+            train_rows, val_rows, split_stats = _build_date_row_splits(
+                config.train_shards,
+                val_ratio=config.val_ratio,
+                val_embargo_days=config.val_embargo_days,
+                y_key=config.y_key,
+            )
+            train_sample_count = int(split_stats["train_sample_count"])
+            val_sample_count = int(split_stats["val_sample_count"])
+        else:
+            train_rows, val_rows, train_sample_count, val_sample_count = _build_row_splits(
+                config.train_shards,
+                val_ratio=config.val_ratio,
+                split_seed=config.split_seed,
+                y_key=config.y_key,
+            )
         train_loader = ShardBatchIterator(
             config.train_shards,
             batch_size=config.batch_size,
@@ -658,6 +828,36 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
             buffer=config.buffer,
             row_indices_by_shard=val_rows,
             num_workers=config.num_workers,
+        )
+
+    if config.val_shards:
+        logger.info(
+            "dataset_split mode=explicit_val_shards val_ratio=%.4f val_embargo_days=%d train_sample_count=%d val_sample_count=%d",
+            float(config.val_ratio),
+            int(config.val_embargo_days),
+            int(train_sample_count),
+            int(val_sample_count),
+        )
+    elif split_stats is not None:
+        logger.info(
+            "dataset_split mode=date val_ratio=%.4f val_embargo_days=%d unique_dates=%d train_dates=%d gap_dates=%d val_dates=%d train_sample_count=%d val_sample_count=%d",
+            float(config.val_ratio),
+            int(config.val_embargo_days),
+            int(split_stats["unique_dates"]),
+            int(split_stats["train_dates"]),
+            int(split_stats["gap_dates"]),
+            int(split_stats["val_dates"]),
+            int(train_sample_count),
+            int(val_sample_count),
+        )
+    else:
+        logger.info(
+            "dataset_split mode=code val_ratio=%.4f val_embargo_days=%d split_seed=%d train_sample_count=%d val_sample_count=%d",
+            float(config.val_ratio),
+            int(config.val_embargo_days),
+            int(config.split_seed),
+            int(train_sample_count),
+            int(val_sample_count),
         )
 
     model = MultiScaleRegressor(
@@ -688,6 +888,7 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
         model = torch.compile(model, mode=config.compile_mode)
 
     gate_lr = _resolve_gate_lr(config)
+    gate_last_lr = float(config.lr) * 0.5
     gate_module = model.fusion.gated.gate_mlp
     gate_all_named_params = [(name, p) for name, p in gate_module.named_parameters() if p.requires_grad]
     gate_last_named_params = [(name, p) for name, p in gate_all_named_params if name.startswith("2.")]
@@ -706,7 +907,8 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
             },
             {
                 "params": [p for _, p in gate_last_named_params],
-                "lr": float(gate_lr),
+                "lr": float(gate_last_lr),
+                # Keep logits/bias calibration stable: no decay on gate output layer.
                 "weight_decay": 0.0,
                 "name": "gate_last_no_decay",
             },
@@ -743,13 +945,15 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
 
         resume_main_lr = float(config.lr)
         resume_gate_lr = _resolve_gate_lr(config)
+        resume_gate_last_lr = float(config.lr) * 0.5
         for idx, pg in enumerate(optimizer.param_groups):
             group_name = str(pg.get("name", ""))
             is_gate_group = group_name.startswith("gate_") or idx > 0
-            pg["lr"] = float(resume_gate_lr if is_gate_group else resume_main_lr)
             if group_name == "gate_last_no_decay":
+                pg["lr"] = float(resume_gate_last_lr)
                 pg["weight_decay"] = 0.0
             else:
+                pg["lr"] = float(resume_gate_lr if is_gate_group else resume_main_lr)
                 pg["weight_decay"] = float(config.weight_decay)
             if "initial_lr" in pg:
                 pg["initial_lr"] = float(pg["lr"])
@@ -839,11 +1043,15 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                         guided_pool = aux["fusion"]["guided_pool"]
                         free_pool = aux["fusion"]["free_pool"]
                         fused_pool = aux["fusion"].get("fused_pool", None)
-                        gate_mean = gate.mean()
-                        gate_std = gate.std(unbiased=False)
+                        gate_stats = _compute_gate_stats(gate=gate, gate_logits=gate_logits)
+                        gate_mean = gate_stats["gate_mean"]
+                        gate_std = gate_stats["gate_global_std"]
                         if gate_reg_enabled:
                             progress = min(1.0, float(global_step) / float(total_train_steps))
                             gate_std_scale, gate_mean_scale, gate_entropy_scale = _gate_reg_decay_scale(progress=progress)
+                            effective_gate_std_reg = float(config.gate_std_reg) * gate_std_scale
+                            effective_gate_mean_reg = float(config.gate_mean_reg) * gate_mean_scale
+                            effective_gate_entropy_reg = float(config.gate_entropy_reg) * gate_entropy_scale
                             gate_target = torch.as_tensor(config.gate_std_target, dtype=gate_std.dtype, device=gate_std.device)
                             gate_std_penalty = torch.relu(gate_target - gate_std) ** 2
                             gate_mean_target = torch.as_tensor(config.gate_mean_target, dtype=gate_mean.dtype, device=gate_mean.device)
@@ -854,14 +1062,17 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                             gate_entropy_penalty = -gate_entropy
                             total_loss = (
                                 loss
-                                + (float(config.gate_std_reg) * gate_std_scale) * gate_std_penalty
-                                + (float(config.gate_mean_reg) * gate_mean_scale) * gate_mean_penalty
-                                + (float(config.gate_entropy_reg) * gate_entropy_scale) * gate_entropy_penalty
+                                + effective_gate_std_reg * gate_std_penalty
+                                + effective_gate_mean_reg * gate_mean_penalty
+                                + effective_gate_entropy_reg * gate_entropy_penalty
                             )
                         else:
                             gate_std_penalty = torch.zeros((), dtype=loss.dtype, device=loss.device)
                             gate_mean_penalty = torch.zeros((), dtype=loss.dtype, device=loss.device)
                             gate_entropy_penalty = torch.zeros((), dtype=loss.dtype, device=loss.device)
+                            effective_gate_std_reg = 0.0
+                            effective_gate_mean_reg = 0.0
+                            effective_gate_entropy_reg = 0.0
                             total_loss = loss
                         scaled_loss = total_loss / max(1, config.grad_accum_steps)
                 except RuntimeError as exc:
@@ -955,11 +1166,21 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                     "macro_lambda_mean": float(aux["macro"]["lambda_mean"].mean().detach().item()),
                     "gate_mean": float(gate_mean.detach().item()),
                     "gate_std": float(gate_std.detach().item()),
-                    "gate_logits_mean": float(gate_logits.mean().detach().item()),
-                    "gate_logits_std": float(gate_logits.std(unbiased=False).detach().item()),
+                    "gate_global_std": float(gate_stats["gate_global_std"].detach().item()),
+                    "gate_logits_mean": float(gate_stats["gate_logits_mean"].detach().item()),
+                    "gate_logits_std": float(gate_stats["gate_logits_std"].detach().item()),
+                    "gate_channel_std": float(gate_stats["gate_channel_std"].detach().item()),
+                    "gate_sample_mean_std": float(gate_stats["gate_sample_mean_std"].detach().item()),
+                    "gate_channel_mean_std": float(gate_stats["gate_channel_mean_std"].detach().item()),
+                    "gate_saturation_frac_low": float(gate_stats["gate_saturation_frac_low"].detach().item()),
+                    "gate_saturation_frac_high": float(gate_stats["gate_saturation_frac_high"].detach().item()),
+                    "gate_mid_frac": float(gate_stats["gate_mid_frac"].detach().item()),
                     "gate_std_penalty": float(gate_std_penalty.detach().item()),
                     "gate_mean_penalty": float(gate_mean_penalty.detach().item()),
                     "gate_entropy_penalty": float(gate_entropy_penalty.detach().item()),
+                    "effective_gate_mean_reg": float(effective_gate_mean_reg),
+                    "effective_gate_std_reg": float(effective_gate_std_reg),
+                    "effective_gate_entropy_reg": float(effective_gate_entropy_reg),
                     "gate_last_bias": gate_last_bias,
                     "gate_last_weight_norm": gate_last_weight_norm,
                     "gate_last_grad_norm": gate_last_grad_norm,
@@ -980,6 +1201,9 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 _safe_add_scalar(writer, "train/gate_std_penalty", train_row["gate_std_penalty"], global_step)
                 _safe_add_scalar(writer, "train/gate_mean_penalty", train_row["gate_mean_penalty"], global_step)
                 _safe_add_scalar(writer, "train/gate_entropy_penalty", train_row["gate_entropy_penalty"], global_step)
+                _safe_add_scalar(writer, "train/effective_gate_mean_reg", train_row["effective_gate_mean_reg"], global_step)
+                _safe_add_scalar(writer, "train/effective_gate_std_reg", train_row["effective_gate_std_reg"], global_step)
+                _safe_add_scalar(writer, "train/effective_gate_entropy_reg", train_row["effective_gate_entropy_reg"], global_step)
                 _safe_add_scalar(writer, "train/huber", train_row["huber"], global_step)
                 _safe_add_scalar(writer, "train/mae", train_row["mae"], global_step)
                 _safe_add_scalar(writer, "train/mse", train_row["mse"], global_step)
@@ -991,15 +1215,29 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 _safe_add_scalar(writer, "model/micro_lambda_mean", train_row["micro_lambda_mean"], global_step)
                 _safe_add_scalar(writer, "model/mezzo_lambda_mean", train_row["mezzo_lambda_mean"], global_step)
                 _safe_add_scalar(writer, "model/macro_lambda_mean", train_row["macro_lambda_mean"], global_step)
-                _safe_add_scalar(writer, "model/gate_mean", train_row["gate_mean"], global_step)
-                _safe_add_scalar(writer, "model/gate_std", train_row["gate_std"], global_step)
-                _safe_add_scalar(writer, "model/gate_logits_mean", train_row["gate_logits_mean"], global_step)
-                _safe_add_scalar(writer, "model/gate_logits_std", train_row["gate_logits_std"], global_step)
-                _safe_add_scalar(writer, "model/gate_last_bias", train_row["gate_last_bias"], global_step)
-                _safe_add_scalar(writer, "model/gate_last_weight_norm", train_row["gate_last_weight_norm"], global_step)
-                _safe_add_scalar(writer, "model/guided_pool_norm", train_row["guided_pool_norm"], global_step)
-                _safe_add_scalar(writer, "model/free_pool_norm", train_row["free_pool_norm"], global_step)
-                _safe_add_scalar(writer, "model/guided_free_gap", train_row["guided_free_gap"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_mean", train_row["gate_mean"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_std", train_row["gate_std"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_global_std", train_row["gate_global_std"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_channel_std", train_row["gate_channel_std"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_sample_mean_std", train_row["gate_sample_mean_std"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_channel_mean_std", train_row["gate_channel_mean_std"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_saturation_frac_low", train_row["gate_saturation_frac_low"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_saturation_frac_high", train_row["gate_saturation_frac_high"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_mid_frac", train_row["gate_mid_frac"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_logits_mean", train_row["gate_logits_mean"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_logits_std", train_row["gate_logits_std"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_last_bias", train_row["gate_last_bias"], global_step)
+                _safe_add_scalar(writer, "train_model/gate_last_weight_norm", train_row["gate_last_weight_norm"], global_step)
+                _safe_add_scalar(writer, "train_model/guided_pool_norm", train_row["guided_pool_norm"], global_step)
+                _safe_add_scalar(writer, "train_model/free_pool_norm", train_row["free_pool_norm"], global_step)
+                _safe_add_scalar(writer, "train_model/guided_free_gap", train_row["guided_free_gap"], global_step)
+
+                if global_step % max(1, int(config.hist_every)) == 0:
+                    # Histograms are interval-logged to avoid oversized TensorBoard event files.
+                    _safe_add_histogram(writer, "model/gate_values_hist", gate, global_step)
+                    _safe_add_histogram(writer, "model/gate_logits_hist", gate_logits, global_step)
+                    _safe_add_histogram(writer, "model/gate_channel_mean_hist", gate.mean(dim=0), global_step)
+                    _safe_add_histogram(writer, "model/gate_channel_std_hist", gate.std(dim=0, unbiased=False), global_step)
 
                 if global_step % max(1, config.log_every) == 0:
                     logger.info("epoch=%d step=%d train_loss=%.6f valid_ratio=%.4f", epoch + 1, global_step, train_row["loss"], train_row["valid_ratio"])
@@ -1026,6 +1264,23 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
             val_mae_weighted_sum = 0.0
             val_mse_weighted_sum = 0.0
             val_num_valid_total = 0
+            val_preds_chunks: list[torch.Tensor] = []
+            val_targets_chunks: list[torch.Tensor] = []
+            val_gate_stats_acc = {
+                "gate_mean": 0.0,
+                "gate_global_std": 0.0,
+                "gate_logits_mean": 0.0,
+                "gate_logits_std": 0.0,
+                "gate_channel_std": 0.0,
+                "gate_sample_mean_std": 0.0,
+                "gate_channel_mean_std": 0.0,
+                "gate_saturation_frac_low": 0.0,
+                "gate_saturation_frac_high": 0.0,
+                "gate_mid_frac": 0.0,
+                "guided_pool_norm": 0.0,
+                "free_pool_norm": 0.0,
+                "guided_free_gap": 0.0,
+            }
             with torch.no_grad():
                 if device.type == "cuda" and config.prefetch_cuda:
                     val_prefetcher = CUDAPrefetcher(val_loader, device=device, pin_memory=config.pin_memory)
@@ -1034,36 +1289,117 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                         if batch is None:
                             break
                         with autocast(enabled=use_amp):
-                            y_hat, _ = model(batch)
+                            y_hat, aux = model(batch)
                             val_loss, val_metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
+                        gate_stats = _compute_gate_stats(gate=aux["fusion"]["gate"], gate_logits=aux["fusion"]["gate_logits"])
                         num_valid = int(val_metrics["num_valid"])
                         val_num_valid_total += num_valid
+                        valid_mask = batch["loss_mask"].to(dtype=torch.bool)
+                        if bool(valid_mask.any()):
+                            val_preds_chunks.append(y_hat[valid_mask].detach().float().cpu())
+                            val_targets_chunks.append(batch["y"][valid_mask].detach().float().cpu())
                         val_loss_weighted_sum += _weighted_metric_value(val_loss, num_valid)
                         val_huber_weighted_sum += _weighted_metric_value(val_metrics["huber"], num_valid)
                         val_mae_weighted_sum += _weighted_metric_value(val_metrics["mae"], num_valid)
                         val_mse_weighted_sum += _weighted_metric_value(val_metrics["mse"], num_valid)
+                        guided_pool = aux["fusion"]["guided_pool"]
+                        free_pool = aux["fusion"]["free_pool"]
+                        val_gate_stats_acc["guided_pool_norm"] += _weighted_metric_value(guided_pool.detach().norm(dim=-1).mean(), num_valid)
+                        val_gate_stats_acc["free_pool_norm"] += _weighted_metric_value(free_pool.detach().norm(dim=-1).mean(), num_valid)
+                        val_gate_stats_acc["guided_free_gap"] += _weighted_metric_value(torch.abs(guided_pool - free_pool).mean(), num_valid)
+                        for key in ("gate_mean", "gate_global_std", "gate_logits_mean", "gate_logits_std", "gate_channel_std", "gate_sample_mean_std", "gate_channel_mean_std", "gate_saturation_frac_low", "gate_saturation_frac_high", "gate_mid_frac"):
+                            val_gate_stats_acc[key] += _weighted_metric_value(gate_stats[key], num_valid)
                 else:
                     for raw_batch in val_loader:
                         batch = _to_device(raw_batch, device, pin_memory=config.pin_memory)
                         with autocast(enabled=use_amp):
-                            y_hat, _ = model(batch)
+                            y_hat, aux = model(batch)
                             val_loss, val_metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
+                        gate_stats = _compute_gate_stats(gate=aux["fusion"]["gate"], gate_logits=aux["fusion"]["gate_logits"])
                         num_valid = int(val_metrics["num_valid"])
                         val_num_valid_total += num_valid
+                        valid_mask = batch["loss_mask"].to(dtype=torch.bool)
+                        if bool(valid_mask.any()):
+                            val_preds_chunks.append(y_hat[valid_mask].detach().float().cpu())
+                            val_targets_chunks.append(batch["y"][valid_mask].detach().float().cpu())
                         val_loss_weighted_sum += _weighted_metric_value(val_loss, num_valid)
                         val_huber_weighted_sum += _weighted_metric_value(val_metrics["huber"], num_valid)
                         val_mae_weighted_sum += _weighted_metric_value(val_metrics["mae"], num_valid)
                         val_mse_weighted_sum += _weighted_metric_value(val_metrics["mse"], num_valid)
+                        guided_pool = aux["fusion"]["guided_pool"]
+                        free_pool = aux["fusion"]["free_pool"]
+                        val_gate_stats_acc["guided_pool_norm"] += _weighted_metric_value(guided_pool.detach().norm(dim=-1).mean(), num_valid)
+                        val_gate_stats_acc["free_pool_norm"] += _weighted_metric_value(free_pool.detach().norm(dim=-1).mean(), num_valid)
+                        val_gate_stats_acc["guided_free_gap"] += _weighted_metric_value(torch.abs(guided_pool - free_pool).mean(), num_valid)
+                        for key in ("gate_mean", "gate_global_std", "gate_logits_mean", "gate_logits_std", "gate_channel_std", "gate_sample_mean_std", "gate_channel_mean_std", "gate_saturation_frac_low", "gate_saturation_frac_high", "gate_mid_frac"):
+                            val_gate_stats_acc[key] += _weighted_metric_value(gate_stats[key], num_valid)
 
             denom = max(1, int(val_num_valid_total))
+            if len(val_preds_chunks) > 0:
+                y_hat_all = torch.cat(val_preds_chunks, dim=0)
+                y_true_all = torch.cat(val_targets_chunks, dim=0)
+            else:
+                y_hat_all = torch.empty(0, dtype=torch.float32)
+                y_true_all = torch.empty(0, dtype=torch.float32)
+
+            global_pearson = _compute_global_pearson(y_hat=y_hat_all, y_true=y_true_all)
+            y_true_mean_when_yhat_gt_1, count_yhat_gt_1 = _compute_mean_y_true_when_yhat_gt_threshold(
+                y_hat=y_hat_all, y_true=y_true_all, threshold=1.0
+            )
+            sign_acc_when_abs_yhat_gt_0_5, count_abs_yhat_gt_0_5 = _compute_sign_acc_when_abs_yhat_gt_threshold(
+                y_hat=y_hat_all, y_true=y_true_all, threshold=0.5
+            )
+
             val_row = {
                 "epoch": int(epoch + 1),
                 "loss": float(val_loss_weighted_sum / denom),
                 "huber": float(val_huber_weighted_sum / denom),
                 "mae": float(val_mae_weighted_sum / denom),
                 "mse": float(val_mse_weighted_sum / denom),
+                "gate_mean": float(val_gate_stats_acc["gate_mean"] / denom),
+                "gate_global_std": float(val_gate_stats_acc["gate_global_std"] / denom),
+                "gate_std": float(val_gate_stats_acc["gate_global_std"] / denom),
+                "gate_logits_mean": float(val_gate_stats_acc["gate_logits_mean"] / denom),
+                "gate_logits_std": float(val_gate_stats_acc["gate_logits_std"] / denom),
+                "gate_channel_std": float(val_gate_stats_acc["gate_channel_std"] / denom),
+                "gate_sample_mean_std": float(val_gate_stats_acc["gate_sample_mean_std"] / denom),
+                "gate_channel_mean_std": float(val_gate_stats_acc["gate_channel_mean_std"] / denom),
+                "gate_saturation_frac_low": float(val_gate_stats_acc["gate_saturation_frac_low"] / denom),
+                "gate_saturation_frac_high": float(val_gate_stats_acc["gate_saturation_frac_high"] / denom),
+                "gate_mid_frac": float(val_gate_stats_acc["gate_mid_frac"] / denom),
+                "guided_pool_norm": float(val_gate_stats_acc["guided_pool_norm"] / denom),
+                "free_pool_norm": float(val_gate_stats_acc["free_pool_norm"] / denom),
+                "guided_free_gap": float(val_gate_stats_acc["guided_free_gap"] / denom),
+                "global_pearson": float(global_pearson),
+                "y_true_mean_when_yhat_gt_1": float(y_true_mean_when_yhat_gt_1),
+                "count_yhat_gt_1": int(count_yhat_gt_1),
+                "sign_acc_when_abs_yhat_gt_0_5": float(sign_acc_when_abs_yhat_gt_0_5),
+                "count_abs_yhat_gt_0_5": int(count_abs_yhat_gt_0_5),
             }
-            if not all(_safe_scalar(v) is not None for v in val_row.values()):
+            required_val_keys = (
+                "epoch",
+                "loss",
+                "huber",
+                "mae",
+                "mse",
+                "gate_mean",
+                "gate_global_std",
+                "gate_std",
+                "gate_logits_mean",
+                "gate_logits_std",
+                "gate_channel_std",
+                "gate_sample_mean_std",
+                "gate_channel_mean_std",
+                "gate_saturation_frac_low",
+                "gate_saturation_frac_high",
+                "gate_mid_frac",
+                "guided_pool_norm",
+                "free_pool_norm",
+                "guided_free_gap",
+                "count_yhat_gt_1",
+                "count_abs_yhat_gt_0_5",
+            )
+            if not all(_safe_scalar(val_row[k]) is not None for k in required_val_keys):
                 logger.warning("skip_non_finite_val epoch=%d values=%s", epoch + 1, val_row)
                 continue
             history["val"].append(val_row)
@@ -1074,13 +1410,35 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
             _safe_add_scalar(writer, "val/huber", val_row["huber"], epochs_completed)
             _safe_add_scalar(writer, "val/mae", val_row["mae"], epochs_completed)
             _safe_add_scalar(writer, "val/mse", val_row["mse"], epochs_completed)
+            _safe_add_scalar(writer, "val/global_pearson", val_row["global_pearson"], epochs_completed)
+            _safe_add_scalar(writer, "val/y_true_mean_when_yhat_gt_1", val_row["y_true_mean_when_yhat_gt_1"], epochs_completed)
+            _safe_add_scalar(writer, "val/count_yhat_gt_1", val_row["count_yhat_gt_1"], epochs_completed)
+            _safe_add_scalar(writer, "val/sign_acc_when_abs_yhat_gt_0_5", val_row["sign_acc_when_abs_yhat_gt_0_5"], epochs_completed)
+            _safe_add_scalar(writer, "val/count_abs_yhat_gt_0_5", val_row["count_abs_yhat_gt_0_5"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_mean", val_row["gate_mean"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_std", val_row["gate_std"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_global_std", val_row["gate_global_std"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_logits_mean", val_row["gate_logits_mean"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_logits_std", val_row["gate_logits_std"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_channel_std", val_row["gate_channel_std"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_sample_mean_std", val_row["gate_sample_mean_std"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_channel_mean_std", val_row["gate_channel_mean_std"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_saturation_frac_low", val_row["gate_saturation_frac_low"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_saturation_frac_high", val_row["gate_saturation_frac_high"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/gate_mid_frac", val_row["gate_mid_frac"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/guided_pool_norm", val_row["guided_pool_norm"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/free_pool_norm", val_row["free_pool_norm"], epochs_completed)
+            _safe_add_scalar(writer, "val_model/guided_free_gap", val_row["guided_free_gap"], epochs_completed)
             logger.info(
-                "epoch=%d val_loss=%.6f val_huber=%.6f val_mae=%.6f val_mse=%.6f",
+                "epoch=%d val_loss=%.6f val_huber=%.6f val_mae=%.6f val_mse=%.6f pearson=%.6f ytrue@pred>1=%.6f sign_acc@|pred|>0.5=%.6f",
                 epochs_completed,
                 val_row["loss"],
                 val_row["huber"],
                 val_row["mae"],
                 val_row["mse"],
+                val_row["global_pearson"],
+                val_row["y_true_mean_when_yhat_gt_1"],
+                val_row["sign_acc_when_abs_yhat_gt_0_5"],
             )
             curve_path.write_text(json.dumps(history, indent=2), encoding="utf-8")
 
@@ -1173,4 +1531,3 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
         if raise_on_error:
             raise
         return {"history": history, "feedback": crash_feedback}
-

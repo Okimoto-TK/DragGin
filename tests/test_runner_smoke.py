@@ -18,9 +18,10 @@ from src.train.runner import (
 
 def _write_shard(path: Path, n: int = 3, all_loss_mask_false: bool = False) -> str:
     rng = np.random.default_rng(7)
+    base = np.datetime64("2024-01-01")
     shard = {
         "codes": np.array([f"C{i:03d}" for i in range(n)], dtype=object),
-        "asof_dates": np.array([f"2024-01-{i+1:02d}" for i in range(n)], dtype=object),
+        "asof_dates": np.array([(base + np.timedelta64(i, "D")).astype(str) for i in range(n)], dtype=object),
         "X_micro": rng.normal(size=(n, 48, 6)).astype(np.float32),
         "X_mezzo": rng.normal(size=(n, 40, 6)).astype(np.float32),
         "X_macro": rng.normal(size=(n, 30, 6)).astype(np.float32),
@@ -130,6 +131,8 @@ def test_train_one_epoch_smoke(tmp_path: Path) -> None:
 
 
 def test_gate_std_penalty_zero_when_free_branch_disabled(tmp_path: Path) -> None:
+    # Stabilize tiny-run behavior across platforms for this regression check.
+    torch.manual_seed(0)
     train_path = _write_shard(tmp_path / "train_no_free.npy", n=4)
     val_path = _write_shard(tmp_path / "val_no_free.npy", n=2)
 
@@ -148,7 +151,8 @@ def test_gate_std_penalty_zero_when_free_branch_disabled(tmp_path: Path) -> None
         out_dir=str(tmp_path / "out_no_free"),
         enable_free_branch=False,
     )
-    run_training(cfg)
+    result = run_training(cfg)
+    assert result["feedback"]["meta"]["status"] == "ok"
 
     data = json.loads((Path(cfg.out_dir) / "metrics" / "curve.json").read_text(encoding="utf-8"))
     assert len(data["train"]) >= 1
@@ -195,12 +199,40 @@ def test_train_one_epoch_with_val_ratio_split(tmp_path: Path) -> None:
         dropout=0.1,
         exp_name="smoke_ratio",
         out_dir=str(tmp_path / "out_ratio"),
+        split_mode="code",
     )
     result = run_training(cfg)
 
     assert result["feedback"]["meta"]["status"] == "ok"
     assert result["feedback"]["data"]["train_samples"] == 8
     assert result["feedback"]["data"]["val_samples"] == 2
+
+
+def test_train_one_epoch_with_date_split_and_embargo(tmp_path: Path) -> None:
+    train_path = _write_shard(tmp_path / "train_only_date.npy", n=100)
+
+    cfg = TrainConfig(
+        train_shards=[train_path],
+        val_shards=[],
+        val_ratio=0.2,
+        split_mode="date",
+        val_embargo_days=30,
+        batch_size=8,
+        grad_accum_steps=1,
+        num_epochs=1,
+        lr=1e-3,
+        weight_decay=1e-4,
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.1,
+        exp_name="smoke_date_split",
+        out_dir=str(tmp_path / "out_date_split"),
+    )
+    result = run_training(cfg)
+
+    assert result["feedback"]["meta"]["status"] == "ok"
+    assert result["feedback"]["data"]["train_samples"] == 56
+    assert result["feedback"]["data"]["val_samples"] == 14
 
 
 
@@ -539,4 +571,3 @@ def test_unscale_called_even_without_global_clip(tmp_path: Path, monkeypatch) ->
     run_training(cfg)
     assert "unscale" in calls
     assert calls.index("unscale") < calls.index("step")
-
