@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable
 
@@ -80,19 +81,31 @@ def _fetch_moneyflow_by_date(pro, trade_date: str, sleep_seconds: float = 0.0) -
     return out.reset_index(drop=True)
 
 
-def fetch_moneyflow_range(start_date: str, end_date: str, out_dir: Path, sleep_seconds: float = 0.0) -> None:
+def _fetch_and_write_single_date(token: str, out_dir: Path, trade_date: str, sleep_seconds: float = 0.0) -> None:
+    pro = _get_pro_client(token)
+    out_file = out_dir / f"{trade_date}_mf.parquet"
+    df = _fetch_moneyflow_by_date(pro=pro, trade_date=trade_date, sleep_seconds=sleep_seconds)
+    df.to_parquet(out_file, index=False)
+
+
+def fetch_moneyflow_range(start_date: str, end_date: str, out_dir: Path, sleep_seconds: float = 0.0, max_workers: int = 4) -> None:
     token = os.getenv("TUSHARE_TOKEN", "").strip()
     if not token:
         raise RuntimeError("TUSHARE_TOKEN is required")
 
     out_dir.mkdir(parents=True, exist_ok=True)
-    pro = _get_pro_client(token)
 
     trade_dates = _iter_trade_dates(start_date, end_date)
-    for trade_date in tqdm(trade_dates, total=len(trade_dates), desc="Fetching Moneyflow daily parquets"):
-        out_file = out_dir / f"{trade_date}_mf.parquet"
-        df = _fetch_moneyflow_by_date(pro=pro, trade_date=trade_date, sleep_seconds=sleep_seconds)
-        df.to_parquet(out_file, index=False)
+    if not trade_dates:
+        return
+
+    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
+        futures = [
+            executor.submit(_fetch_and_write_single_date, token, out_dir, trade_date, sleep_seconds)
+            for trade_date in trade_dates
+        ]
+        for future in tqdm(as_completed(futures), total=len(futures), desc="Phase 1: Fetching Moneyflow chunks"):
+            future.result()
 
 
 def main() -> None:
@@ -101,6 +114,7 @@ def main() -> None:
     parser.add_argument("--et", required=True, help="End date in YYYYmmdd")
     parser.add_argument("--out-dir", required=True, help="Output directory path")
     parser.add_argument("--sleep", type=float, default=0.0, help="Sleep seconds between paginated requests")
+    parser.add_argument("--max-workers", type=int, default=4, help="Maximum worker threads for fetching dates")
     args = parser.parse_args()
 
     fetch_moneyflow_range(
@@ -108,6 +122,7 @@ def main() -> None:
         end_date=args.et,
         out_dir=Path(args.out_dir),
         sleep_seconds=max(0.0, args.sleep),
+        max_workers=max(1, args.max_workers),
     )
 
 
