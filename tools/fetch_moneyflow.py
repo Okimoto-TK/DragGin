@@ -3,7 +3,7 @@ from __future__ import annotations
 import argparse
 import os
 import time
-from concurrent.futures import FIRST_EXCEPTION, ThreadPoolExecutor, wait
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable
 
@@ -142,18 +142,17 @@ def fetch_moneyflow_range(start_date: str, end_date: str, out_dir: Path, sleep_s
             executor.submit(_fetch_and_write_single_date, token, out_dir, trade_date, sleep_seconds, MAX_RETRIES)
             for trade_date in trade_dates
         ]
+        future_set = set(futures)
 
-        pending = set(futures)
         with tqdm(total=len(futures), desc="Phase 1: Fetching Moneyflow chunks") as pbar:
-            while pending:
-                done, pending = wait(pending, return_when=FIRST_EXCEPTION)
-                for future in done:
-                    pbar.update(1)
-                    exc = future.exception()
-                    if exc is not None:
-                        for p in pending:
-                            p.cancel()
-                        raise exc
+            for future in as_completed(futures):
+                pbar.update(1)
+                exc = future.exception()
+                if exc is not None:
+                    for pending in future_set:
+                        if pending is not future:
+                            pending.cancel()
+                    raise exc
 
 
 def main() -> None:
