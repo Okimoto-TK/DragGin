@@ -156,8 +156,11 @@ def _build_flow_features(data_dir: str | Path, code: str, asof: str) -> tuple[np
     if len(w) != 30:
         return _invalid_flow()
 
-    volume = w["volume"].to_numpy(dtype=np.float64)
-    if (~np.isfinite(volume)).any() or (volume <= 0).any():
+    # daily.volume unit: shares(股); moneyflow *_vol unit: lots(手, 100 shares)
+    # normalize to same unit before ratio computation.
+    volume_shares = w["volume"].to_numpy(dtype=np.float64)
+    volume_lots = volume_shares / 100.0
+    if (~np.isfinite(volume_lots)).any() or (volume_lots <= 0).any():
         return _invalid_flow()
 
     net = w["net_mf_vol"].to_numpy(dtype=np.float64)
@@ -165,7 +168,7 @@ def _build_flow_features(data_dir: str | Path, code: str, asof: str) -> tuple[np
     elg = (w["buy_elg_vol"] - w["sell_elg_vol"]).to_numpy(dtype=np.float64)
     lg_elg = (w["buy_lg_vol"] + w["buy_elg_vol"] - w["sell_lg_vol"] - w["sell_elg_vol"]).to_numpy(dtype=np.float64)
 
-    flow_x = np.stack([net / volume, lg / volume, elg / volume, lg_elg / volume], axis=1).astype(np.float32)
+    flow_x = np.stack([net / volume_lots, lg / volume_lots, elg / volume_lots, lg_elg / volume_lots], axis=1).astype(np.float32)
     if flow_x.shape != (30, 4) or (not np.isfinite(flow_x).all()):
         return _invalid_flow()
 
