@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 from src.model.head import masked_huber_loss
@@ -14,6 +15,41 @@ from src.train.runner import (
     run_training,
     _weighted_metric_value,
 )
+
+
+def _train_diagnostics(out_dir: Path) -> str:
+    metrics_path = out_dir / "metrics" / "curve.json"
+    log_path = out_dir / "logs" / "train.log"
+    feedback_dir = out_dir / "reports" / "feedback"
+
+    lines: list[str] = []
+    lines.append(f"metrics_exists={metrics_path.exists()}")
+    if metrics_path.exists():
+        raw = metrics_path.read_text(encoding="utf-8")
+        try:
+            data = json.loads(raw)
+            train_rows = data.get("train", [])
+            val_rows = data.get("val", [])
+            lines.append(f"curve_train_rows={len(train_rows)}")
+            lines.append(f"curve_val_rows={len(val_rows)}")
+            if len(train_rows) > 0:
+                lines.append(f"curve_last_train_row={train_rows[-1]}")
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            lines.append(f"curve_parse_error={exc}")
+            lines.append(f"curve_raw_head={raw[:1000]}")
+
+    lines.append(f"log_exists={log_path.exists()}")
+    if log_path.exists():
+        log_lines = log_path.read_text(encoding="utf-8").splitlines()
+        tail = log_lines[-80:]
+        lines.append("train_log_tail:")
+        lines.extend(tail)
+
+    lines.append(f"feedback_dir_exists={feedback_dir.exists()}")
+    if feedback_dir.exists():
+        lines.append(f"feedback_files={[p.name for p in sorted(feedback_dir.glob('*.yaml'))]}")
+
+    return "\n".join(lines)
 
 
 def _write_shard(path: Path, n: int = 3, all_loss_mask_false: bool = False) -> str:
@@ -160,8 +196,10 @@ def test_gate_std_penalty_zero_when_free_branch_disabled(tmp_path: Path) -> None
     result = run_training(cfg)
     assert result["feedback"]["meta"]["status"] == "ok"
 
-    data = json.loads((Path(cfg.out_dir) / "metrics" / "curve.json").read_text(encoding="utf-8"))
-    assert len(data["train"]) >= 1
+    out_dir = Path(cfg.out_dir)
+    data = json.loads((out_dir / "metrics" / "curve.json").read_text(encoding="utf-8"))
+    if len(data["train"]) < 1:
+        pytest.fail("expected at least 1 train row, diagnostics:\n" + _train_diagnostics(out_dir))
     for row in data["train"]:
         assert float(row["gate_std_penalty"]) == 0.0
         assert float(row["total_loss"]) == float(row["loss"])
