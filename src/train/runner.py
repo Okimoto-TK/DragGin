@@ -680,11 +680,26 @@ def _safe_add_scalar(writer: SummaryWriter, tag: str, value: float | int, step: 
         writer.add_scalar(tag, safe, step)
 
 
-def _all_grads_finite(model: nn.Module) -> bool:
-    for p in model.parameters():
-        if p.grad is not None and not _is_finite_tensor(p.grad):
-            return False
-    return True
+def _non_finite_kind(x: torch.Tensor) -> str | None:
+    has_nan = bool(torch.isnan(x).any().item())
+    has_inf = bool(torch.isinf(x).any().item())
+    if has_nan and has_inf:
+        return "nan_and_inf"
+    if has_nan:
+        return "nan"
+    if has_inf:
+        return "inf"
+    return None
+
+
+def _find_first_non_finite_grad(model: nn.Module) -> tuple[str | None, str | None]:
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            continue
+        kind = _non_finite_kind(p.grad)
+        if kind is not None:
+            return name, kind
+    return None, None
 
 
 def _resolve_gate_lr(config: TrainConfig) -> float:
@@ -1039,7 +1054,13 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
 
             finite_skip_warn_count = 0
 
-            def _warn_finite_skip(reason: str, batch: dict[str, Any], batch_idx: int) -> None:
+            def _warn_finite_skip(
+                reason: str,
+                batch: dict[str, Any],
+                batch_idx: int,
+                first_bad_grad_name: str | None = None,
+                first_bad_grad_kind: str | None = None,
+            ) -> None:
                 nonlocal finite_skip_warn_count
                 if finite_skip_warn_count >= int(config.finite_skip_max_warn):
                     return
@@ -1048,14 +1069,21 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 asof = batch.get("asof_date", [])
                 code0 = code[0] if isinstance(code, list | tuple) and len(code) > 0 else "n/a"
                 asof0 = asof[0] if isinstance(asof, list | tuple) and len(asof) > 0 else "n/a"
+                extra_suffix = ""
+                if first_bad_grad_name is not None or first_bad_grad_kind is not None:
+                    extra_suffix = (
+                        f" first_bad_grad_name={first_bad_grad_name or 'n/a'}"
+                        f" first_bad_grad_kind={first_bad_grad_kind or 'n/a'}"
+                    )
                 logger.warning(
-                    "skip_non_finite epoch=%d step=%d batch_idx=%d reason=%s code=%s asof_date=%s",
+                    "skip_non_finite epoch=%d step=%d batch_idx=%d reason=%s code=%s asof_date=%s%s",
                     epoch + 1,
                     global_step,
                     batch_idx,
                     reason,
                     str(code0),
                     str(asof0),
+                    extra_suffix,
                 )
 
             def _train_on_batch(batch: dict[str, Any], batch_idx: int) -> None:
@@ -1141,14 +1169,32 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 if scaled_loss.requires_grad:
                     scaler.unscale_(optimizer)
                     did_unscale = True
-                    if not _all_grads_finite(model):
+                    first_bad_grad_name, first_bad_grad_kind = _find_first_non_finite_grad(model)
+                    if first_bad_grad_name is not None:
                         has_non_finite = True
                     gate_weight_grad = gate_last_layer.weight.grad
                     gate_bias_grad = gate_last_layer.bias.grad
                     if not _is_finite_tensor(gate_weight_grad) or not _is_finite_tensor(gate_bias_grad):
                         has_non_finite = True
+                        if first_bad_grad_name is None:
+                            if gate_weight_grad is not None:
+                                kind = _non_finite_kind(gate_weight_grad)
+                                if kind is not None:
+                                    first_bad_grad_name = "fusion.gate_mlp.2.weight"
+                                    first_bad_grad_kind = kind
+                            if first_bad_grad_name is None and gate_bias_grad is not None:
+                                kind = _non_finite_kind(gate_bias_grad)
+                                if kind is not None:
+                                    first_bad_grad_name = "fusion.gate_mlp.2.bias"
+                                    first_bad_grad_kind = kind
                     if has_non_finite:
-                        _warn_finite_skip(reason="non_finite_grad", batch=batch, batch_idx=batch_idx)
+                        _warn_finite_skip(
+                            reason="non_finite_grad",
+                            batch=batch,
+                            batch_idx=batch_idx,
+                            first_bad_grad_name=first_bad_grad_name,
+                            first_bad_grad_kind=first_bad_grad_kind,
+                        )
                         optimizer.zero_grad(set_to_none=True)
                         scaler.update()
                         return

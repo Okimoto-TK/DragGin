@@ -53,8 +53,17 @@ class WNO1DEncoder(nn.Module):
             self.approx_gate = None
             self.detail_gates = None
 
-        self.flow_film_approx = WaveletGatedFiLM(hidden_dim=hidden_dim, flow_raw_dim=24)
-        self.flow_film_details = nn.ModuleList([WaveletGatedFiLM(hidden_dim=hidden_dim, flow_raw_dim=24) for _ in range(self.levels)])
+        cpu_rng_state = torch.random.get_rng_state()
+        cuda_rng_states: list[torch.Tensor] | None = None
+        if torch.cuda.is_available():
+            cuda_rng_states = torch.cuda.get_rng_state_all()
+        try:
+            self.flow_film_approx = WaveletGatedFiLM(hidden_dim=hidden_dim, flow_raw_dim=24)
+            self.flow_film_details = nn.ModuleList([WaveletGatedFiLM(hidden_dim=hidden_dim, flow_raw_dim=24) for _ in range(self.levels)])
+        finally:
+            torch.random.set_rng_state(cpu_rng_state)
+            if cuda_rng_states is not None:
+                torch.cuda.set_rng_state_all(cuda_rng_states)
 
     def _mask_to_channel(self, mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         return mask.unsqueeze(1).to(dtype=dtype)
