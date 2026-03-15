@@ -249,15 +249,15 @@ def test_build_train_dataset_flow_features_formula(tmp_path, monkeypatch):
 
     import pandas as pd
 
-    pd.DataFrame({"trade_date": date_str, "amount": [100.0] * 30}).to_parquet(code_dir / "daily.parquet", index=False)
+    pd.DataFrame({"trade_date": date_str, "volume": [100.0] * 30}).to_parquet(code_dir / "daily.parquet", index=False)
     pd.DataFrame(
         {
             "trade_date": date_str,
-            "net_mf_amount": [10.0] * 30,
-            "buy_lg_amount": [7.0] * 30,
-            "sell_lg_amount": [2.0] * 30,
-            "buy_elg_amount": [9.0] * 30,
-            "sell_elg_amount": [4.0] * 30,
+            "net_mf_vol": [10.0] * 30,
+            "buy_lg_vol": [7.0] * 30,
+            "sell_lg_vol": [2.0] * 30,
+            "buy_elg_vol": [9.0] * 30,
+            "sell_elg_vol": [4.0] * 30,
         }
     ).to_parquet(code_dir / "moneyflow.parquet", index=False)
 

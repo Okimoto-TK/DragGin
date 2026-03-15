@@ -88,19 +88,19 @@ def _iter_progress(iterable, total: int, show_progress: bool, desc: str):
 
 
 @lru_cache(maxsize=512)
-def _load_daily_amount(data_dir: str, code: str) -> pd.DataFrame | None:
+def _load_daily_volume(data_dir: str, code: str) -> pd.DataFrame | None:
     path = Path(data_dir) / code / "daily.parquet"
     if not path.exists():
         return None
     try:
-        d1 = pd.read_parquet(path, columns=["trade_date", "amount"])
+        d1 = pd.read_parquet(path, columns=["trade_date", "volume"])
     except Exception:
         return None
-    if "trade_date" not in d1.columns or "amount" not in d1.columns:
+    if "trade_date" not in d1.columns or "volume" not in d1.columns:
         return None
     d1["trade_date"] = pd.to_datetime(d1["trade_date"], errors="coerce").dt.date
-    d1["amount"] = pd.to_numeric(d1["amount"], errors="coerce")
-    d1 = d1.dropna(subset=["trade_date", "amount"]).sort_values("trade_date")
+    d1["volume"] = pd.to_numeric(d1["volume"], errors="coerce")
+    d1 = d1.dropna(subset=["trade_date", "volume"]).sort_values("trade_date")
     d1 = d1.drop_duplicates(subset=["trade_date"], keep="last").reset_index(drop=True)
     return d1
 
@@ -112,11 +112,11 @@ def _load_moneyflow(data_dir: str, code: str) -> pd.DataFrame | None:
         return None
     cols = [
         "trade_date",
-        "net_mf_amount",
-        "buy_lg_amount",
-        "sell_lg_amount",
-        "buy_elg_amount",
-        "sell_elg_amount",
+        "net_mf_vol",
+        "buy_lg_vol",
+        "sell_lg_vol",
+        "buy_elg_vol",
+        "sell_elg_vol",
     ]
     try:
         mf = pd.read_parquet(path, columns=cols)
@@ -138,7 +138,7 @@ def _invalid_flow() -> tuple[np.ndarray, np.ndarray, bool]:
 
 def _build_flow_features(data_dir: str | Path, code: str, asof: str) -> tuple[np.ndarray, np.ndarray, bool]:
     data_dir_key = str(Path(data_dir).resolve())
-    d1 = _load_daily_amount(data_dir_key, code)
+    d1 = _load_daily_volume(data_dir_key, code)
     mf = _load_moneyflow(data_dir_key, code)
     if d1 is None or mf is None or d1.empty or mf.empty:
         return _invalid_flow()
@@ -156,16 +156,16 @@ def _build_flow_features(data_dir: str | Path, code: str, asof: str) -> tuple[np
     if len(w) != 30:
         return _invalid_flow()
 
-    amount = w["amount"].to_numpy(dtype=np.float64)
-    if (~np.isfinite(amount)).any() or (amount <= 0).any():
+    volume = w["volume"].to_numpy(dtype=np.float64)
+    if (~np.isfinite(volume)).any() or (volume <= 0).any():
         return _invalid_flow()
 
-    net = w["net_mf_amount"].to_numpy(dtype=np.float64)
-    lg = (w["buy_lg_amount"] - w["sell_lg_amount"]).to_numpy(dtype=np.float64)
-    elg = (w["buy_elg_amount"] - w["sell_elg_amount"]).to_numpy(dtype=np.float64)
-    lg_elg = (w["buy_lg_amount"] + w["buy_elg_amount"] - w["sell_lg_amount"] - w["sell_elg_amount"]).to_numpy(dtype=np.float64)
+    net = w["net_mf_vol"].to_numpy(dtype=np.float64)
+    lg = (w["buy_lg_vol"] - w["sell_lg_vol"]).to_numpy(dtype=np.float64)
+    elg = (w["buy_elg_vol"] - w["sell_elg_vol"]).to_numpy(dtype=np.float64)
+    lg_elg = (w["buy_lg_vol"] + w["buy_elg_vol"] - w["sell_lg_vol"] - w["sell_elg_vol"]).to_numpy(dtype=np.float64)
 
-    flow_x = np.stack([net / amount, lg / amount, elg / amount, lg_elg / amount], axis=1).astype(np.float32)
+    flow_x = np.stack([net / volume, lg / volume, elg / volume, lg_elg / volume], axis=1).astype(np.float32)
     if flow_x.shape != (30, 4) or (not np.isfinite(flow_x).all()):
         return _invalid_flow()
 
@@ -249,7 +249,7 @@ def _rows_from_code_task(
     finally:
         clear_tensor_worker_cache()
         clear_label_worker_cache()
-        _load_daily_amount.cache_clear()
+        _load_daily_volume.cache_clear()
         _load_moneyflow.cache_clear()
 
 
