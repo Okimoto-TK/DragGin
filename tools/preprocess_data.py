@@ -165,6 +165,8 @@ def _normalize_daily(df: pd.DataFrame) -> pd.DataFrame:
         spread = pd.to_numeric(df["high"], errors="coerce") - pd.to_numeric(df["low"], errors="coerce")
         volume = spread.abs().fillna(0.0) + 1.0
 
+    amount = pd.to_numeric(df["amount"], errors="coerce") if "amount" in df.columns else pd.Series(pd.NA, index=df.index)
+
     out = pd.DataFrame(
         {
             "code": df[code_col],
@@ -174,6 +176,7 @@ def _normalize_daily(df: pd.DataFrame) -> pd.DataFrame:
             "low": df["low"],
             "close": df["close"],
             "volume": volume,
+            "amount": amount,
             "adj_factor": df["adj_factor"],
         }
     )
@@ -231,7 +234,7 @@ def _process_5min_file(csv_file: Path) -> dict[str, list[pd.DataFrame]]:
 
 
 _DAILY_PARQUET_COLUMNS = [
-    "code", "trade_date", "date", "open", "high", "low", "close", "adj_factor", "volume", "vol", "pct_chg",
+    "code", "trade_date", "date", "open", "high", "low", "close", "adj_factor", "volume", "vol", "pct_chg", "amount",
 ]
 
 _MONEYFLOW_PARQUET_COLUMNS = [
