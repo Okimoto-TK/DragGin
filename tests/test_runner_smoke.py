@@ -28,6 +28,8 @@ def _write_shard(path: Path, n: int = 3, all_loss_mask_false: bool = False) -> s
         "mask_micro": np.ones((n, 48), dtype=bool),
         "mask_mezzo": np.ones((n, 40), dtype=bool),
         "mask_macro": np.ones((n, 30), dtype=bool),
+        "flow_x": rng.normal(size=(n, 30, 4)).astype(np.float32),
+        "flow_mask": np.ones((n, 30), dtype=bool),
         "y": rng.normal(size=(n,)).astype(np.float32),
         "y_raw": rng.normal(size=(n,)).astype(np.float32),
         "y_z": rng.normal(size=(n,)).astype(np.float32),
@@ -47,6 +49,8 @@ def _synthetic_batch(batch_size: int = 2) -> dict:
         "mask_micro": torch.ones(batch_size, 48, dtype=torch.bool),
         "mask_mezzo": torch.ones(batch_size, 40, dtype=torch.bool),
         "mask_macro": torch.ones(batch_size, 30, dtype=torch.bool),
+        "flow_x": torch.randn(batch_size, 30, 4),
+        "flow_mask": torch.ones(batch_size, 30, dtype=torch.bool),
         "y": torch.randn(batch_size),
         "dp_ok": torch.ones(batch_size, dtype=torch.bool),
         "label_ok": torch.ones(batch_size, dtype=torch.bool),
@@ -69,6 +73,8 @@ def test_dataset_and_collate_shapes(tmp_path: Path) -> None:
     assert batch["x_micro"].shape == (2, 48, 6)
     assert batch["x_mezzo"].shape == (2, 40, 6)
     assert batch["x_macro"].shape == (2, 30, 6)
+    assert batch["flow_x"].shape == (2, 30, 4)
+    assert batch["flow_mask"].shape == (2, 30)
     assert batch["y"].shape == (2,)
     assert batch["loss_mask"].shape == (2,)
 

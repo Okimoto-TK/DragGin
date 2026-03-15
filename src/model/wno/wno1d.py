@@ -13,6 +13,8 @@ from __future__ import annotations
 import torch
 from torch import nn
 
+from src.model.flow import WaveletGatedFiLM
+
 from .soft_threshold_gate import SoftThresholdGate
 from .wavelet_ops import CoefPack, wavelet_decompose_1d, wavelet_reconstruct_1d
 
@@ -51,10 +53,19 @@ class WNO1DEncoder(nn.Module):
             self.approx_gate = None
             self.detail_gates = None
 
+        self.flow_film_approx = WaveletGatedFiLM(hidden_dim=hidden_dim, flow_raw_dim=24)
+        self.flow_film_details = nn.ModuleList([WaveletGatedFiLM(hidden_dim=hidden_dim, flow_raw_dim=24) for _ in range(self.levels)])
+
     def _mask_to_channel(self, mask: torch.Tensor, dtype: torch.dtype) -> torch.Tensor:
         return mask.unsqueeze(1).to(dtype=dtype)
 
-    def forward(self, x: torch.Tensor, mask: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor, dict]:
+    def forward(
+        self,
+        x: torch.Tensor,
+        mask: torch.Tensor,
+        flow_raw: torch.Tensor | None = None,
+        force_flow_gate_value: float | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor, dict]:
         if x.ndim != 3:
             raise ValueError("x must be shaped [B, L, C].")
         if mask.ndim != 2:
@@ -69,6 +80,17 @@ class WNO1DEncoder(nn.Module):
 
         z = self.input_proj(x_perm)
         pack = wavelet_decompose_1d(z, wavelet=self.wavelet, levels=self.levels, pad_mode=self.pad_mode)
+
+        flow_approx_aux: dict[str, torch.Tensor] | None = None
+        flow_detail_aux_list: list[dict[str, torch.Tensor]] = []
+        if flow_raw is not None:
+            pack.approx, flow_approx_aux = self.flow_film_approx(pack.approx, flow_raw, force_flow_gate_value)
+            mod_details: list[torch.Tensor] = []
+            for i, detail in enumerate(pack.details):
+                detail_mod, detail_aux = self.flow_film_details[i](detail, flow_raw, force_flow_gate_value)
+                mod_details.append(detail_mod)
+                flow_detail_aux_list.append(detail_aux)
+            pack.details = mod_details
 
         if self.enable_dynamic_threshold:
             assert self.approx_gate is not None
@@ -116,4 +138,35 @@ class WNO1DEncoder(nn.Module):
             "lambda_mean": lambda_mean,
             "lambda_max": lambda_max,
         }
+        if flow_approx_aux is None:
+            zero = torch.zeros((), dtype=h_seq.dtype, device=h_seq.device)
+            aux.update(
+                {
+                    "flow_gate_approx_mean": zero,
+                    "flow_gate_approx_std": zero,
+                    "flow_gamma_approx_mean": zero,
+                    "flow_beta_approx_mean": zero,
+                    "flow_gate_detail_mean": zero,
+                    "flow_gate_detail_std": zero,
+                    "flow_gamma_detail_mean": zero,
+                    "flow_beta_detail_mean": zero,
+                }
+            )
+        else:
+            detail_gate_mean = torch.stack([a["flow_gate_mean"] for a in flow_detail_aux_list]).mean()
+            detail_gate_std = torch.stack([a["flow_gate_std"] for a in flow_detail_aux_list]).mean()
+            detail_gamma_mean = torch.stack([a["flow_gamma_mean"] for a in flow_detail_aux_list]).mean()
+            detail_beta_mean = torch.stack([a["flow_beta_mean"] for a in flow_detail_aux_list]).mean()
+            aux.update(
+                {
+                    "flow_gate_approx_mean": flow_approx_aux["flow_gate_mean"],
+                    "flow_gate_approx_std": flow_approx_aux["flow_gate_std"],
+                    "flow_gamma_approx_mean": flow_approx_aux["flow_gamma_mean"],
+                    "flow_beta_approx_mean": flow_approx_aux["flow_beta_mean"],
+                    "flow_gate_detail_mean": detail_gate_mean,
+                    "flow_gate_detail_std": detail_gate_std,
+                    "flow_gamma_detail_mean": detail_gamma_mean,
+                    "flow_beta_detail_mean": detail_beta_mean,
+                }
+            )
         return h_seq, h_pool, aux
