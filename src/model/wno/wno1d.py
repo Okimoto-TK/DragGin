@@ -83,7 +83,9 @@ class WNO1DEncoder(nn.Module):
 
         flow_approx_aux: dict[str, torch.Tensor] | None = None
         flow_detail_aux_list: list[dict[str, torch.Tensor]] = []
-        if flow_raw is not None:
+        should_apply_flow_film = (flow_raw is not None) and (force_flow_gate_value != 0.0)
+        if should_apply_flow_film:
+            assert flow_raw is not None
             pack.approx, flow_approx_aux = self.flow_film_approx(pack.approx, flow_raw, force_flow_gate_value)
             mod_details: list[torch.Tensor] = []
             for i, detail in enumerate(pack.details):
