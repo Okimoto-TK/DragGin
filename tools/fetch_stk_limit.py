@@ -15,8 +15,9 @@ except ImportError:  # pragma: no cover
     def tqdm(iterable: Iterable, **_: object) -> Iterable:
         return iterable
 
+
 MAX_RETRIES = 5
-STK_LIMIT_FIELDS = "ts_code,trade_date,pre_close,up_limit,down_limit"
+STK_LIMIT_COLUMNS = ["ts_code", "trade_date", "pre_close", "up_limit", "down_limit"]
 
 
 def _get_pro_client(token: str):
@@ -39,15 +40,18 @@ def _iter_trade_dates(pro, start_date: str, end_date: str) -> list[str]:
     return cal["cal_date"].astype(str).sort_values().drop_duplicates().tolist()
 
 
-def _fetch_stk_limit_by_date(pro, trade_date: str, sleep_seconds: float = 0.0) -> pd.DataFrame:
+def _fetch_stk_limit_by_date(token: str, trade_date: str, sleep_seconds: float = 0.0) -> pd.DataFrame:
+    pro = _get_pro_client(token)
     last_error: Exception | None = None
+
     for attempt in range(1, MAX_RETRIES + 1):
         try:
-            df = pro.stk_limit(trade_date=trade_date, fields=STK_LIMIT_FIELDS)
+            df = pro.stk_limit(trade_date=trade_date, fields=",".join(STK_LIMIT_COLUMNS))
             if df is None or df.empty:
                 raise RuntimeError(f"Empty stk_limit response for trade_date={trade_date}")
+
             out = (
-                df.reindex(columns=STK_LIMIT_FIELDS.split(","))
+                df.reindex(columns=STK_LIMIT_COLUMNS)
                 .drop_duplicates(subset=["ts_code", "trade_date"], keep="last")
                 .sort_values(["ts_code", "trade_date"])
                 .reset_index(drop=True)
@@ -65,11 +69,24 @@ def _fetch_stk_limit_by_date(pro, trade_date: str, sleep_seconds: float = 0.0) -
     raise RuntimeError(f"Failed to fetch stk_limit for trade_date={trade_date} after {MAX_RETRIES} retries") from last_error
 
 
-def _fetch_and_write_single_date(token: str, out_dir: Path, trade_date: str, sleep_seconds: float = 0.0) -> None:
-    pro = _get_pro_client(token)
-    df = _fetch_stk_limit_by_date(pro=pro, trade_date=trade_date, sleep_seconds=sleep_seconds)
-    out_file = out_dir / f"{trade_date}_stk_limit.parquet"
-    df.to_parquet(out_file, index=False)
+def _append_code_limit(out_dir: Path, code: str, df_chunk: pd.DataFrame) -> None:
+    code_dir = out_dir / code
+    code_dir.mkdir(parents=True, exist_ok=True)
+    out_file = code_dir / "limit.parquet"
+
+    if out_file.exists():
+        old = pd.read_parquet(out_file)
+        merged = pd.concat([old, df_chunk], ignore_index=True)
+    else:
+        merged = df_chunk
+
+    merged = (
+        merged.reindex(columns=STK_LIMIT_COLUMNS)
+        .drop_duplicates(subset=["ts_code", "trade_date"], keep="last")
+        .sort_values(["trade_date"])
+        .reset_index(drop=True)
+    )
+    merged.to_parquet(out_file, index=False)
 
 
 def fetch_stk_limit_range(
@@ -92,25 +109,21 @@ def fetch_stk_limit_range(
 
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
         futures = [
-            executor.submit(_fetch_and_write_single_date, token, out_dir, trade_date, sleep_seconds)
+            executor.submit(_fetch_stk_limit_by_date, token, trade_date, sleep_seconds)
             for trade_date in trade_dates
         ]
-        future_set = set(futures)
 
         with tqdm(total=len(futures), desc="Fetching stk_limit by date") as pbar:
             for future in as_completed(futures):
                 pbar.update(1)
-                exc = future.exception()
-                if exc is not None:
-                    for pending in future_set:
-                        if pending is not future:
-                            pending.cancel()
-                    raise exc
+                df = future.result()
+                for code, group in df.groupby("ts_code", sort=False):
+                    _append_code_limit(out_dir=out_dir, code=code, df_chunk=group)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Fetch Tushare stk_limit data for each open day and save as YYYYmmdd_stk_limit.parquet",
+        description="Fetch Tushare stk_limit data and store as {ts_code}/limit.parquet",
     )
     parser.add_argument("--st", required=True, help="Start date in YYYYmmdd")
     parser.add_argument("--et", required=True, help="End date in YYYYmmdd")
