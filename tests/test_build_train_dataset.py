@@ -41,6 +41,12 @@ def _lb(label_ok: bool, loss_mask: bool) -> LabelBundle:
     )
 
 
+def _flow(ok: bool = True):
+    if ok:
+        return np.ones((30, 4), dtype=np.float32), np.ones((30,), dtype=np.uint8), True
+    return np.zeros((30, 4), dtype=np.float32), np.zeros((30,), dtype=np.uint8), False
+
+
 def test_build_train_dataset_filters_invalid(monkeypatch):
     from src.feat import build_training_dataset as btd
 
@@ -54,6 +60,7 @@ def test_build_train_dataset_filters_invalid(monkeypatch):
 
     monkeypatch.setattr(btd, "build_multiscale_tensors", fake_build_multiscale_tensors)
     monkeypatch.setattr(btd, "build_label_from_data_dir", fake_build_label_from_data_dir)
+    monkeypatch.setattr(btd, "_build_flow_features", lambda *_: _flow(True))
 
     filtered = build_train_dataset(".", ["AAA"], ["2024-01-02", "2024-01-03"], include_invalid=False, show_progress=False)
     assert filtered.y.shape == (1,)
@@ -112,6 +119,7 @@ def test_build_train_dataset_multiprocess_path(monkeypatch):
 
     monkeypatch.setattr(btd, "build_multiscale_tensors", fake_build_multiscale_tensors)
     monkeypatch.setattr(btd, "build_label_from_data_dir", fake_build_label_from_data_dir)
+    monkeypatch.setattr(btd, "_build_flow_features", lambda *_: _flow(True))
     monkeypatch.setattr(btd, "ProcessPoolExecutor", FakeExecutor)
     monkeypatch.setattr(btd, "as_completed", lambda futures: futures)
 
@@ -145,6 +153,7 @@ def test_progress_wrapper_uses_tqdm(monkeypatch):
 
     monkeypatch.setattr(btd, "build_multiscale_tensors", fake_build_multiscale_tensors)
     monkeypatch.setattr(btd, "build_label_from_data_dir", fake_build_label_from_data_dir)
+    monkeypatch.setattr(btd, "_build_flow_features", lambda *_: _flow(True))
 
     _ = build_train_dataset(
         ".",
@@ -176,6 +185,7 @@ def test_worker_cache_cleared_after_code_task(monkeypatch):
 
     monkeypatch.setattr(btd, "build_multiscale_tensors", fake_build_multiscale_tensors)
     monkeypatch.setattr(btd, "build_label_from_data_dir", fake_build_label_from_data_dir)
+    monkeypatch.setattr(btd, "_build_flow_features", lambda *_: _flow(True))
     monkeypatch.setattr(btd, "clear_tensor_worker_cache", fake_clear_tensor_worker_cache)
     monkeypatch.setattr(btd, "clear_label_worker_cache", fake_clear_label_worker_cache)
 
@@ -202,6 +212,7 @@ def test_build_train_dataset_shards_writes_per_code_files(tmp_path, monkeypatch)
 
     monkeypatch.setattr(btd, "build_multiscale_tensors", fake_build_multiscale_tensors)
     monkeypatch.setattr(btd, "build_label_from_data_dir", fake_build_label_from_data_dir)
+    monkeypatch.setattr(btd, "_build_flow_features", lambda *_: _flow(True))
 
     out_dir = tmp_path / "out"
     infos = build_train_dataset_shards(
@@ -217,3 +228,75 @@ def test_build_train_dataset_shards_writes_per_code_files(tmp_path, monkeypatch)
     assert sorted(p.name for p in out_dir.glob("*.npy")) == ["AAA.npy", "BBB.npy"]
     assert len(infos) == 2
     assert sorted(int(x["rows"]) for x in infos) == [1, 1]
+
+
+def test_build_train_dataset_flow_features_formula(tmp_path, monkeypatch):
+    from src.feat import build_training_dataset as btd
+
+    def fake_build_multiscale_tensors(data_dir, code, asof):
+        return _dp(dp_ok=True)
+
+    def fake_build_label_from_data_dir(data_dir, code, asof_date, dp_ok=True):
+        return _lb(label_ok=True, loss_mask=True)
+
+    monkeypatch.setattr(btd, "build_multiscale_tensors", fake_build_multiscale_tensors)
+    monkeypatch.setattr(btd, "build_label_from_data_dir", fake_build_label_from_data_dir)
+
+    code_dir = tmp_path / "AAA"
+    code_dir.mkdir(parents=True)
+    dates = np.array(np.arange("2024-01-01", "2024-01-31", dtype="datetime64[D]"), dtype="datetime64[D]")
+    date_str = [str(x) for x in dates]
+
+    import pandas as pd
+
+    pd.DataFrame({"trade_date": date_str, "volume": [10000.0] * 30}).to_parquet(code_dir / "daily.parquet", index=False)
+    pd.DataFrame(
+        {
+            "trade_date": date_str,
+            "net_mf_vol": [10.0] * 30,
+            "buy_lg_vol": [7.0] * 30,
+            "sell_lg_vol": [2.0] * 30,
+            "buy_elg_vol": [9.0] * 30,
+            "sell_elg_vol": [4.0] * 30,
+        }
+    ).to_parquet(code_dir / "moneyflow.parquet", index=False)
+
+    out = btd.build_train_dataset(
+        tmp_path,
+        codes=["AAA"],
+        asof_dates=["2024-01-30"],
+        include_invalid=False,
+        show_progress=False,
+    )
+    assert out.flow_x.shape == (1, 30, 4)
+    assert out.flow_mask.shape == (1, 30)
+    np.testing.assert_allclose(out.flow_x[0, :, 0], 0.1)
+    np.testing.assert_allclose(out.flow_x[0, :, 1], 0.05)
+    np.testing.assert_allclose(out.flow_x[0, :, 2], 0.05)
+    np.testing.assert_allclose(out.flow_x[0, :, 3], 0.1)
+    assert np.all(out.flow_mask[0] == 1)
+
+
+def test_build_train_dataset_invalid_when_flow_missing(monkeypatch):
+    from src.feat import build_training_dataset as btd
+
+    def fake_build_multiscale_tensors(data_dir, code, asof):
+        return _dp(dp_ok=True)
+
+    def fake_build_label_from_data_dir(data_dir, code, asof_date, dp_ok=True):
+        return _lb(label_ok=True, loss_mask=True)
+
+    monkeypatch.setattr(btd, "build_multiscale_tensors", fake_build_multiscale_tensors)
+    monkeypatch.setattr(btd, "build_label_from_data_dir", fake_build_label_from_data_dir)
+    monkeypatch.setattr(btd, "_build_flow_features", lambda *_: _flow(False))
+
+    out = btd.build_train_dataset(
+        ".",
+        codes=["AAA"],
+        asof_dates=["2024-01-02"],
+        include_invalid=True,
+        show_progress=False,
+    )
+    assert out.y.shape == (1,)
+    assert out.loss_mask.tolist() == [False]
+    assert out.dp_ok.tolist() == [False]

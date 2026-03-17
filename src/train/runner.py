@@ -20,6 +20,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import Dataset
 from torch.utils.tensorboard import SummaryWriter
 
+from src.model.flow import FlowLegendreProjectionEncoder
 from src.model.fusion import MultiScaleFusion
 from src.model.head import RegressionHead, masked_huber_loss
 from src.model.wno import WNO1DEncoder
@@ -70,6 +71,8 @@ class NpyShardDataset(Dataset):
             "mask_micro": torch.as_tensor(shard["mask_micro"][row_idx], dtype=torch.bool),
             "mask_mezzo": torch.as_tensor(shard["mask_mezzo"][row_idx], dtype=torch.bool),
             "mask_macro": torch.as_tensor(shard["mask_macro"][row_idx], dtype=torch.bool),
+            "flow_x": torch.as_tensor(shard["flow_x"][row_idx], dtype=torch.float32),
+            "flow_mask": torch.as_tensor(shard["flow_mask"][row_idx], dtype=torch.bool),
             "y": torch.as_tensor(shard[self.y_key][row_idx], dtype=torch.float32),
             "dp_ok": torch.as_tensor(shard["dp_ok"][row_idx], dtype=torch.bool),
             "label_ok": torch.as_tensor(shard["label_ok"][row_idx], dtype=torch.bool),
@@ -355,6 +358,8 @@ def collate_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "mask_micro": torch.stack([sample["mask_micro"] for sample in samples], dim=0),
         "mask_mezzo": torch.stack([sample["mask_mezzo"] for sample in samples], dim=0),
         "mask_macro": torch.stack([sample["mask_macro"] for sample in samples], dim=0),
+        "flow_x": torch.stack([sample["flow_x"] for sample in samples], dim=0),
+        "flow_mask": torch.stack([sample["flow_mask"] for sample in samples], dim=0),
         "y": torch.stack([sample["y"] for sample in samples], dim=0),
         "dp_ok": torch.stack([sample["dp_ok"] for sample in samples], dim=0),
         "label_ok": torch.stack([sample["label_ok"] for sample in samples], dim=0),
@@ -374,6 +379,8 @@ def _batch_from_shard_rows(shard: dict[str, Any], rows: np.ndarray, y_key: str) 
         "mask_micro": torch.from_numpy(np.ascontiguousarray(shard["mask_micro"][rows_contig])).to(torch.bool),
         "mask_mezzo": torch.from_numpy(np.ascontiguousarray(shard["mask_mezzo"][rows_contig])).to(torch.bool),
         "mask_macro": torch.from_numpy(np.ascontiguousarray(shard["mask_macro"][rows_contig])).to(torch.bool),
+        "flow_x": torch.from_numpy(np.ascontiguousarray(shard["flow_x"][rows_contig], dtype=np.float32)),
+        "flow_mask": torch.from_numpy(np.ascontiguousarray(shard["flow_mask"][rows_contig])).to(torch.bool),
         "y": torch.from_numpy(np.ascontiguousarray(shard[y_key][rows_contig], dtype=np.float32)),
         "dp_ok": torch.from_numpy(np.ascontiguousarray(shard["dp_ok"][rows_contig])).to(torch.bool),
         "label_ok": torch.from_numpy(np.ascontiguousarray(shard["label_ok"][rows_contig])).to(torch.bool),
@@ -409,6 +416,8 @@ def _batch_from_shard_chunks(chunks: list[tuple[dict[str, Any], np.ndarray]], y_
         "mask_micro": torch.from_numpy(_cat_contiguous("mask_micro")).to(torch.bool),
         "mask_mezzo": torch.from_numpy(_cat_contiguous("mask_mezzo")).to(torch.bool),
         "mask_macro": torch.from_numpy(_cat_contiguous("mask_macro")).to(torch.bool),
+        "flow_x": torch.from_numpy(_cat_contiguous("flow_x", np.float32)),
+        "flow_mask": torch.from_numpy(_cat_contiguous("flow_mask")).to(torch.bool),
         "y": torch.from_numpy(_cat_contiguous(y_key, np.float32)),
         "dp_ok": torch.from_numpy(_cat_contiguous("dp_ok")).to(torch.bool),
         "label_ok": torch.from_numpy(_cat_contiguous("label_ok")).to(torch.bool),
@@ -450,6 +459,7 @@ class MultiScaleRegressor(nn.Module):
             enable_dynamic_threshold=enable_dynamic_threshold,
             init_lambda=init_lambda_macro,
         )
+        self.flow_encoder = FlowLegendreProjectionEncoder(window=30, in_features=4, order=6)
 
         self.fusion = MultiScaleFusion(
             hidden_dim=hidden_dim,
@@ -464,10 +474,27 @@ class MultiScaleRegressor(nn.Module):
         self,
         batch: dict[str, torch.Tensor],
         force_gate_value: float | None = None,
+        force_flow_gate_value: float | None = None,
     ) -> tuple[torch.Tensor, dict[str, Any]]:
-        micro_seq, micro_pool, aux_micro = self.micro_encoder(batch["x_micro"], batch["mask_micro"])
-        mezzo_seq, mezzo_pool, aux_mezzo = self.mezzo_encoder(batch["x_mezzo"], batch["mask_mezzo"])
-        macro_seq, macro_pool, aux_macro = self.macro_encoder(batch["x_macro"], batch["mask_macro"])
+        flow_raw = self.flow_encoder(batch["flow_x"], batch["flow_mask"])
+        micro_seq, micro_pool, aux_micro = self.micro_encoder(
+            batch["x_micro"],
+            batch["mask_micro"],
+            flow_raw=flow_raw,
+            force_flow_gate_value=force_flow_gate_value,
+        )
+        mezzo_seq, mezzo_pool, aux_mezzo = self.mezzo_encoder(
+            batch["x_mezzo"],
+            batch["mask_mezzo"],
+            flow_raw=flow_raw,
+            force_flow_gate_value=force_flow_gate_value,
+        )
+        macro_seq, macro_pool, aux_macro = self.macro_encoder(
+            batch["x_macro"],
+            batch["mask_macro"],
+            flow_raw=flow_raw,
+            force_flow_gate_value=force_flow_gate_value,
+        )
 
         fused_seq, fused_pool, aux_fusion = self.fusion(
             micro_seq=micro_seq,
@@ -507,6 +534,7 @@ class TrainConfig:
     gate_mean_reg: float = 1e-2
     gate_entropy_reg: float = 5e-3
     gate_warmup_steps: int = 500
+    flow_gate_force_zero_all_steps: bool = False
     y_key: str = "y"
     in_dim: int = 6
     enable_dynamic_threshold: bool = True
@@ -634,6 +662,12 @@ def _weighted_metric_value(metric: torch.Tensor, num_valid: int) -> float:
     return float(metric.detach().item()) * float(max(0, int(num_valid)))
 
 
+def _resolve_force_flow_gate_value(config: TrainConfig, global_step: int) -> float | None:
+    if bool(config.flow_gate_force_zero_all_steps):
+        return 0.0
+    return 0.0 if int(global_step) < 2000 else None
+
+
 
 
 def _is_finite_tensor(x: torch.Tensor | None) -> bool:
@@ -653,11 +687,26 @@ def _safe_add_scalar(writer: SummaryWriter, tag: str, value: float | int, step: 
         writer.add_scalar(tag, safe, step)
 
 
-def _all_grads_finite(model: nn.Module) -> bool:
-    for p in model.parameters():
-        if p.grad is not None and not _is_finite_tensor(p.grad):
-            return False
-    return True
+def _non_finite_kind(x: torch.Tensor) -> str | None:
+    has_nan = bool(torch.isnan(x).any().item())
+    has_inf = bool(torch.isinf(x).any().item())
+    if has_nan and has_inf:
+        return "nan_and_inf"
+    if has_nan:
+        return "nan"
+    if has_inf:
+        return "inf"
+    return None
+
+
+def _find_first_non_finite_grad(model: nn.Module) -> tuple[str | None, str | None]:
+    for name, p in model.named_parameters():
+        if p.grad is None:
+            continue
+        kind = _non_finite_kind(p.grad)
+        if kind is not None:
+            return name, kind
+    return None, None
 
 
 def _resolve_gate_lr(config: TrainConfig) -> float:
@@ -1012,7 +1061,13 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
 
             finite_skip_warn_count = 0
 
-            def _warn_finite_skip(reason: str, batch: dict[str, Any], batch_idx: int) -> None:
+            def _warn_finite_skip(
+                reason: str,
+                batch: dict[str, Any],
+                batch_idx: int,
+                first_bad_grad_name: str | None = None,
+                first_bad_grad_kind: str | None = None,
+            ) -> None:
                 nonlocal finite_skip_warn_count
                 if finite_skip_warn_count >= int(config.finite_skip_max_warn):
                     return
@@ -1021,22 +1076,34 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 asof = batch.get("asof_date", [])
                 code0 = code[0] if isinstance(code, list | tuple) and len(code) > 0 else "n/a"
                 asof0 = asof[0] if isinstance(asof, list | tuple) and len(asof) > 0 else "n/a"
+                extra_suffix = ""
+                if first_bad_grad_name is not None or first_bad_grad_kind is not None:
+                    extra_suffix = (
+                        f" first_bad_grad_name={first_bad_grad_name or 'n/a'}"
+                        f" first_bad_grad_kind={first_bad_grad_kind or 'n/a'}"
+                    )
                 logger.warning(
-                    "skip_non_finite epoch=%d step=%d batch_idx=%d reason=%s code=%s asof_date=%s",
+                    "skip_non_finite epoch=%d step=%d batch_idx=%d reason=%s code=%s asof_date=%s%s",
                     epoch + 1,
                     global_step,
                     batch_idx,
                     reason,
                     str(code0),
                     str(asof0),
+                    extra_suffix,
                 )
 
             def _train_on_batch(batch: dict[str, Any], batch_idx: int) -> None:
                 nonlocal global_step, last_train_row
                 force_gate_value = 0.5 if global_step < int(config.gate_warmup_steps) else None
+                force_flow_gate_value = _resolve_force_flow_gate_value(config=config, global_step=global_step)
                 try:
                     with autocast(enabled=use_amp):
-                        y_hat, aux = model(batch, force_gate_value=force_gate_value)
+                        y_hat, aux = model(
+                            batch,
+                            force_gate_value=force_gate_value,
+                            force_flow_gate_value=force_flow_gate_value,
+                        )
                         loss, metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
                         gate = aux["fusion"]["gate"]
                         gate_logits = aux["fusion"]["gate_logits"]
@@ -1109,14 +1176,32 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 if scaled_loss.requires_grad:
                     scaler.unscale_(optimizer)
                     did_unscale = True
-                    if not _all_grads_finite(model):
+                    first_bad_grad_name, first_bad_grad_kind = _find_first_non_finite_grad(model)
+                    if first_bad_grad_name is not None:
                         has_non_finite = True
                     gate_weight_grad = gate_last_layer.weight.grad
                     gate_bias_grad = gate_last_layer.bias.grad
                     if not _is_finite_tensor(gate_weight_grad) or not _is_finite_tensor(gate_bias_grad):
                         has_non_finite = True
+                        if first_bad_grad_name is None:
+                            if gate_weight_grad is not None:
+                                kind = _non_finite_kind(gate_weight_grad)
+                                if kind is not None:
+                                    first_bad_grad_name = "fusion.gate_mlp.2.weight"
+                                    first_bad_grad_kind = kind
+                            if first_bad_grad_name is None and gate_bias_grad is not None:
+                                kind = _non_finite_kind(gate_bias_grad)
+                                if kind is not None:
+                                    first_bad_grad_name = "fusion.gate_mlp.2.bias"
+                                    first_bad_grad_kind = kind
                     if has_non_finite:
-                        _warn_finite_skip(reason="non_finite_grad", batch=batch, batch_idx=batch_idx)
+                        _warn_finite_skip(
+                            reason="non_finite_grad",
+                            batch=batch,
+                            batch_idx=batch_idx,
+                            first_bad_grad_name=first_bad_grad_name,
+                            first_bad_grad_kind=first_bad_grad_kind,
+                        )
                         optimizer.zero_grad(set_to_none=True)
                         scaler.update()
                         return
@@ -1188,6 +1273,19 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                     "free_pool_norm": free_pool_norm,
                     "guided_free_gap": guided_free_gap,
                     "force_gate_value": float(force_gate_value) if force_gate_value is not None else -1.0,
+                    "force_flow_gate_value": float(force_flow_gate_value) if force_flow_gate_value is not None else -1.0,
+                    "micro_flow_gate_mean": float(aux["micro"]["flow_gate_approx_mean"].detach().item()),
+                    "mezzo_flow_gate_mean": float(aux["mezzo"]["flow_gate_approx_mean"].detach().item()),
+                    "macro_flow_gate_mean": float(aux["macro"]["flow_gate_approx_mean"].detach().item()),
+                    "micro_flow_gate_std": float(aux["micro"]["flow_gate_approx_std"].detach().item()),
+                    "mezzo_flow_gate_std": float(aux["mezzo"]["flow_gate_approx_std"].detach().item()),
+                    "macro_flow_gate_std": float(aux["macro"]["flow_gate_approx_std"].detach().item()),
+                    "micro_flow_gamma_mean": float(aux["micro"]["flow_gamma_approx_mean"].detach().item()),
+                    "mezzo_flow_gamma_mean": float(aux["mezzo"]["flow_gamma_approx_mean"].detach().item()),
+                    "macro_flow_gamma_mean": float(aux["macro"]["flow_gamma_approx_mean"].detach().item()),
+                    "micro_flow_beta_mean": float(aux["micro"]["flow_beta_approx_mean"].detach().item()),
+                    "mezzo_flow_beta_mean": float(aux["mezzo"]["flow_beta_approx_mean"].detach().item()),
+                    "macro_flow_beta_mean": float(aux["macro"]["flow_beta_approx_mean"].detach().item()),
                 }
                 finite_row = all(_safe_scalar(v) is not None for v in train_row.values() if isinstance(v, float | int))
                 if not finite_row:
@@ -1209,12 +1307,25 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 _safe_add_scalar(writer, "train/mse", train_row["mse"], global_step)
                 _safe_add_scalar(writer, "train/lr", train_row["lr"], global_step)
                 _safe_add_scalar(writer, "train/force_gate_value", train_row["force_gate_value"], global_step)
+                _safe_add_scalar(writer, "train/force_flow_gate_value", train_row["force_flow_gate_value"], global_step)
                 _safe_add_scalar(writer, "train/gate_last_grad_norm", train_row["gate_last_grad_norm"], global_step)
                 _safe_add_scalar(writer, "data/num_valid", train_row["num_valid"], global_step)
                 _safe_add_scalar(writer, "data/valid_ratio", train_row["valid_ratio"], global_step)
                 _safe_add_scalar(writer, "model/micro_lambda_mean", train_row["micro_lambda_mean"], global_step)
                 _safe_add_scalar(writer, "model/mezzo_lambda_mean", train_row["mezzo_lambda_mean"], global_step)
                 _safe_add_scalar(writer, "model/macro_lambda_mean", train_row["macro_lambda_mean"], global_step)
+                _safe_add_scalar(writer, "model/micro_flow_gate_mean", train_row["micro_flow_gate_mean"], global_step)
+                _safe_add_scalar(writer, "model/mezzo_flow_gate_mean", train_row["mezzo_flow_gate_mean"], global_step)
+                _safe_add_scalar(writer, "model/macro_flow_gate_mean", train_row["macro_flow_gate_mean"], global_step)
+                _safe_add_scalar(writer, "model/micro_flow_gate_std", train_row["micro_flow_gate_std"], global_step)
+                _safe_add_scalar(writer, "model/mezzo_flow_gate_std", train_row["mezzo_flow_gate_std"], global_step)
+                _safe_add_scalar(writer, "model/macro_flow_gate_std", train_row["macro_flow_gate_std"], global_step)
+                _safe_add_scalar(writer, "model/micro_flow_gamma_mean", train_row["micro_flow_gamma_mean"], global_step)
+                _safe_add_scalar(writer, "model/mezzo_flow_gamma_mean", train_row["mezzo_flow_gamma_mean"], global_step)
+                _safe_add_scalar(writer, "model/macro_flow_gamma_mean", train_row["macro_flow_gamma_mean"], global_step)
+                _safe_add_scalar(writer, "model/micro_flow_beta_mean", train_row["micro_flow_beta_mean"], global_step)
+                _safe_add_scalar(writer, "model/mezzo_flow_beta_mean", train_row["mezzo_flow_beta_mean"], global_step)
+                _safe_add_scalar(writer, "model/macro_flow_beta_mean", train_row["macro_flow_beta_mean"], global_step)
                 _safe_add_scalar(writer, "train_model/gate_mean", train_row["gate_mean"], global_step)
                 _safe_add_scalar(writer, "train_model/gate_std", train_row["gate_std"], global_step)
                 _safe_add_scalar(writer, "train_model/gate_global_std", train_row["gate_global_std"], global_step)

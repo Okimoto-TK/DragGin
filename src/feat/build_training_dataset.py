@@ -2,10 +2,12 @@ from __future__ import annotations
 
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from dataclasses import dataclass
+from functools import lru_cache
 from pathlib import Path
 import tempfile
 
 import numpy as np
+import pandas as pd
 
 from src.feat.build_multiscale_tensor import build_calendar_from_daily_filenames
 from src.feat.build_multiscale_tensor import build_multiscale_tensors
@@ -26,9 +28,11 @@ class TrainDatasetBundle:
     X_micro: np.ndarray
     X_mezzo: np.ndarray
     X_macro: np.ndarray
+    flow_x: np.ndarray
     mask_micro: np.ndarray
     mask_mezzo: np.ndarray
     mask_macro: np.ndarray
+    flow_mask: np.ndarray
     y: np.ndarray
     y_raw: np.ndarray
     y_z: np.ndarray
@@ -44,9 +48,11 @@ def _empty_bundle() -> TrainDatasetBundle:
         X_micro=np.zeros((0, 48, 6), dtype=np.float32),
         X_mezzo=np.zeros((0, 40, 6), dtype=np.float32),
         X_macro=np.zeros((0, 30, 6), dtype=np.float32),
+        flow_x=np.zeros((0, 30, 4), dtype=np.float32),
         mask_micro=np.zeros((0, 48), dtype=np.uint8),
         mask_mezzo=np.zeros((0, 40), dtype=np.uint8),
         mask_macro=np.zeros((0, 30), dtype=np.uint8),
+        flow_mask=np.zeros((0, 30), dtype=np.uint8),
         y=np.zeros((0,), dtype=np.float32),
         y_raw=np.zeros((0,), dtype=np.float32),
         y_z=np.zeros((0,), dtype=np.float32),
@@ -81,6 +87,94 @@ def _iter_progress(iterable, total: int, show_progress: bool, desc: str):
     return iterable
 
 
+@lru_cache(maxsize=512)
+def _load_daily_volume(data_dir: str, code: str) -> pd.DataFrame | None:
+    path = Path(data_dir) / code / "daily.parquet"
+    if not path.exists():
+        return None
+    try:
+        d1 = pd.read_parquet(path, columns=["trade_date", "volume"])
+    except Exception:
+        return None
+    if "trade_date" not in d1.columns or "volume" not in d1.columns:
+        return None
+    d1["trade_date"] = pd.to_datetime(d1["trade_date"], errors="coerce").dt.date
+    d1["volume"] = pd.to_numeric(d1["volume"], errors="coerce")
+    d1 = d1.dropna(subset=["trade_date", "volume"]).sort_values("trade_date")
+    d1 = d1.drop_duplicates(subset=["trade_date"], keep="last").reset_index(drop=True)
+    return d1
+
+
+@lru_cache(maxsize=512)
+def _load_moneyflow(data_dir: str, code: str) -> pd.DataFrame | None:
+    path = Path(data_dir) / code / "moneyflow.parquet"
+    if not path.exists():
+        return None
+    cols = [
+        "trade_date",
+        "net_mf_vol",
+        "buy_lg_vol",
+        "sell_lg_vol",
+        "buy_elg_vol",
+        "sell_elg_vol",
+    ]
+    try:
+        mf = pd.read_parquet(path, columns=cols)
+    except Exception:
+        return None
+    if not set(cols).issubset(set(mf.columns)):
+        return None
+    mf["trade_date"] = pd.to_datetime(mf["trade_date"], errors="coerce").dt.date
+    for c in cols[1:]:
+        mf[c] = pd.to_numeric(mf[c], errors="coerce")
+    mf = mf.dropna(subset=cols).sort_values("trade_date")
+    mf = mf.drop_duplicates(subset=["trade_date"], keep="last").reset_index(drop=True)
+    return mf
+
+
+def _invalid_flow() -> tuple[np.ndarray, np.ndarray, bool]:
+    return np.zeros((30, 4), dtype=np.float32), np.zeros((30,), dtype=np.uint8), False
+
+
+def _build_flow_features(data_dir: str | Path, code: str, asof: str) -> tuple[np.ndarray, np.ndarray, bool]:
+    data_dir_key = str(Path(data_dir).resolve())
+    d1 = _load_daily_volume(data_dir_key, code)
+    mf = _load_moneyflow(data_dir_key, code)
+    if d1 is None or mf is None or d1.empty or mf.empty:
+        return _invalid_flow()
+
+    asof_date = pd.to_datetime(asof).date()
+    dates = d1["trade_date"].tolist()
+    if asof_date not in set(dates):
+        return _invalid_flow()
+    idx = dates.index(asof_date)
+    if idx + 1 < 30:
+        return _invalid_flow()
+
+    tail_dates = dates[idx + 1 - 30 : idx + 1]
+    w = d1[d1["trade_date"].isin(set(tail_dates))].merge(mf, on="trade_date", how="inner").sort_values("trade_date")
+    if len(w) != 30:
+        return _invalid_flow()
+
+    # daily.volume unit: shares(股); moneyflow *_vol unit: lots(手, 100 shares)
+    # normalize to same unit before ratio computation.
+    volume_shares = w["volume"].to_numpy(dtype=np.float64)
+    volume_lots = volume_shares / 100.0
+    if (~np.isfinite(volume_lots)).any() or (volume_lots <= 0).any():
+        return _invalid_flow()
+
+    net = w["net_mf_vol"].to_numpy(dtype=np.float64)
+    lg = (w["buy_lg_vol"] - w["sell_lg_vol"]).to_numpy(dtype=np.float64)
+    elg = (w["buy_elg_vol"] - w["sell_elg_vol"]).to_numpy(dtype=np.float64)
+    lg_elg = (w["buy_lg_vol"] + w["buy_elg_vol"] - w["sell_lg_vol"] - w["sell_elg_vol"]).to_numpy(dtype=np.float64)
+
+    flow_x = np.stack([net / volume_lots, lg / volume_lots, elg / volume_lots, lg_elg / volume_lots], axis=1).astype(np.float32)
+    if flow_x.shape != (30, 4) or (not np.isfinite(flow_x).all()):
+        return _invalid_flow()
+
+    return flow_x, np.ones((30,), dtype=np.uint8), True
+
+
 def _rows_from_code_task(
     data_dir: str | Path,
     code: str,
@@ -95,9 +189,11 @@ def _rows_from_code_task(
         X_micro = np.zeros((n, 48, 6), dtype=np.float32)
         X_mezzo = np.zeros((n, 40, 6), dtype=np.float32)
         X_macro = np.zeros((n, 30, 6), dtype=np.float32)
+        flow_x = np.zeros((n, 30, 4), dtype=np.float32)
         mask_micro = np.zeros((n, 48), dtype=np.uint8)
         mask_mezzo = np.zeros((n, 40), dtype=np.uint8)
         mask_macro = np.zeros((n, 30), dtype=np.uint8)
+        flow_mask = np.zeros((n, 30), dtype=np.uint8)
         y = np.zeros((n,), dtype=np.float32)
         y_raw = np.zeros((n,), dtype=np.float32)
         y_z = np.zeros((n,), dtype=np.float32)
@@ -109,7 +205,9 @@ def _rows_from_code_task(
         for asof in selected_asof_dates:
             dp = build_multiscale_tensors(data_dir, code, asof)
             lb = build_label_from_data_dir(data_dir, code, asof, dp_ok=dp.dp_ok)
-            if (not include_invalid) and (not lb.loss_mask):
+            fx, fm, flow_ok = _build_flow_features(data_dir, code, asof)
+            effective_loss_mask = bool(lb.loss_mask and flow_ok)
+            if (not include_invalid) and (not effective_loss_mask):
                 continue
 
             codes[write_idx] = code
@@ -117,15 +215,17 @@ def _rows_from_code_task(
             X_micro[write_idx] = dp.X_micro.astype(np.float32)
             X_mezzo[write_idx] = dp.X_mezzo.astype(np.float32)
             X_macro[write_idx] = dp.X_macro.astype(np.float32)
+            flow_x[write_idx] = fx.astype(np.float32)
             mask_micro[write_idx] = dp.mask_micro.astype(np.uint8)
             mask_mezzo[write_idx] = dp.mask_mezzo.astype(np.uint8)
             mask_macro[write_idx] = dp.mask_macro.astype(np.uint8)
+            flow_mask[write_idx] = fm.astype(np.uint8)
             y[write_idx] = np.float32(lb.y)
             y_raw[write_idx] = np.float32(lb.y_raw)
             y_z[write_idx] = np.float32(lb.y_z)
-            dp_ok[write_idx] = bool(dp.dp_ok)
+            dp_ok[write_idx] = bool(dp.dp_ok and flow_ok)
             label_ok[write_idx] = bool(lb.label_ok)
-            loss_mask[write_idx] = bool(lb.loss_mask)
+            loss_mask[write_idx] = effective_loss_mask
             write_idx += 1
 
         shard_path = Path(shard_dir) / f"{code}.npy"
@@ -135,9 +235,11 @@ def _rows_from_code_task(
             "X_micro": X_micro[:write_idx],
             "X_mezzo": X_mezzo[:write_idx],
             "X_macro": X_macro[:write_idx],
+            "flow_x": flow_x[:write_idx],
             "mask_micro": mask_micro[:write_idx],
             "mask_mezzo": mask_mezzo[:write_idx],
             "mask_macro": mask_macro[:write_idx],
+            "flow_mask": flow_mask[:write_idx],
             "y": y[:write_idx],
             "y_raw": y_raw[:write_idx],
             "y_z": y_z[:write_idx],
@@ -150,6 +252,8 @@ def _rows_from_code_task(
     finally:
         clear_tensor_worker_cache()
         clear_label_worker_cache()
+        _load_daily_volume.cache_clear()
+        _load_moneyflow.cache_clear()
 
 
 def _merge_shards(shard_infos: list[dict]) -> TrainDatasetBundle:
@@ -165,9 +269,11 @@ def _merge_shards(shard_infos: list[dict]) -> TrainDatasetBundle:
         "X_micro": [],
         "X_mezzo": [],
         "X_macro": [],
+        "flow_x": [],
         "mask_micro": [],
         "mask_mezzo": [],
         "mask_macro": [],
+        "flow_mask": [],
         "y": [],
         "y_raw": [],
         "y_z": [],
@@ -191,9 +297,11 @@ def _merge_shards(shard_infos: list[dict]) -> TrainDatasetBundle:
         X_micro=np.concatenate(parts["X_micro"], axis=0).astype(np.float32),
         X_mezzo=np.concatenate(parts["X_mezzo"], axis=0).astype(np.float32),
         X_macro=np.concatenate(parts["X_macro"], axis=0).astype(np.float32),
+        flow_x=np.concatenate(parts["flow_x"], axis=0).astype(np.float32),
         mask_micro=np.concatenate(parts["mask_micro"], axis=0).astype(np.uint8),
         mask_mezzo=np.concatenate(parts["mask_mezzo"], axis=0).astype(np.uint8),
         mask_macro=np.concatenate(parts["mask_macro"], axis=0).astype(np.uint8),
+        flow_mask=np.concatenate(parts["flow_mask"], axis=0).astype(np.uint8),
         y=np.concatenate(parts["y"]).astype(np.float32),
         y_raw=np.concatenate(parts["y_raw"]).astype(np.float32),
         y_z=np.concatenate(parts["y_z"]).astype(np.float32),
@@ -278,9 +386,11 @@ def save_train_dataset(bundle: TrainDatasetBundle, out_npz: str | Path) -> None:
         X_micro=bundle.X_micro,
         X_mezzo=bundle.X_mezzo,
         X_macro=bundle.X_macro,
+        flow_x=bundle.flow_x,
         mask_micro=bundle.mask_micro,
         mask_mezzo=bundle.mask_mezzo,
         mask_macro=bundle.mask_macro,
+        flow_mask=bundle.flow_mask,
         y=bundle.y,
         y_raw=bundle.y_raw,
         y_z=bundle.y_z,
