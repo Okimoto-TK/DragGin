@@ -13,6 +13,7 @@ from src.train.runner import (
     TrainConfig,
     collate_batch,
     run_training,
+    _resolve_force_flow_gate_value,
     _weighted_metric_value,
 )
 
@@ -615,3 +616,42 @@ def test_unscale_called_even_without_global_clip(tmp_path: Path, monkeypatch) ->
     run_training(cfg)
     assert "unscale" in calls
     assert calls.index("unscale") < calls.index("step")
+
+
+def test_resolve_force_flow_gate_value_respects_always_zero_switch() -> None:
+    cfg_always_zero = TrainConfig(
+        train_shards=["dummy.npy"],
+        val_shards=["dummy_val.npy"],
+        batch_size=1,
+        grad_accum_steps=1,
+        num_epochs=1,
+        lr=1e-3,
+        weight_decay=1e-4,
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        exp_name="resolve_flow_gate",
+        out_dir="/tmp/out",
+        flow_gate_force_zero_all_steps=True,
+    )
+    assert _resolve_force_flow_gate_value(cfg_always_zero, global_step=0) == 0.0
+    assert _resolve_force_flow_gate_value(cfg_always_zero, global_step=2000) == 0.0
+    assert _resolve_force_flow_gate_value(cfg_always_zero, global_step=999999) == 0.0
+
+    cfg_warmup_only = TrainConfig(
+        train_shards=["dummy.npy"],
+        val_shards=["dummy_val.npy"],
+        batch_size=1,
+        grad_accum_steps=1,
+        num_epochs=1,
+        lr=1e-3,
+        weight_decay=1e-4,
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        exp_name="resolve_flow_gate_warmup",
+        out_dir="/tmp/out2",
+    )
+    assert _resolve_force_flow_gate_value(cfg_warmup_only, global_step=0) == 0.0
+    assert _resolve_force_flow_gate_value(cfg_warmup_only, global_step=1999) == 0.0
+    assert _resolve_force_flow_gate_value(cfg_warmup_only, global_step=2000) is None

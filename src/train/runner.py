@@ -534,6 +534,7 @@ class TrainConfig:
     gate_mean_reg: float = 1e-2
     gate_entropy_reg: float = 5e-3
     gate_warmup_steps: int = 500
+    flow_gate_force_zero_all_steps: bool = False
     y_key: str = "y"
     in_dim: int = 6
     enable_dynamic_threshold: bool = True
@@ -659,6 +660,12 @@ def _write_yaml(path: Path, payload: dict[str, Any]) -> None:
 
 def _weighted_metric_value(metric: torch.Tensor, num_valid: int) -> float:
     return float(metric.detach().item()) * float(max(0, int(num_valid)))
+
+
+def _resolve_force_flow_gate_value(config: TrainConfig, global_step: int) -> float | None:
+    if bool(config.flow_gate_force_zero_all_steps):
+        return 0.0
+    return 0.0 if int(global_step) < 2000 else None
 
 
 
@@ -1089,7 +1096,7 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
             def _train_on_batch(batch: dict[str, Any], batch_idx: int) -> None:
                 nonlocal global_step, last_train_row
                 force_gate_value = 0.5 if global_step < int(config.gate_warmup_steps) else None
-                force_flow_gate_value = 0.0 if global_step < 2000 else None
+                force_flow_gate_value = _resolve_force_flow_gate_value(config=config, global_step=global_step)
                 try:
                     with autocast(enabled=use_amp):
                         y_hat, aux = model(
