@@ -3,8 +3,8 @@ from __future__ import annotations
 import argparse
 import json
 import math
-import sys
 import os
+import sys
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -39,9 +39,13 @@ class Position:
     def cost_per_share(self) -> float:
         return (self.buy_price * self.qty + self.buy_fee + self.est_sell_fee) / self.qty
 
-    @property
-    def cost_total(self) -> float:
-        return self.cost_per_share * self.qty
+
+@dataclass
+class FlowContext:
+    # 预读取后按 asof 快速切 30 日窗口，避免每次读 parquet/merge/sort。
+    daily_dates: list[str]
+    daily_date_to_idx: dict[str, int]
+    flow_by_date: dict[str, np.ndarray]
 
 
 def _commission(amount: float) -> float:
@@ -55,13 +59,6 @@ def _to_datestr(v: Any) -> str:
     return ts_.strftime("%Y-%m-%d")
 
 
-def _to_trade_datestr(v: Any) -> str:
-    ts_ = pd.to_datetime(v, errors="coerce")
-    if pd.isna(ts_):
-        raise ValueError(f"invalid date value: {v}")
-    return ts_.strftime("%Y%m%d")
-
-
 def _read_calendar_dates(data_dir: Path) -> list[str]:
     cal_path = data_dir / "calendar.parquet"
     if not cal_path.exists():
@@ -70,9 +67,8 @@ def _read_calendar_dates(data_dir: Path) -> list[str]:
     for col in ["trade_date", "cal_date", "date"]:
         if col in df.columns:
             values = sorted({_to_datestr(x) for x in df[col].dropna().tolist()})
-            if not values:
-                break
-            return values
+            if values:
+                return values
     raise ValueError(f"cannot find date column in {cal_path}")
 
 
@@ -82,46 +78,6 @@ def _resolve_codes(data_dir: Path) -> list[str]:
         if p.is_dir() and (p / "daily.parquet").exists() and (p / "5min.parquet").exists() and (p / "moneyflow.parquet").exists():
             codes.append(p.name)
     return codes
-
-
-def _build_flow_features(data_dir: Path, code: str, asof: str) -> tuple[np.ndarray, np.ndarray, bool]:
-    d1_path = data_dir / code / "daily.parquet"
-    mf_path = data_dir / code / "moneyflow.parquet"
-    if not d1_path.exists() or not mf_path.exists():
-        return np.zeros((30, 4), dtype=np.float32), np.zeros((30,), dtype=np.uint8), False
-
-    d1 = pd.read_parquet(d1_path, columns=["trade_date", "volume"])
-    mf = pd.read_parquet(mf_path, columns=["trade_date", "net_mf_vol", "buy_lg_vol", "sell_lg_vol", "buy_elg_vol", "sell_elg_vol"])
-    d1["trade_date"] = pd.to_datetime(d1["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    mf["trade_date"] = pd.to_datetime(mf["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    d1["volume"] = pd.to_numeric(d1["volume"], errors="coerce")
-    d1 = d1.dropna().sort_values("trade_date").drop_duplicates("trade_date", keep="last")
-    mf = mf.dropna().sort_values("trade_date").drop_duplicates("trade_date", keep="last")
-
-    dates = d1["trade_date"].tolist()
-    if asof not in set(dates):
-        return np.zeros((30, 4), dtype=np.float32), np.zeros((30,), dtype=np.uint8), False
-    idx = dates.index(asof)
-    if idx + 1 < 30:
-        return np.zeros((30, 4), dtype=np.float32), np.zeros((30,), dtype=np.uint8), False
-
-    tail_dates = dates[idx + 1 - 30 : idx + 1]
-    w = d1[d1["trade_date"].isin(set(tail_dates))].merge(mf, on="trade_date", how="inner").sort_values("trade_date")
-    if len(w) != 30:
-        return np.zeros((30, 4), dtype=np.float32), np.zeros((30,), dtype=np.uint8), False
-
-    volume_lots = w["volume"].to_numpy(dtype=np.float64) / 100.0
-    if (~np.isfinite(volume_lots)).any() or (volume_lots <= 0).any():
-        return np.zeros((30, 4), dtype=np.float32), np.zeros((30,), dtype=np.uint8), False
-
-    net = w["net_mf_vol"].to_numpy(dtype=np.float64)
-    lg = (w["buy_lg_vol"] - w["sell_lg_vol"]).to_numpy(dtype=np.float64)
-    elg = (w["buy_elg_vol"] - w["sell_elg_vol"]).to_numpy(dtype=np.float64)
-    lg_elg = (w["buy_lg_vol"] + w["buy_elg_vol"] - w["sell_lg_vol"] - w["sell_elg_vol"]).to_numpy(dtype=np.float64)
-    flow_x = np.stack([net / volume_lots, lg / volume_lots, elg / volume_lots, lg_elg / volume_lots], axis=1).astype(np.float32)
-    if flow_x.shape != (30, 4) or (not np.isfinite(flow_x).all()):
-        return np.zeros((30, 4), dtype=np.float32), np.zeros((30,), dtype=np.uint8), False
-    return flow_x, np.ones((30,), dtype=np.uint8), True
 
 
 def _expand_paths(raw_paths: list[str]) -> list[str]:
@@ -168,6 +124,136 @@ def _load_daily_map(data_dir: Path, code: str) -> dict[str, dict[str, float]]:
     out: dict[str, dict[str, float]] = {}
     for _, row in df.iterrows():
         out[str(row["trade_date"])] = {"open": float(row["open"]), "high": float(row["high"]), "low": float(row["low"]), "close": float(row["close"])}
+    return out
+
+
+def _build_flow_context(data_dir: Path, code: str) -> FlowContext | None:
+    d1_path = data_dir / code / "daily.parquet"
+    mf_path = data_dir / code / "moneyflow.parquet"
+    if not d1_path.exists() or not mf_path.exists():
+        return None
+
+    d1 = pd.read_parquet(d1_path, columns=["trade_date", "volume"])
+    mf = pd.read_parquet(mf_path, columns=["trade_date", "net_mf_vol", "buy_lg_vol", "sell_lg_vol", "buy_elg_vol", "sell_elg_vol"])
+
+    d1["trade_date"] = pd.to_datetime(d1["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    d1["volume"] = pd.to_numeric(d1["volume"], errors="coerce")
+    d1 = d1.dropna().sort_values("trade_date").drop_duplicates("trade_date", keep="last")
+    if d1.empty:
+        return None
+
+    mf["trade_date"] = pd.to_datetime(mf["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    for c in ["net_mf_vol", "buy_lg_vol", "sell_lg_vol", "buy_elg_vol", "sell_elg_vol"]:
+        mf[c] = pd.to_numeric(mf[c], errors="coerce")
+    mf = mf.dropna().sort_values("trade_date").drop_duplicates("trade_date", keep="last")
+    if mf.empty:
+        return None
+
+    mf_map: dict[str, np.ndarray] = {}
+    for _, row in mf.iterrows():
+        mf_map[str(row["trade_date"])] = np.asarray(
+            [
+                float(row["net_mf_vol"]),
+                float(row["buy_lg_vol"] - row["sell_lg_vol"]),
+                float(row["buy_elg_vol"] - row["sell_elg_vol"]),
+                float(row["buy_lg_vol"] + row["buy_elg_vol"] - row["sell_lg_vol"] - row["sell_elg_vol"]),
+            ],
+            dtype=np.float64,
+        )
+
+    daily_dates = d1["trade_date"].astype(str).tolist()
+    flow_by_date: dict[str, np.ndarray] = {}
+    for _, row in d1.iterrows():
+        d = str(row["trade_date"])
+        if d not in mf_map:
+            continue
+        volume_lots = float(row["volume"]) / 100.0
+        if (not np.isfinite(volume_lots)) or volume_lots <= 0:
+            continue
+        vec = mf_map[d] / volume_lots
+        if np.isfinite(vec).all():
+            flow_by_date[d] = vec.astype(np.float32)
+
+    return FlowContext(
+        daily_dates=daily_dates,
+        daily_date_to_idx={d: i for i, d in enumerate(daily_dates)},
+        flow_by_date=flow_by_date,
+    )
+
+
+def _flow_window_from_context(ctx: FlowContext | None, asof: str) -> tuple[np.ndarray, np.ndarray, bool]:
+    if ctx is None:
+        return np.zeros((30, 4), dtype=np.float32), np.zeros((30,), dtype=np.uint8), False
+    idx = ctx.daily_date_to_idx.get(asof)
+    if idx is None or idx + 1 < 30:
+        return np.zeros((30, 4), dtype=np.float32), np.zeros((30,), dtype=np.uint8), False
+    tail_dates = ctx.daily_dates[idx + 1 - 30 : idx + 1]
+    rows: list[np.ndarray] = []
+    for d in tail_dates:
+        vec = ctx.flow_by_date.get(d)
+        if vec is None:
+            return np.zeros((30, 4), dtype=np.float32), np.zeros((30,), dtype=np.uint8), False
+        rows.append(vec)
+    flow_x = np.stack(rows, axis=0).astype(np.float32)
+    if flow_x.shape != (30, 4) or (not np.isfinite(flow_x).all()):
+        return np.zeros((30, 4), dtype=np.float32), np.zeros((30,), dtype=np.uint8), False
+    return flow_x, np.ones((30,), dtype=np.uint8), True
+
+
+def _infer_scores_for_code(
+    *,
+    model: MultiScaleRegressor,
+    device: torch.device,
+    data_dir: Path,
+    code: str,
+    asof_dates: list[str],
+    flow_ctx: FlowContext | None,
+    infer_batch_size: int,
+) -> list[tuple[str, float]]:
+    # 阶段1按 code 扫描：复用 tensor/flow 上下文，避免 date×code 双层里重复 IO。
+    samples: list[tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
+    for asof in asof_dates:
+        dp = build_multiscale_tensors(str(data_dir), code, asof)
+        flow_x, flow_mask, flow_ok = _flow_window_from_context(flow_ctx, asof)
+        if (not dp.dp_ok) or (not flow_ok):
+            continue
+        samples.append(
+            (
+                asof,
+                dp.X_micro.astype(np.float32),
+                dp.X_mezzo.astype(np.float32),
+                dp.X_macro.astype(np.float32),
+                dp.mask_micro.astype(np.uint8),
+                dp.mask_mezzo.astype(np.uint8),
+                dp.mask_macro.astype(np.uint8),
+                flow_x,
+                flow_mask.astype(np.uint8),
+            )
+        )
+
+    if not samples:
+        return []
+
+    out: list[tuple[str, float]] = []
+    bs = max(1, int(infer_batch_size))
+    with torch.inference_mode():
+        # 批量推理显著减少 python/框架调度开销。
+        for start in range(0, len(samples), bs):
+            chunk = samples[start : start + bs]
+            asof_chunk = [x[0] for x in chunk]
+            batch = {
+                "x_micro": torch.from_numpy(np.stack([x[1] for x in chunk], axis=0)).to(device),
+                "x_mezzo": torch.from_numpy(np.stack([x[2] for x in chunk], axis=0)).to(device),
+                "x_macro": torch.from_numpy(np.stack([x[3] for x in chunk], axis=0)).to(device),
+                "mask_micro": torch.from_numpy(np.stack([x[4] for x in chunk], axis=0)).to(torch.bool).to(device),
+                "mask_mezzo": torch.from_numpy(np.stack([x[5] for x in chunk], axis=0)).to(torch.bool).to(device),
+                "mask_macro": torch.from_numpy(np.stack([x[6] for x in chunk], axis=0)).to(torch.bool).to(device),
+                "flow_x": torch.from_numpy(np.stack([x[7] for x in chunk], axis=0)).to(device),
+                "flow_mask": torch.from_numpy(np.stack([x[8] for x in chunk], axis=0)).to(torch.bool).to(device),
+            }
+            y_hat, _ = model(batch)
+            scores = y_hat.detach().to("cpu").numpy().reshape(-1)
+            out.extend((asof_chunk[i], float(scores[i])) for i in range(len(asof_chunk)))
     return out
 
 
@@ -276,6 +362,7 @@ def main() -> None:
     parser.add_argument("--use-seq-context", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--enable-dynamic-threshold", action=argparse.BooleanOptionalAction, default=True)
     parser.add_argument("--enable-free-branch", action=argparse.BooleanOptionalAction, default=True)
+    parser.add_argument("--infer-batch-size", type=int, default=512)
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -312,36 +399,34 @@ def main() -> None:
 
     daily_cache = {c: _load_daily_map(data_dir, c) for c in codes}
 
+    # 阶段1：按 code 预计算所有 asof 的分数。
+    score_by_date: dict[str, list[tuple[str, float]]] = {d: [] for d in asof_dates}
+    for idx, code in enumerate(codes, start=1):
+        flow_ctx = _build_flow_context(data_dir, code)
+        code_scores = _infer_scores_for_code(
+            model=model,
+            device=device,
+            data_dir=data_dir,
+            code=code,
+            asof_dates=asof_dates,
+            flow_ctx=flow_ctx,
+            infer_batch_size=int(args.infer_batch_size),
+        )
+        for asof, score in code_scores:
+            score_by_date.setdefault(asof, []).append((code, score))
+        if idx % 200 == 0 or idx == len(codes):
+            print(f"[phase1] scored codes: {idx}/{len(codes)}")
+
+    # 阶段2：按交易日执行原有交易逻辑。
     cash = float(args.initial_cash)
     positions: dict[str, Position] = {}
     prev_final_holding_amount = 0.0
 
-    for asof in asof_dates:
-        t_idx = val_dates.index(asof)
+    for t_idx, asof in enumerate(asof_dates):
         day = val_dates[t_idx + 1]
         day_trade = day.replace("-", "")
 
-        rank_rows: list[tuple[str, float]] = []
-        for code in codes:
-            dp = build_multiscale_tensors(str(data_dir), code, asof)
-            flow_x, flow_mask, flow_ok = _build_flow_features(data_dir, code, asof)
-            if (not dp.dp_ok) or (not flow_ok):
-                continue
-            batch = {
-                "x_micro": torch.from_numpy(dp.X_micro.astype(np.float32)).unsqueeze(0).to(device),
-                "x_mezzo": torch.from_numpy(dp.X_mezzo.astype(np.float32)).unsqueeze(0).to(device),
-                "x_macro": torch.from_numpy(dp.X_macro.astype(np.float32)).unsqueeze(0).to(device),
-                "mask_micro": torch.from_numpy(dp.mask_micro.astype(np.uint8)).to(torch.bool).unsqueeze(0).to(device),
-                "mask_mezzo": torch.from_numpy(dp.mask_mezzo.astype(np.uint8)).to(torch.bool).unsqueeze(0).to(device),
-                "mask_macro": torch.from_numpy(dp.mask_macro.astype(np.uint8)).to(torch.bool).unsqueeze(0).to(device),
-                "flow_x": torch.from_numpy(flow_x).unsqueeze(0).to(device),
-                "flow_mask": torch.from_numpy(flow_mask.astype(np.uint8)).to(torch.bool).unsqueeze(0).to(device),
-            }
-            with torch.no_grad():
-                y_hat, _ = model(batch)
-            rank_rows.append((code, float(y_hat.squeeze().item())))
-
-        rank_rows.sort(key=lambda x: x[1], reverse=True)
+        rank_rows = sorted(score_by_date.get(asof, []), key=lambda x: x[1], reverse=True)
         rank_map = {code: i + 1 for i, (code, _) in enumerate(rank_rows)}
 
         if day_trade not in limit_cache:
@@ -385,7 +470,7 @@ def main() -> None:
 
             sell_price: float | None = None
             if np.isfinite(down_limit) and abs(open_p - down_limit) < 1e-8:
-                if (abs(high_p - down_limit) < 1e-8):
+                if abs(high_p - down_limit) < 1e-8:
                     sell_price = None
                 elif down_limit / pos.cost_per_share < 0.925:
                     sell_price = down_limit
