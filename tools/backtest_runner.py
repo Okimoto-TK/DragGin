@@ -178,6 +178,87 @@ def _round_lot_shares(max_cash: float, price: float) -> int:
     return max(0, lots * 100)
 
 
+def _fmt_money(v: float) -> str:
+    return f"{float(v):,.2f}"
+
+
+def _print_day_summary(payload: dict[str, Any]) -> None:
+    day = str(payload.get("date", ""))
+    asof = str(payload.get("asof_date", ""))
+    print("\n" + "=" * 88)
+    print(f"回测日报 | 交易日: {day} | asof: {asof}")
+    print("-" * 88)
+    print(
+        "期初资产  持仓: {0} | 现金: {1} | 总资产: {2}".format(
+            _fmt_money(payload.get("initial_holding_amount", 0.0)),
+            _fmt_money(payload.get("initial_cash", 0.0)),
+            _fmt_money(payload.get("initial_total_asset", 0.0)),
+        )
+    )
+
+    init_positions = payload.get("initial_positions", []) or []
+    if init_positions:
+        print("\n[期初持仓]")
+        for row in init_positions:
+            print(
+                "  - {code:<10} 数量:{qty:>8} 成本:{cost:>10} 浮盈亏(开盘):{pnl:>12}".format(
+                    code=str(row.get("code", "")),
+                    qty=int(row.get("qty", 0)),
+                    cost=f"{float(row.get('cost', 0.0)):.4f}",
+                    pnl=_fmt_money(float(row.get("float_pnl", 0.0))),
+                )
+            )
+
+    sells = payload.get("sell_records", []) or []
+    if sells:
+        print("\n[卖出记录]")
+        for row in sells:
+            print(
+                "  - {code:<10} 数量:{qty:>8} 成交:{price:>10} 成本:{cost:>10} 实现盈亏:{pnl:>12}".format(
+                    code=str(row.get("code", "")),
+                    qty=int(row.get("qty", 0)),
+                    price=f"{float(row.get('price', 0.0)):.4f}",
+                    cost=f"{float(row.get('cost', 0.0)):.4f}",
+                    pnl=_fmt_money(float(row.get("realized_pnl", 0.0))),
+                )
+            )
+
+    buys = payload.get("buy_records", []) or []
+    if buys:
+        print("\n[买入记录]")
+        for row in buys:
+            print(
+                "  - {code:<10} 数量:{qty:>8} 成本:{cost:>10}".format(
+                    code=str(row.get("code", "")),
+                    qty=int(row.get("qty", 0)),
+                    cost=f"{float(row.get('cost', 0.0)):.4f}",
+                )
+            )
+
+    final_positions = payload.get("final_positions", []) or []
+    if final_positions:
+        print("\n[期末持仓]")
+        for row in final_positions:
+            print(
+                "  - {code:<10} 数量:{qty:>8} 成本:{cost:>10} 浮盈亏(收盘):{pnl:>12}".format(
+                    code=str(row.get("code", "")),
+                    qty=int(row.get("qty", 0)),
+                    cost=f"{float(row.get('cost', 0.0)):.4f}",
+                    pnl=_fmt_money(float(row.get("float_pnl", 0.0))),
+                )
+            )
+
+    print("\n" + "-" * 88)
+    print(
+        "期末资产  持仓: {0} | 现金: {1} | 总资产: {2}".format(
+            _fmt_money(payload.get("final_holding_amount", 0.0)),
+            _fmt_money(payload.get("final_cash", 0.0)),
+            _fmt_money(payload.get("final_total_asset", 0.0)),
+        )
+    )
+    print("=" * 88)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Model backtest runner")
     parser.add_argument("--data-dir", required=True)
@@ -404,6 +485,7 @@ def main() -> None:
         out_path = out_dir / f"{day_trade}.json"
         out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
         print(f"saved {out_path}")
+        _print_day_summary(payload)
 
 
 if __name__ == "__main__":
