@@ -40,6 +40,11 @@ def main() -> None:
     parser.add_argument("--gate-mean-reg", type=float, default=1e-2)
     parser.add_argument("--gate-entropy-reg", type=float, default=5e-3)
     parser.add_argument("--gate-warmup-steps", type=int, default=500)
+    parser.add_argument(
+        "--flow-gate-force-zero-all-steps",
+        action="store_true",
+        help="force flow gate to 0.0 for all steps while still running flow encoder",
+    )
     parser.add_argument("--hidden-dim", type=int, default=320)
     parser.add_argument("--num-heads", type=int, default=8)
     parser.add_argument("--dropout", type=float, default=0.1)
@@ -87,6 +92,7 @@ def main() -> None:
         gate_mean_reg=args.gate_mean_reg,
         gate_entropy_reg=args.gate_entropy_reg,
         gate_warmup_steps=max(0, int(args.gate_warmup_steps)),
+        flow_gate_force_zero_all_steps=bool(args.flow_gate_force_zero_all_steps),
         gate_lr=args.gate_lr,
         gate_clip_grad_norm=args.gate_clip_grad_norm,
         scheduler_name=str(args.scheduler_name),

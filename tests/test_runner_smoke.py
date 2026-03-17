@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 import numpy as np
+import pytest
 import torch
 
 from src.model.head import masked_huber_loss
@@ -12,8 +13,44 @@ from src.train.runner import (
     TrainConfig,
     collate_batch,
     run_training,
+    _resolve_force_flow_gate_value,
     _weighted_metric_value,
 )
+
+
+def _train_diagnostics(out_dir: Path) -> str:
+    metrics_path = out_dir / "metrics" / "curve.json"
+    log_path = out_dir / "logs" / "train.log"
+    feedback_dir = out_dir / "reports" / "feedback"
+
+    lines: list[str] = []
+    lines.append(f"metrics_exists={metrics_path.exists()}")
+    if metrics_path.exists():
+        raw = metrics_path.read_text(encoding="utf-8")
+        try:
+            data = json.loads(raw)
+            train_rows = data.get("train", [])
+            val_rows = data.get("val", [])
+            lines.append(f"curve_train_rows={len(train_rows)}")
+            lines.append(f"curve_val_rows={len(val_rows)}")
+            if len(train_rows) > 0:
+                lines.append(f"curve_last_train_row={train_rows[-1]}")
+        except Exception as exc:  # pragma: no cover - diagnostic only
+            lines.append(f"curve_parse_error={exc}")
+            lines.append(f"curve_raw_head={raw[:1000]}")
+
+    lines.append(f"log_exists={log_path.exists()}")
+    if log_path.exists():
+        log_lines = log_path.read_text(encoding="utf-8").splitlines()
+        tail = log_lines[-80:]
+        lines.append("train_log_tail:")
+        lines.extend(tail)
+
+    lines.append(f"feedback_dir_exists={feedback_dir.exists()}")
+    if feedback_dir.exists():
+        lines.append(f"feedback_files={[p.name for p in sorted(feedback_dir.glob('*.yaml'))]}")
+
+    return "\n".join(lines)
 
 
 def _write_shard(path: Path, n: int = 3, all_loss_mask_false: bool = False) -> str:
@@ -28,6 +65,8 @@ def _write_shard(path: Path, n: int = 3, all_loss_mask_false: bool = False) -> s
         "mask_micro": np.ones((n, 48), dtype=bool),
         "mask_mezzo": np.ones((n, 40), dtype=bool),
         "mask_macro": np.ones((n, 30), dtype=bool),
+        "flow_x": rng.normal(size=(n, 30, 4)).astype(np.float32),
+        "flow_mask": np.ones((n, 30), dtype=bool),
         "y": rng.normal(size=(n,)).astype(np.float32),
         "y_raw": rng.normal(size=(n,)).astype(np.float32),
         "y_z": rng.normal(size=(n,)).astype(np.float32),
@@ -47,6 +86,8 @@ def _synthetic_batch(batch_size: int = 2) -> dict:
         "mask_micro": torch.ones(batch_size, 48, dtype=torch.bool),
         "mask_mezzo": torch.ones(batch_size, 40, dtype=torch.bool),
         "mask_macro": torch.ones(batch_size, 30, dtype=torch.bool),
+        "flow_x": torch.randn(batch_size, 30, 4),
+        "flow_mask": torch.ones(batch_size, 30, dtype=torch.bool),
         "y": torch.randn(batch_size),
         "dp_ok": torch.ones(batch_size, dtype=torch.bool),
         "label_ok": torch.ones(batch_size, dtype=torch.bool),
@@ -69,6 +110,8 @@ def test_dataset_and_collate_shapes(tmp_path: Path) -> None:
     assert batch["x_micro"].shape == (2, 48, 6)
     assert batch["x_mezzo"].shape == (2, 40, 6)
     assert batch["x_macro"].shape == (2, 30, 6)
+    assert batch["flow_x"].shape == (2, 30, 4)
+    assert batch["flow_mask"].shape == (2, 30)
     assert batch["y"].shape == (2,)
     assert batch["loss_mask"].shape == (2,)
 
@@ -154,8 +197,10 @@ def test_gate_std_penalty_zero_when_free_branch_disabled(tmp_path: Path) -> None
     result = run_training(cfg)
     assert result["feedback"]["meta"]["status"] == "ok"
 
-    data = json.loads((Path(cfg.out_dir) / "metrics" / "curve.json").read_text(encoding="utf-8"))
-    assert len(data["train"]) >= 1
+    out_dir = Path(cfg.out_dir)
+    data = json.loads((out_dir / "metrics" / "curve.json").read_text(encoding="utf-8"))
+    if len(data["train"]) < 1:
+        pytest.fail("expected at least 1 train row, diagnostics:\n" + _train_diagnostics(out_dir))
     for row in data["train"]:
         assert float(row["gate_std_penalty"]) == 0.0
         assert float(row["total_loss"]) == float(row["loss"])
@@ -571,3 +616,42 @@ def test_unscale_called_even_without_global_clip(tmp_path: Path, monkeypatch) ->
     run_training(cfg)
     assert "unscale" in calls
     assert calls.index("unscale") < calls.index("step")
+
+
+def test_resolve_force_flow_gate_value_respects_always_zero_switch() -> None:
+    cfg_always_zero = TrainConfig(
+        train_shards=["dummy.npy"],
+        val_shards=["dummy_val.npy"],
+        batch_size=1,
+        grad_accum_steps=1,
+        num_epochs=1,
+        lr=1e-3,
+        weight_decay=1e-4,
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        exp_name="resolve_flow_gate",
+        out_dir="/tmp/out",
+        flow_gate_force_zero_all_steps=True,
+    )
+    assert _resolve_force_flow_gate_value(cfg_always_zero, global_step=0) == 0.0
+    assert _resolve_force_flow_gate_value(cfg_always_zero, global_step=2000) == 0.0
+    assert _resolve_force_flow_gate_value(cfg_always_zero, global_step=999999) == 0.0
+
+    cfg_warmup_only = TrainConfig(
+        train_shards=["dummy.npy"],
+        val_shards=["dummy_val.npy"],
+        batch_size=1,
+        grad_accum_steps=1,
+        num_epochs=1,
+        lr=1e-3,
+        weight_decay=1e-4,
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        exp_name="resolve_flow_gate_warmup",
+        out_dir="/tmp/out2",
+    )
+    assert _resolve_force_flow_gate_value(cfg_warmup_only, global_step=0) == 0.0
+    assert _resolve_force_flow_gate_value(cfg_warmup_only, global_step=1999) == 0.0
+    assert _resolve_force_flow_gate_value(cfg_warmup_only, global_step=2000) is None
