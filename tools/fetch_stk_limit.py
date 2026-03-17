@@ -2,7 +2,9 @@ from __future__ import annotations
 
 import argparse
 import os
+import shutil
 import time
+from collections import defaultdict
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 from typing import Iterable
@@ -69,24 +71,42 @@ def _fetch_stk_limit_by_date(token: str, trade_date: str, sleep_seconds: float =
     raise RuntimeError(f"Failed to fetch stk_limit for trade_date={trade_date} after {MAX_RETRIES} retries") from last_error
 
 
-def _append_code_limit(out_dir: Path, code: str, df_chunk: pd.DataFrame) -> None:
-    code_dir = out_dir / code
-    code_dir.mkdir(parents=True, exist_ok=True)
-    out_file = code_dir / "limit.parquet"
+def _fetch_and_cache_single_date(
+    token: str,
+    cache_dir: Path,
+    trade_date: str,
+    sleep_seconds: float = 0.0,
+) -> None:
+    df = _fetch_stk_limit_by_date(token=token, trade_date=trade_date, sleep_seconds=sleep_seconds)
+    cache_file = cache_dir / f"{trade_date}.parquet"
+    df.to_parquet(cache_file, index=False)
 
-    if out_file.exists():
-        old = pd.read_parquet(out_file)
-        merged = pd.concat([old, df_chunk], ignore_index=True)
-    else:
-        merged = df_chunk
 
-    merged = (
-        merged.reindex(columns=STK_LIMIT_COLUMNS)
-        .drop_duplicates(subset=["ts_code", "trade_date"], keep="last")
-        .sort_values(["trade_date"])
-        .reset_index(drop=True)
-    )
-    merged.to_parquet(out_file, index=False)
+def _merge_cache_to_code_files(cache_dir: Path, out_dir: Path) -> None:
+    cache_files = sorted(cache_dir.glob("*.parquet"))
+    if not cache_files:
+        raise RuntimeError("No cached date parquet files found")
+
+    bucket: dict[str, list[pd.DataFrame]] = defaultdict(list)
+    for cache_file in tqdm(cache_files, desc="Merging cache by ts_code"):
+        df = pd.read_parquet(cache_file)
+        if df is None or df.empty:
+            continue
+        for code, group in df.groupby("ts_code", sort=False):
+            bucket[code].append(group)
+
+    for code, parts in tqdm(bucket.items(), total=len(bucket), desc="Writing {code}/limit.parquet"):
+        merged = (
+            pd.concat(parts, ignore_index=True)
+            .reindex(columns=STK_LIMIT_COLUMNS)
+            .drop_duplicates(subset=["ts_code", "trade_date"], keep="last")
+            .sort_values(["trade_date"])
+            .reset_index(drop=True)
+        )
+
+        code_dir = out_dir / code
+        code_dir.mkdir(parents=True, exist_ok=True)
+        merged.to_parquet(code_dir / "limit.parquet", index=False)
 
 
 def fetch_stk_limit_range(
@@ -107,23 +127,32 @@ def fetch_stk_limit_range(
     if not trade_dates:
         raise RuntimeError("No open trade dates found from trade_cal in the requested range")
 
-    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
-        futures = [
-            executor.submit(_fetch_stk_limit_by_date, token, trade_date, sleep_seconds)
-            for trade_date in trade_dates
-        ]
+    cache_dir = out_dir / ".stk_limit_cache"
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
-        with tqdm(total=len(futures), desc="Fetching stk_limit by date") as pbar:
-            for future in as_completed(futures):
-                pbar.update(1)
-                df = future.result()
-                for code, group in df.groupby("ts_code", sort=False):
-                    _append_code_limit(out_dir=out_dir, code=code, df_chunk=group)
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
+            futures = [
+                executor.submit(_fetch_and_cache_single_date, token, cache_dir, trade_date, sleep_seconds)
+                for trade_date in trade_dates
+            ]
+
+            with tqdm(total=len(futures), desc="Fetching and caching by date") as pbar:
+                for future in as_completed(futures):
+                    pbar.update(1)
+                    future.result()
+
+        _merge_cache_to_code_files(cache_dir=cache_dir, out_dir=out_dir)
+    finally:
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir)
 
 
 def main() -> None:
     parser = argparse.ArgumentParser(
-        description="Fetch Tushare stk_limit data and store as {ts_code}/limit.parquet",
+        description="Fetch Tushare stk_limit data; cache by date, then merge to {ts_code}/limit.parquet",
     )
     parser.add_argument("--st", required=True, help="Start date in YYYYmmdd")
     parser.add_argument("--et", required=True, help="End date in YYYYmmdd")
