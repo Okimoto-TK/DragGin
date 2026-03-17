@@ -1,0 +1,174 @@
+from __future__ import annotations
+
+import argparse
+import os
+import shutil
+import time
+from collections import defaultdict
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from pathlib import Path
+from typing import Iterable
+
+import pandas as pd
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    def tqdm(iterable: Iterable, **_: object) -> Iterable:
+        return iterable
+
+
+MAX_RETRIES = 5
+STK_LIMIT_COLUMNS = ["ts_code", "trade_date", "pre_close", "up_limit", "down_limit"]
+
+
+def _get_pro_client(token: str):
+    import tushare as ts
+
+    ts.set_token(token)
+    return ts.pro_api(token)
+
+
+def _iter_trade_dates(pro, start_date: str, end_date: str) -> list[str]:
+    cal = pro.trade_cal(
+        exchange="",
+        start_date=start_date,
+        end_date=end_date,
+        is_open="1",
+        fields="cal_date,is_open",
+    )
+    if cal is None or cal.empty or "cal_date" not in cal.columns:
+        return []
+    return cal["cal_date"].astype(str).sort_values().drop_duplicates().tolist()
+
+
+def _fetch_stk_limit_by_date(token: str, trade_date: str, sleep_seconds: float = 0.0) -> pd.DataFrame:
+    pro = _get_pro_client(token)
+    last_error: Exception | None = None
+
+    for attempt in range(1, MAX_RETRIES + 1):
+        try:
+            df = pro.stk_limit(trade_date=trade_date, fields=",".join(STK_LIMIT_COLUMNS))
+            if df is None or df.empty:
+                raise RuntimeError(f"Empty stk_limit response for trade_date={trade_date}")
+
+            out = (
+                df.reindex(columns=STK_LIMIT_COLUMNS)
+                .drop_duplicates(subset=["ts_code", "trade_date"], keep="last")
+                .sort_values(["ts_code", "trade_date"])
+                .reset_index(drop=True)
+            )
+            if out.empty:
+                raise RuntimeError(f"Empty stk_limit dataframe after cleanup for trade_date={trade_date}")
+            return out
+        except Exception as exc:
+            last_error = exc
+            if attempt == MAX_RETRIES:
+                break
+            if sleep_seconds > 0:
+                time.sleep(sleep_seconds)
+
+    raise RuntimeError(f"Failed to fetch stk_limit for trade_date={trade_date} after {MAX_RETRIES} retries") from last_error
+
+
+def _fetch_and_cache_single_date(
+    token: str,
+    cache_dir: Path,
+    trade_date: str,
+    sleep_seconds: float = 0.0,
+) -> None:
+    df = _fetch_stk_limit_by_date(token=token, trade_date=trade_date, sleep_seconds=sleep_seconds)
+    cache_file = cache_dir / f"{trade_date}.parquet"
+    df.to_parquet(cache_file, index=False)
+
+
+def _merge_cache_to_code_files(cache_dir: Path, out_dir: Path) -> None:
+    cache_files = sorted(cache_dir.glob("*.parquet"))
+    if not cache_files:
+        raise RuntimeError("No cached date parquet files found")
+
+    bucket: dict[str, list[pd.DataFrame]] = defaultdict(list)
+    for cache_file in tqdm(cache_files, desc="Merging cache by ts_code"):
+        df = pd.read_parquet(cache_file)
+        if df is None or df.empty:
+            continue
+        for code, group in df.groupby("ts_code", sort=False):
+            bucket[code].append(group)
+
+    for code, parts in tqdm(bucket.items(), total=len(bucket), desc="Writing {code}/limit.parquet"):
+        merged = (
+            pd.concat(parts, ignore_index=True)
+            .reindex(columns=STK_LIMIT_COLUMNS)
+            .drop_duplicates(subset=["ts_code", "trade_date"], keep="last")
+            .sort_values(["trade_date"])
+            .reset_index(drop=True)
+        )
+
+        code_dir = out_dir / code
+        code_dir.mkdir(parents=True, exist_ok=True)
+        merged.to_parquet(code_dir / "limit.parquet", index=False)
+
+
+def fetch_stk_limit_range(
+    start_date: str,
+    end_date: str,
+    out_dir: Path,
+    sleep_seconds: float = 0.0,
+    max_workers: int = 4,
+) -> None:
+    token = os.getenv("TUSHARE_TOKEN", "").strip()
+    if not token:
+        raise RuntimeError("TUSHARE_TOKEN is required")
+
+    out_dir.mkdir(parents=True, exist_ok=True)
+
+    pro = _get_pro_client(token)
+    trade_dates = _iter_trade_dates(pro=pro, start_date=start_date, end_date=end_date)
+    if not trade_dates:
+        raise RuntimeError("No open trade dates found from trade_cal in the requested range")
+
+    cache_dir = out_dir / ".stk_limit_cache"
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
+            futures = [
+                executor.submit(_fetch_and_cache_single_date, token, cache_dir, trade_date, sleep_seconds)
+                for trade_date in trade_dates
+            ]
+
+            with tqdm(total=len(futures), desc="Fetching and caching by date") as pbar:
+                for future in as_completed(futures):
+                    pbar.update(1)
+                    future.result()
+
+        _merge_cache_to_code_files(cache_dir=cache_dir, out_dir=out_dir)
+    finally:
+        if cache_dir.exists():
+            shutil.rmtree(cache_dir)
+
+
+def main() -> None:
+    parser = argparse.ArgumentParser(
+        description="Fetch Tushare stk_limit data; cache by date, then merge to {ts_code}/limit.parquet",
+    )
+    parser.add_argument("--st", required=True, help="Start date in YYYYmmdd")
+    parser.add_argument("--et", required=True, help="End date in YYYYmmdd")
+    parser.add_argument("--out-dir", required=True, help="Output directory path")
+    parser.add_argument("--sleep", type=float, default=0.0, help="Sleep seconds between retry attempts")
+    parser.add_argument("--max-workers", type=int, default=4, help="Maximum worker threads for fetching dates")
+    args = parser.parse_args()
+
+    fetch_stk_limit_range(
+        start_date=args.st,
+        end_date=args.et,
+        out_dir=Path(args.out_dir),
+        sleep_seconds=max(0.0, args.sleep),
+        max_workers=max(1, args.max_workers),
+    )
+
+
+if __name__ == "__main__":
+    main()
