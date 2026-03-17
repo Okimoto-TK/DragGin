@@ -3,9 +3,17 @@ from __future__ import annotations
 import argparse
 import os
 import time
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from typing import Iterable
 
 import pandas as pd
+
+try:
+    from tqdm import tqdm
+except ImportError:  # pragma: no cover
+    def tqdm(iterable: Iterable, **_: object) -> Iterable:
+        return iterable
 
 MAX_RETRIES = 5
 STK_LIMIT_FIELDS = "ts_code,trade_date,pre_close,up_limit,down_limit"
@@ -57,7 +65,20 @@ def _fetch_stk_limit_by_date(pro, trade_date: str, sleep_seconds: float = 0.0) -
     raise RuntimeError(f"Failed to fetch stk_limit for trade_date={trade_date} after {MAX_RETRIES} retries") from last_error
 
 
-def fetch_stk_limit_range(start_date: str, end_date: str, out_dir: Path, sleep_seconds: float = 0.0) -> None:
+def _fetch_and_write_single_date(token: str, out_dir: Path, trade_date: str, sleep_seconds: float = 0.0) -> None:
+    pro = _get_pro_client(token)
+    df = _fetch_stk_limit_by_date(pro=pro, trade_date=trade_date, sleep_seconds=sleep_seconds)
+    out_file = out_dir / f"{trade_date}_stk_limit.parquet"
+    df.to_parquet(out_file, index=False)
+
+
+def fetch_stk_limit_range(
+    start_date: str,
+    end_date: str,
+    out_dir: Path,
+    sleep_seconds: float = 0.0,
+    max_workers: int = 4,
+) -> None:
     token = os.getenv("TUSHARE_TOKEN", "").strip()
     if not token:
         raise RuntimeError("TUSHARE_TOKEN is required")
@@ -69,10 +90,22 @@ def fetch_stk_limit_range(start_date: str, end_date: str, out_dir: Path, sleep_s
     if not trade_dates:
         raise RuntimeError("No open trade dates found from trade_cal in the requested range")
 
-    for trade_date in trade_dates:
-        df = _fetch_stk_limit_by_date(pro=pro, trade_date=trade_date, sleep_seconds=sleep_seconds)
-        out_file = out_dir / f"{trade_date}_stk_limit.parquet"
-        df.to_parquet(out_file, index=False)
+    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
+        futures = [
+            executor.submit(_fetch_and_write_single_date, token, out_dir, trade_date, sleep_seconds)
+            for trade_date in trade_dates
+        ]
+        future_set = set(futures)
+
+        with tqdm(total=len(futures), desc="Fetching stk_limit by date") as pbar:
+            for future in as_completed(futures):
+                pbar.update(1)
+                exc = future.exception()
+                if exc is not None:
+                    for pending in future_set:
+                        if pending is not future:
+                            pending.cancel()
+                    raise exc
 
 
 def main() -> None:
@@ -83,6 +116,7 @@ def main() -> None:
     parser.add_argument("--et", required=True, help="End date in YYYYmmdd")
     parser.add_argument("--out-dir", required=True, help="Output directory path")
     parser.add_argument("--sleep", type=float, default=0.0, help="Sleep seconds between retry attempts")
+    parser.add_argument("--max-workers", type=int, default=4, help="Maximum worker threads for fetching dates")
     args = parser.parse_args()
 
     fetch_stk_limit_range(
@@ -90,6 +124,7 @@ def main() -> None:
         end_date=args.et,
         out_dir=Path(args.out_dir),
         sleep_seconds=max(0.0, args.sleep),
+        max_workers=max(1, args.max_workers),
     )
 
 
