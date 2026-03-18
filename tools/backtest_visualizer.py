@@ -1,494 +1,696 @@
 from __future__ import annotations
 
 import argparse
-import html
 import json
+import sys
+import tempfile
+import webbrowser
+from dataclasses import dataclass, asdict
 from pathlib import Path
 from typing import Any
 
-PLOTLY_CDN = "https://cdn.plot.ly/plotly-2.35.2.min.js"
-SHORT_WINDOW_THRESHOLD = 45
+from plotly.offline.offline import get_plotlyjs
 
 
-def _load_backtest_rows(backtest_dir: Path) -> list[dict[str, Any]]:
-    if not backtest_dir.exists():
-        raise FileNotFoundError(f"backtest dir not found: {backtest_dir}")
+UP_COLOR = "#E06C75"   # muted red
+DOWN_COLOR = "#59A869" # muted green
+NEUTRAL_LINE = "#8AA4C8"
+ACCENT = "#7AA2F7"
+BG = "#0F172A"
+PANEL = "#111827"
+CARD = "#1E293B"
+BORDER = "#334155"
+TEXT = "#E5E7EB"
+TEXT_DIM = "#94A3B8"
 
-    rows: list[dict[str, Any]] = []
-    for path in sorted(backtest_dir.glob("*.json")):
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        date = str(payload.get("date") or path.stem)
-        final_total_asset = float(payload.get("final_total_asset", 0.0))
-        initial_total_asset = float(payload.get("initial_total_asset", final_total_asset))
-        daily_return = 0.0
-        if initial_total_asset > 0:
-            daily_return = final_total_asset / initial_total_asset - 1.0
-        rows.append(
-            {
-                "date": date,
-                "asof_date": str(payload.get("asof_date", "")),
-                "initial_total_asset": initial_total_asset,
-                "final_total_asset": final_total_asset,
-                "daily_return": daily_return,
-                "payload": payload,
-            }
+
+@dataclass
+class DayRecord:
+    trade_date: str
+    prev_date: str
+    open_asset: float
+    close_asset: float
+    high_asset: float
+    low_asset: float
+    daily_return: float
+    cumulative_return: float
+    initial_holding_amount: float
+    initial_cash: float
+    final_holding_amount: float
+    final_cash: float
+    initial_total_asset: float
+    final_total_asset: float
+    initial_positions: list[dict[str, Any]]
+    sell_records: list[dict[str, Any]]
+    buy_records: list[dict[str, Any]]
+    final_positions: list[dict[str, Any]]
+
+
+def _safe_float(value: Any, default: float = 0.0) -> float:
+    try:
+        return float(value)
+    except Exception:
+        return default
+
+
+def _load_json(path: Path) -> dict[str, Any] | None:
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except UnicodeDecodeError:
+        return json.loads(path.read_text(encoding="utf-8-sig"))
+    except Exception:
+        return None
+
+
+def load_backtest_records(backtest_dir: Path) -> list[DayRecord]:
+    files = sorted(backtest_dir.rglob("*.json"))
+    if not files:
+        raise FileNotFoundError(f"No json files found under: {backtest_dir}")
+
+    raw: list[dict[str, Any]] = []
+    for path in files:
+        payload = _load_json(path)
+        if not isinstance(payload, dict):
+            continue
+        if "date" not in payload:
+            payload["date"] = path.stem
+        raw.append(payload)
+
+    if not raw:
+        raise ValueError("No valid json payloads found.")
+
+    raw.sort(key=lambda x: str(x.get("date", "")))
+    first_initial = _safe_float(raw[0].get("initial_total_asset"), 0.0)
+    if first_initial <= 0:
+        raise ValueError("The first record has invalid initial_total_asset.")
+
+    days: list[DayRecord] = []
+    for item in raw:
+        trade_date = str(item.get("date", ""))
+        prev_date = str(item.get("asof_date", ""))
+        open_asset = _safe_float(item.get("initial_total_asset"))
+        close_asset = _safe_float(item.get("final_total_asset"))
+        high_asset = max(open_asset, close_asset)
+        low_asset = min(open_asset, close_asset)
+        daily_return = (close_asset / open_asset - 1.0) if open_asset else 0.0
+        cumulative_return = (close_asset / first_initial - 1.0) if first_initial else 0.0
+
+        days.append(
+            DayRecord(
+                trade_date=trade_date,
+                prev_date=prev_date,
+                open_asset=open_asset,
+                close_asset=close_asset,
+                high_asset=high_asset,
+                low_asset=low_asset,
+                daily_return=daily_return,
+                cumulative_return=cumulative_return,
+                initial_holding_amount=_safe_float(item.get("initial_holding_amount")),
+                initial_cash=_safe_float(item.get("initial_cash")),
+                final_holding_amount=_safe_float(item.get("final_holding_amount")),
+                final_cash=_safe_float(item.get("final_cash")),
+                initial_total_asset=open_asset,
+                final_total_asset=close_asset,
+                initial_positions=list(item.get("initial_positions", []) or []),
+                sell_records=list(item.get("sell_records", []) or []),
+                buy_records=list(item.get("buy_records", []) or []),
+                final_positions=list(item.get("final_positions", []) or []),
+            )
         )
 
-    if not rows:
-        raise ValueError(f"no backtest json files found in: {backtest_dir}")
-
-    base_asset = rows[0]["initial_total_asset"]
-    if base_asset <= 0:
-        base_asset = rows[0]["final_total_asset"]
-    if base_asset <= 0:
-        raise ValueError("cannot compute cumulative return because initial asset is non-positive")
-
-    for row in rows:
-        row["start_cum_return"] = row["initial_total_asset"] / base_asset - 1.0
-        row["cum_return"] = row["final_total_asset"] / base_asset - 1.0
-    return rows
+    return days
 
 
-def _build_html(rows: list[dict[str, Any]], title: str) -> str:
-    serializable_rows = [
-        {
-            "date": row["date"],
-            "asof_date": row["asof_date"],
-            "initial_total_asset": row["initial_total_asset"],
-            "final_total_asset": row["final_total_asset"],
-            "daily_return": row["daily_return"],
-            "start_cum_return": row["start_cum_return"],
-            "cum_return": row["cum_return"],
-            "payload": row["payload"],
-        }
-        for row in rows
-    ]
+def build_html(days: list[DayRecord], title: str) -> str:
+    plotly_js = get_plotlyjs()
+    payload = json.dumps([asdict(x) for x in days], ensure_ascii=False)
+    title_json = json.dumps(title, ensure_ascii=False)
 
-    rows_json = json.dumps(serializable_rows, ensure_ascii=False)
-    title_text = html.escape(title)
     return f"""<!DOCTYPE html>
-<html lang=\"zh-CN\">
+<html lang="zh-CN">
 <head>
-  <meta charset=\"utf-8\" />
-  <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\" />
-  <title>{title_text}</title>
-  <script src=\"{PLOTLY_CDN}\"></script>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>{title}</title>
   <style>
     :root {{
-      color-scheme: light;
-      --border: #e5e7eb;
-      --border-strong: #d0d5dd;
-      --bg-page: #f8fafc;
-      --bg-card: rgba(255,255,255,0.88);
-      --text-main: #0f172a;
-      --text-muted: #667085;
-      --text-soft: #475467;
-      --positive: #d92d20;
-      --negative: #1570ef;
-      --shadow: 0 14px 28px rgba(15, 23, 42, 0.08);
+      --bg: {BG};
+      --panel: {PANEL};
+      --card: {CARD};
+      --border: {BORDER};
+      --text: {TEXT};
+      --text-dim: {TEXT_DIM};
+      --accent: {ACCENT};
+      --up: {UP_COLOR};
+      --down: {DOWN_COLOR};
+      --line: {NEUTRAL_LINE};
+      --shadow: 0 18px 45px rgba(2, 8, 23, 0.34);
+      --radius: 20px;
     }}
+
     * {{ box-sizing: border-box; }}
-    body {{ margin: 0; font-family: Inter, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif; color: var(--text-main); background: linear-gradient(180deg, #f8fafc 0%, #eef2f7 100%); }}
-    .page {{ display: flex; min-height: 100vh; }}
-    .main {{ flex: 1 1 auto; min-width: 0; padding: 20px; }}
-    .sidebar {{ width: 460px; max-width: 44vw; border-left: 1px solid rgba(208, 213, 221, 0.75); background: rgba(248, 250, 252, 0.92); backdrop-filter: blur(14px); padding: 20px; overflow: auto; }}
-    .panel {{ background: var(--bg-card); border: 1px solid rgba(229, 231, 235, 0.95); border-radius: 18px; box-shadow: var(--shadow); }}
-    .hero {{ padding: 18px 20px; margin-bottom: 16px; }}
-    .headline {{ margin: 0 0 8px; font-size: 24px; font-weight: 700; }}
-    .subhead {{ margin: 0; color: var(--text-muted); font-size: 14px; line-height: 1.6; }}
-    .stats {{ display: grid; grid-template-columns: repeat(4, minmax(0, 1fr)); gap: 12px; margin-bottom: 16px; }}
-    .stat-card {{ padding: 14px 16px; }}
-    .label {{ font-size: 12px; color: var(--text-muted); margin-bottom: 6px; }}
-    .value {{ font-size: 18px; font-weight: 700; color: var(--text-main); }}
-    .positive {{ color: var(--positive) !important; }}
-    .negative {{ color: var(--negative) !important; }}
-    .chart-panel {{ padding: 12px; }}
-    #chart {{ width: 100%; height: calc(100vh - 220px); min-height: 560px; border-radius: 14px; }}
-    .sidebar-title {{ margin: 0 0 6px; font-size: 20px; font-weight: 700; }}
-    .sidebar-subtitle {{ margin: 0 0 16px; color: var(--text-muted); font-size: 13px; line-height: 1.6; }}
-    .detail-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; margin-bottom: 14px; }}
-    .detail-card {{ padding: 12px 14px; }}
-    .section {{ margin-top: 16px; }}
-    .section-title {{ margin: 0 0 10px; font-size: 14px; font-weight: 700; color: var(--text-soft); }}
-    .metric-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 10px; }}
-    .metric-card {{ padding: 12px 14px; }}
-    .list {{ display: grid; gap: 10px; }}
-    .trade-card {{ padding: 12px 14px; }}
-    .trade-card-head {{ display: flex; align-items: center; justify-content: space-between; gap: 10px; margin-bottom: 10px; }}
-    .trade-code {{ font-size: 14px; font-weight: 700; }}
-    .pill {{ border-radius: 999px; padding: 4px 9px; font-size: 11px; font-weight: 700; background: #eef4ff; color: #175cd3; }}
-    .kv-grid {{ display: grid; grid-template-columns: repeat(2, minmax(0, 1fr)); gap: 8px 12px; }}
-    .kv {{ min-width: 0; }}
-    .kv .label {{ margin-bottom: 2px; }}
-    .kv .text {{ font-size: 13px; color: var(--text-main); font-weight: 600; word-break: break-word; }}
-    .empty {{ padding: 14px; color: var(--text-muted); font-size: 13px; text-align: center; border: 1px dashed var(--border-strong); border-radius: 14px; background: rgba(255,255,255,0.7); }}
-    @media (max-width: 1200px) {{
-      .page {{ flex-direction: column; }}
-      .sidebar {{ width: 100%; max-width: none; border-left: none; border-top: 1px solid rgba(208, 213, 221, 0.75); }}
-      #chart {{ height: 72vh; min-height: 460px; }}
-      .stats {{ grid-template-columns: repeat(2, minmax(0, 1fr)); }}
+    html, body {{ margin: 0; padding: 0; height: 100%; background: radial-gradient(circle at top left, #15213a 0%, var(--bg) 40%, #0b1120 100%); color: var(--text); font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif; }}
+    body {{ overflow: hidden; }}
+
+    .app {{ display: flex; flex-direction: column; height: 100vh; padding: 18px; gap: 14px; }}
+    .header {{ display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 8px 6px 2px; }}
+    .title-wrap {{ display: flex; flex-direction: column; gap: 6px; }}
+    .title {{ font-size: 22px; font-weight: 700; letter-spacing: 0.02em; }}
+    .subtitle {{ color: var(--text-dim); font-size: 13px; }}
+    .legend {{ display: flex; align-items: center; gap: 16px; color: var(--text-dim); font-size: 13px; flex-wrap: wrap; }}
+    .legend-item {{ display: inline-flex; align-items: center; gap: 8px; }}
+    .legend-dot {{ width: 10px; height: 10px; border-radius: 999px; }}
+
+    .content {{ flex: 1; min-height: 0; display: grid; grid-template-columns: minmax(0, 1fr) 392px; gap: 16px; }}
+
+    .chart-shell, .side-shell {{ min-height: 0; background: rgba(17, 24, 39, 0.82); border: 1px solid rgba(148, 163, 184, 0.14); box-shadow: var(--shadow); backdrop-filter: blur(10px); }}
+    .chart-shell {{ border-radius: 24px; padding: 12px 14px 10px; display: flex; flex-direction: column; }}
+    .side-shell {{ border-radius: 24px; overflow: hidden; position: relative; }}
+    #chart {{ flex: 1; min-height: 0; }}
+
+    .hint {{ padding: 0 10px 4px; color: var(--text-dim); font-size: 12px; }}
+
+    .slider-wrap {{ width: 200%; height: 100%; display: flex; transform: translateX(0); transition: transform 260ms cubic-bezier(.22,.61,.36,1); }}
+    .slider-wrap.detail-open {{ transform: translateX(-50%); }}
+    .panel-page {{ width: 50%; height: 100%; padding: 16px; overflow: auto; }}
+    .panel-page::-webkit-scrollbar {{ width: 10px; }}
+    .panel-page::-webkit-scrollbar-thumb {{ background: rgba(148,163,184,.22); border-radius: 999px; }}
+    .panel-page::-webkit-scrollbar-track {{ background: transparent; }}
+
+    .section {{ background: linear-gradient(180deg, rgba(30,41,59,.96), rgba(15,23,42,.92)); border: 1px solid rgba(148,163,184,.12); border-radius: 18px; padding: 14px; margin-bottom: 14px; }}
+    .section-title {{ font-size: 13px; letter-spacing: .08em; text-transform: uppercase; color: var(--text-dim); margin-bottom: 12px; font-weight: 700; }}
+
+    .kv-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
+    .kv-card {{ background: rgba(15, 23, 42, 0.76); border: 1px solid rgba(148,163,184,.08); border-radius: 16px; padding: 12px; min-width: 0; }}
+    .kv-card.full {{ grid-column: 1 / -1; }}
+    .kv-label {{ font-size: 12px; color: var(--text-dim); margin-bottom: 8px; }}
+    .kv-value {{ font-size: 18px; font-weight: 700; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+    .pct-up {{ color: var(--up); }}
+    .pct-down {{ color: var(--down); }}
+
+    .buttons-grid {{ display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }}
+    .action-btn {{ border: 1px solid rgba(122, 162, 247, .16); background: linear-gradient(180deg, rgba(30,41,59,.98), rgba(15,23,42,.96)); color: var(--text); border-radius: 16px; min-height: 78px; padding: 12px; text-align: left; cursor: pointer; transition: transform 140ms ease, border-color 140ms ease, background 140ms ease; }}
+    .action-btn:hover {{ transform: translateY(-2px); border-color: rgba(122, 162, 247, .38); background: linear-gradient(180deg, rgba(38,52,77,.98), rgba(15,23,42,.96)); }}
+    .action-btn .btn-title {{ display: block; font-size: 15px; font-weight: 700; margin-bottom: 7px; }}
+    .action-btn .btn-sub {{ display: block; font-size: 12px; color: var(--text-dim); line-height: 1.45; }}
+
+    .detail-top {{ display: flex; align-items: center; gap: 10px; margin-bottom: 12px; position: sticky; top: 0; padding-bottom: 6px; background: linear-gradient(180deg, rgba(17,24,39,.96), rgba(17,24,39,.8), transparent); backdrop-filter: blur(8px); z-index: 3; }}
+    .back-btn {{ border: 1px solid rgba(148,163,184,.14); background: rgba(30,41,59,.9); color: var(--text); border-radius: 12px; min-width: 38px; height: 38px; font-size: 20px; cursor: pointer; }}
+    .detail-title {{ font-size: 18px; font-weight: 700; }}
+    .detail-sub {{ font-size: 12px; color: var(--text-dim); margin-top: 2px; }}
+
+    .table-wrap {{ border: 1px solid rgba(148,163,184,.10); border-radius: 16px; overflow: hidden; background: rgba(15,23,42,.72); }}
+    table {{ width: 100%; border-collapse: collapse; table-layout: fixed; }}
+    thead {{ background: rgba(30,41,59,.92); position: sticky; top: 54px; z-index: 2; }}
+    th, td {{ padding: 10px 10px; border-bottom: 1px solid rgba(148,163,184,.08); font-size: 12.5px; text-align: right; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }}
+    th:first-child, td:first-child {{ text-align: left; }}
+    tbody tr:hover {{ background: rgba(51,65,85,.22); }}
+    .empty {{ padding: 28px 14px; text-align: center; color: var(--text-dim); font-size: 13px; }}
+
+    @media (max-width: 1180px) {{
+      .content {{ grid-template-columns: 1fr; }}
+      .side-shell {{ height: min(52vh, 540px); }}
     }}
   </style>
+  <script>{plotly_js}</script>
 </head>
 <body>
-  <div class=\"page\">
-    <div class=\"main\">
-      <section class=\"panel hero\">
-        <h1 class=\"headline\">{title_text}</h1>
-        <p class=\"subhead\">默认显示累计收益视图。缩放后会自动重算纵轴范围；区间较大时显示平滑曲线，区间缩短后自动切换成无影线 K 线（上涨红色、下跌蓝色），并在悬浮时展示当日细节。</p>
-      </section>
-      <section class=\"stats\">
-        <div class=\"panel stat-card\"><div class=\"label\">交易日数量</div><div class=\"value\" id=\"stat-days\"></div></div>
-        <div class=\"panel stat-card\"><div class=\"label\">期初总资产</div><div class=\"value\" id=\"stat-start\"></div></div>
-        <div class=\"panel stat-card\"><div class=\"label\">期末总资产</div><div class=\"value\" id=\"stat-end\"></div></div>
-        <div class=\"panel stat-card\"><div class=\"label\">累计收益率</div><div class=\"value\" id=\"stat-return\"></div></div>
-      </section>
-      <section class=\"panel chart-panel\">
-        <div id=\"chart\"></div>
-      </section>
+  <div class="app">
+    <div class="header">
+      <div class="title-wrap">
+        <div class="title" id="page-title"></div>
+        <div class="subtitle">主图支持点击选日；下方时间框可拖动选择范围；范围较大时自动切换为折线，小范围保持无影线日K。</div>
+      </div>
+      <div class="legend">
+        <span class="legend-item"><span class="legend-dot" style="background: var(--up);"></span>上涨</span>
+        <span class="legend-item"><span class="legend-dot" style="background: var(--down);"></span>下跌</span>
+        <span class="legend-item"><span class="legend-dot" style="background: var(--line);"></span>大范围折线</span>
+      </div>
     </div>
-    <aside class="sidebar">
-      <h2 class="sidebar-title">当日明细</h2>
-      <p class="sidebar-subtitle">默认展示最后一个交易日。点击图上的任意点或柱体，可在这里查看结构化的交易摘要、持仓变化与买卖记录。</p>
-      <div class="sidebar-stage">
-        <div class="sidebar-track" id="sidebar-track">
-          <section class="sidebar-pane">
-            <div class="detail-grid">
-              <div class="panel detail-card"><div class="label">交易日</div><div class="value" id="detail-date"></div></div>
-              <div class="panel detail-card"><div class="label">asof_date</div><div class="value" id="detail-asof"></div></div>
-              <div class="panel detail-card"><div class="label">日收益率</div><div class="value" id="detail-daily-return"></div></div>
-              <div class="panel detail-card"><div class="label">累计收益率</div><div class="value" id="detail-cum-return"></div></div>
+
+    <div class="content">
+      <div class="chart-shell">
+        <div class="hint" id="chart-hint"></div>
+        <div id="chart"></div>
+      </div>
+
+      <div class="side-shell">
+        <div class="slider-wrap" id="panel-slider">
+          <div class="panel-page" id="overview-page">
+            <div class="section">
+              <div class="section-title">日信息概览</div>
+              <div class="kv-grid" id="overview-grid"></div>
             </div>
-            <div id="detail-summary"></div>
-            <div class="section-button-grid" id="section-buttons"></div>
-          </section>
-          <section class="sidebar-pane">
-            <div class="detail-shell">
-              <div class="detail-header">
-                <button class="back-button" id="detail-back" type="button">← 返回</button>
-                <div class="detail-panel-title" id="detail-panel-title">详情</div>
+
+            <div class="section">
+              <div class="section-title">日资产摘要</div>
+              <div class="kv-grid" id="asset-grid"></div>
+            </div>
+
+            <div class="section">
+              <div class="section-title">明细</div>
+              <div class="buttons-grid">
+                <button class="action-btn" data-detail="initial_positions">
+                  <span class="btn-title">期初持仓</span>
+                  <span class="btn-sub">查看开盘前持仓列表与浮盈亏。</span>
+                </button>
+                <button class="action-btn" data-detail="sell_records">
+                  <span class="btn-title">卖出详细</span>
+                  <span class="btn-sub">查看当日卖出价格、数量与已实现盈亏。</span>
+                </button>
+                <button class="action-btn" data-detail="buy_records">
+                  <span class="btn-title">买入详细</span>
+                  <span class="btn-sub">查看当日买入成本与数量。</span>
+                </button>
+                <button class="action-btn" data-detail="final_positions">
+                  <span class="btn-title">期末持仓</span>
+                  <span class="btn-sub">查看收盘后持仓列表与浮盈亏。</span>
+                </button>
               </div>
-              <div id="detail-panel-content"></div>
             </div>
-          </section>
+          </div>
+
+          <div class="panel-page" id="detail-page">
+            <div class="detail-top">
+              <button class="back-btn" id="back-btn" title="返回">←</button>
+              <div>
+                <div class="detail-title" id="detail-title">明细</div>
+                <div class="detail-sub" id="detail-sub">-</div>
+              </div>
+            </div>
+            <div class="table-wrap" id="detail-wrap"></div>
+          </div>
         </div>
       </div>
-    </aside>
+    </div>
   </div>
+
   <script>
-    const rows = {rows_json};
-    const SHORT_WINDOW_THRESHOLD = {SHORT_WINDOW_THRESHOLD};
-    let syncLock = false;
+    const APP_TITLE = {title_json};
+    const DAYS = {payload};
+    const CANDLE_THRESHOLD = 90;
+    const UP_COLOR = getComputedStyle(document.documentElement).getPropertyValue('--up').trim();
+    const DOWN_COLOR = getComputedStyle(document.documentElement).getPropertyValue('--down').trim();
+    const LINE_COLOR = getComputedStyle(document.documentElement).getPropertyValue('--line').trim();
+    const ACCENT = getComputedStyle(document.documentElement).getPropertyValue('--accent').trim();
 
-    function formatMoney(v) {{
-      const num = Number(v || 0);
-      return new Intl.NumberFormat('zh-CN', {{ minimumFractionDigits: 2, maximumFractionDigits: 2 }}).format(num);
+    let selectedIndex = Math.max(0, DAYS.length - 1);
+    let currentRange = null;
+    let currentMode = null;
+    let currentDetail = 'final_positions';
+    let gd = null;
+
+    const DETAIL_META = {{
+      initial_positions: {{ title: '期初持仓', desc: '期初持仓明细', columns: [
+        {{ key: 'code', label: '代码', align: 'left' }},
+        {{ key: 'cost', label: '成本' }},
+        {{ key: 'qty', label: '数量' }},
+        {{ key: 'float_pnl', label: '浮盈亏', pnl: true }}
+      ] }},
+      sell_records: {{ title: '卖出详细', desc: '当日卖出成交', columns: [
+        {{ key: 'code', label: '代码', align: 'left' }},
+        {{ key: 'price', label: '卖价' }},
+        {{ key: 'cost', label: '成本' }},
+        {{ key: 'qty', label: '数量' }},
+        {{ key: 'realized_pnl', label: '已实现盈亏', pnl: true }}
+      ] }},
+      buy_records: {{ title: '买入详细', desc: '当日买入成交', columns: [
+        {{ key: 'code', label: '代码', align: 'left' }},
+        {{ key: 'cost', label: '成本' }},
+        {{ key: 'qty', label: '数量' }}
+      ] }},
+      final_positions: {{ title: '期末持仓', desc: '期末持仓明细', columns: [
+        {{ key: 'code', label: '代码', align: 'left' }},
+        {{ key: 'cost', label: '成本' }},
+        {{ key: 'qty', label: '数量' }},
+        {{ key: 'float_pnl', label: '浮盈亏', pnl: true }}
+      ] }},
+    }};
+
+    function fmtNumber(value, digits = 2) {{
+      const num = Number(value || 0);
+      return num.toLocaleString('zh-CN', {{ minimumFractionDigits: digits, maximumFractionDigits: digits }});
     }}
 
-    function formatPct(v) {{
-      return `${{(Number(v || 0) * 100).toFixed(2)}}%`;
+    function fmtMoney(value) {{
+      return fmtNumber(value, 2);
     }}
 
-    function escapeHtml(value) {{
-      return String(value ?? '')
-        .replace(/&/g, '&amp;')
-        .replace(/</g, '&lt;')
-        .replace(/>/g, '&gt;')
-        .replace(/"/g, '&quot;')
-        .replace(/'/g, '&#39;');
+    function fmtQty(value) {{
+      const num = Number(value || 0);
+      const digits = Number.isInteger(num) ? 0 : 2;
+      return num.toLocaleString('zh-CN', {{ minimumFractionDigits: digits, maximumFractionDigits: digits }});
     }}
 
-    function setValue(id, text, cls='') {{
-      const el = document.getElementById(id);
-      el.textContent = text;
-      el.className = `value ${{cls}}`.trim();
+    function fmtPct(value) {{
+      const num = Number(value || 0) * 100;
+      return `${{num >= 0 ? '+' : ''}}${{num.toFixed(2)}}%`;
     }}
 
-    function sectionHtml(title, innerHtml) {{
-      return `<section class="section"><h3 class="section-title">${{title}}</h3>${{innerHtml}}</section>`;
+    function pnlClass(value) {{
+      return Number(value || 0) >= 0 ? 'pct-up' : 'pct-down';
     }}
 
-    function metricCard(label, value, cls='') {{
-      return `<div class="panel metric-card"><div class="label">${{escapeHtml(label)}}</div><div class="value ${{cls}}">${{escapeHtml(value)}}</div></div>`;
+    function parseDate(dateStr) {{
+      return new Date(`${{dateStr}}T00:00:00`);
     }}
 
-    function emptyState(text) {{
-      return `<div class="empty">${{escapeHtml(text)}}</div>`;
+    function isInRange(dateStr, range) {{
+      if (!range || !range[0] || !range[1]) return true;
+      const x = parseDate(dateStr).getTime();
+      return x >= new Date(range[0]).getTime() && x <= new Date(range[1]).getTime();
     }}
 
-    function recordCard(record, kindLabel) {{
-      const items = Object.entries(record || {{}})
-        .filter(([key]) => key !== 'code')
-        .map(([key, value]) => `
-          <div class="kv">
-            <div class="label">${{escapeHtml(key)}}</div>
-            <div class="text">${{typeof value === 'number' ? escapeHtml(formatMoney(value)) : escapeHtml(String(value))}}</div>
-          </div>
-        `)
-        .join('');
-      return `
-        <article class="panel trade-card">
-          <div class="trade-card-head">
-            <div class="trade-code">${{escapeHtml(record.code || '-')}}</div>
-            <span class="pill">${{escapeHtml(kindLabel)}}</span>
-          </div>
-          <div class="kv-grid">${{items}}</div>
-        </article>
-      `;
+    function visibleCount() {{
+      return DAYS.filter(d => isInRange(d.trade_date, currentRange)).length;
     }}
 
-    function recordsSection(title, records, emptyText, kindLabel) {{
-      if (!records || !records.length) return sectionHtml(title, emptyState(emptyText));
-      return sectionHtml(title, `<div class="list">${{records.map(row => recordCard(row, kindLabel)).join('')}}</div>`);
+    function modeForRange() {{
+      return visibleCount() > CANDLE_THRESHOLD ? 'line' : 'candlestick';
     }}
 
-    function buildSummaryContent(row) {{
-      const payload = row.payload || {{}};
-      return sectionHtml('资产摘要', `
-        <div class="metric-grid">
-          ${{metricCard('期初持仓市值', formatMoney(payload.initial_holding_amount || 0))}}
-          ${{metricCard('期初现金', formatMoney(payload.initial_cash || 0))}}
-          ${{metricCard('期末持仓市值', formatMoney(payload.final_holding_amount || 0))}}
-          ${{metricCard('期末现金', formatMoney(payload.final_cash || 0))}}
-          ${{metricCard('期初总资产', formatMoney(payload.initial_total_asset || row.initial_total_asset))}}
-          ${{metricCard('期末总资产', formatMoney(payload.final_total_asset || row.final_total_asset))}}
+    function selectedDay() {{
+      return DAYS[Math.max(0, Math.min(selectedIndex, DAYS.length - 1))];
+    }}
+
+    function closestIndexByDate(x) {{
+      const target = new Date(x).getTime();
+      let bestIdx = 0;
+      let bestDist = Infinity;
+      DAYS.forEach((d, i) => {{
+        const dist = Math.abs(parseDate(d.trade_date).getTime() - target);
+        if (dist < bestDist) {{
+          bestDist = dist;
+          bestIdx = i;
+        }}
+      }});
+      return bestIdx;
+    }}
+
+    function renderInfoCards() {{
+      const d = selectedDay();
+
+      const overview = [
+        {{ label: '交易日', value: d.trade_date }},
+        {{ label: '上交易日', value: d.prev_date || '-' }},
+        {{ label: '日收益率', value: fmtPct(d.daily_return), cls: pnlClass(d.daily_return) }},
+        {{ label: '累计收益率', value: fmtPct(d.cumulative_return), cls: pnlClass(d.cumulative_return) }},
+      ];
+
+      const assets = [
+        {{ label: '期初持仓市值', value: fmtMoney(d.initial_holding_amount) }},
+        {{ label: '期初现金', value: fmtMoney(d.initial_cash) }},
+        {{ label: '期末持仓市值', value: fmtMoney(d.final_holding_amount) }},
+        {{ label: '期末现金', value: fmtMoney(d.final_cash) }},
+        {{ label: '期初总资产', value: fmtMoney(d.initial_total_asset), full: true }},
+        {{ label: '期末总资产', value: fmtMoney(d.final_total_asset), full: true }},
+      ];
+
+      document.getElementById('overview-grid').innerHTML = overview.map(item => `
+        <div class="kv-card">
+          <div class="kv-label">${{item.label}}</div>
+          <div class="kv-value ${{item.cls || ''}}">${{item.value}}</div>
         </div>
-      `);
-    }}
+      `).join('');
 
-    function buildDrilldownSections(row) {{
-      const payload = row.payload || {{}};
-      return {{
-        initial_positions: {{ title: '期初持仓', html: recordsSection('期初持仓', payload.initial_positions || [], '当日开盘前没有持仓。', '持仓') }},
-        buy_records: {{ title: '买入记录', html: recordsSection('买入记录', payload.buy_records || [], '当日没有买入记录。', '买入') }},
-        sell_records: {{ title: '卖出记录', html: recordsSection('卖出记录', payload.sell_records || [], '当日没有卖出记录。', '卖出') }},
-        final_positions: {{ title: '期末持仓', html: recordsSection('期末持仓', payload.final_positions || [], '当日收盘后没有持仓。', '收盘') }},
-      }};
-    }}
-
-    function buildSectionButtons() {{
-      return [
-        {{ key: 'initial_positions', title: '期初持仓', desc: '查看开盘前已持有的仓位明细。' }},
-        {{ key: 'buy_records', title: '买入', desc: '查看当日新开仓与加仓记录。' }},
-        {{ key: 'sell_records', title: '卖出', desc: '查看当日止盈、止损和调仓卖出。' }},
-        {{ key: 'final_positions', title: '期末持仓', desc: '查看收盘后剩余持仓状态。' }},
-      ].map((item) => `
-        <button class="panel section-button" type="button" data-section-key="${{item.key}}">
-          <div class="section-button-title">${{item.title}}</div>
-          <div class="section-button-desc">${{item.desc}}</div>
-        </button>
+      document.getElementById('asset-grid').innerHTML = assets.map(item => `
+        <div class="kv-card ${{item.full ? 'full' : ''}}">
+          <div class="kv-label">${{item.label}}</div>
+          <div class="kv-value">${{item.value}}</div>
+        </div>
       `).join('');
     }}
 
-    function updateSummary() {{
-      const first = rows[0];
-      const last = rows[rows.length - 1];
-      document.getElementById('stat-days').textContent = String(rows.length);
-      document.getElementById('stat-start').textContent = formatMoney(first.initial_total_asset);
-      document.getElementById('stat-end').textContent = formatMoney(last.final_total_asset);
-      const cls = last.cum_return >= 0 ? 'positive' : 'negative';
-      const ret = document.getElementById('stat-return');
-      ret.textContent = formatPct(last.cum_return);
-      ret.className = `value ${{cls}}`;
+    function cellHtml(value, col) {{
+      if (col.key === 'qty') return fmtQty(value);
+      if (typeof value === 'number') return fmtMoney(value);
+      return value == null ? '-' : String(value);
     }}
 
-    function showSummaryPane() {{
-      document.getElementById('sidebar-track').classList.remove('is-detail');
-    }}
+    function renderDetailTable() {{
+      const d = selectedDay();
+      const meta = DETAIL_META[currentDetail];
+      const rows = d[currentDetail] || [];
+      document.getElementById('detail-title').textContent = meta.title;
+      document.getElementById('detail-sub').textContent = `${{d.trade_date}} · ${{meta.desc}} · 共 ${{rows.length}} 条`;
 
-    function showSectionPane(title, html) {{
-      document.getElementById('detail-panel-title').textContent = title;
-      document.getElementById('detail-panel-content').innerHTML = html;
-      document.getElementById('sidebar-track').classList.add('is-detail');
-    }}
-
-    function bindSectionButtons(row) {{
-      const sections = buildDrilldownSections(row);
-      document.querySelectorAll('[data-section-key]').forEach((btn) => {{
-        btn.addEventListener('click', () => {{
-          const key = btn.getAttribute('data-section-key');
-          const section = sections[key];
-          if (!section) return;
-          showSectionPane(section.title, section.html);
-        }});
-      }});
-    }}
-
-    function updateDetail(idx) {{
-      const row = rows[idx];
-      document.getElementById('detail-date').textContent = row.date;
-      document.getElementById('detail-asof').textContent = row.asof_date || '-';
-      setValue('detail-daily-return', formatPct(row.daily_return), row.daily_return >= 0 ? 'positive' : 'negative');
-      setValue('detail-cum-return', formatPct(row.cum_return), row.cum_return >= 0 ? 'positive' : 'negative');
-      document.getElementById('detail-summary').innerHTML = buildSummaryContent(row);
-      document.getElementById('section-buttons').innerHTML = buildSectionButtons();
-      bindSectionButtons(row);
-      showSummaryPane();
-    }}
-
-    function parseDate(value) {{
-      return new Date(`${{value}}T00:00:00`);
-    }}
-
-    function getVisibleIndices(relayout, graphDiv = null) {{
-      let start = 0;
-      let end = rows.length - 1;
-      const graphRange = graphDiv?.layout?.xaxis?.range || null;
-      const x0 = relayout?.['xaxis.range[0]'] ?? relayout?.xaxis?.range?.[0] ?? graphRange?.[0];
-      const x1 = relayout?.['xaxis.range[1]'] ?? relayout?.xaxis?.range?.[1] ?? graphRange?.[1];
-      if (x0 || x1) {{
-        const left = x0 ? parseDate(x0) : parseDate(rows[0].date);
-        const right = x1 ? parseDate(x1) : parseDate(rows[rows.length - 1].date);
-        while (start < rows.length - 1 && parseDate(rows[start].date) < left) start += 1;
-        while (end > 0 && parseDate(rows[end].date) > right) end -= 1;
-        if (end < start) return [0, rows.length - 1];
+      const wrap = document.getElementById('detail-wrap');
+      if (!rows.length) {{
+        wrap.innerHTML = '<div class="empty">该日没有对应明细。</div>';
+        return;
       }}
-      return [start, end];
+
+      const thead = `<thead><tr>${{meta.columns.map(col => `<th style="text-align:${{col.align || 'right'}}">${{col.label}}</th>`).join('')}}</tr></thead>`;
+      const tbody = `<tbody>${{rows.map(row => `<tr>${{meta.columns.map(col => {{
+        const raw = row[col.key];
+        const cls = col.pnl ? pnlClass(raw) : '';
+        const align = col.align || 'right';
+        return `<td class="${{cls}}" style="text-align:${{align}}">${{cellHtml(raw, col)}}</td>`;
+      }}).join('')}}</tr>`).join('')}}</tbody>`;
+      wrap.innerHTML = `<table>${{thead}}${{tbody}}</table>`;
     }}
 
-    function visibleRows(relayout, graphDiv = null) {{
-      const [start, end] = getVisibleIndices(relayout, graphDiv);
-      return rows.slice(start, end + 1);
+    function detailOpen(open) {{
+      document.getElementById('panel-slider').classList.toggle('detail-open', open);
     }}
 
-    function computeYRange(relayout, mode, graphDiv = null) {{
-      const currentRows = visibleRows(relayout, graphDiv);
-      const values = [];
-      if (mode === 'candlestick') {{
-        currentRows.forEach((row) => {{
-          values.push(row.start_cum_return * 100, row.cum_return * 100);
+    function buildChartTraces(mode) {{
+      const x = DAYS.map(d => d.trade_date);
+      const open = DAYS.map(d => d.open_asset);
+      const high = DAYS.map(d => d.high_asset);
+      const low = DAYS.map(d => d.low_asset);
+      const close = DAYS.map(d => d.close_asset);
+      const upX = DAYS.filter(d => d.close_asset >= d.open_asset).map(d => d.trade_date);
+      const upY = DAYS.filter(d => d.close_asset >= d.open_asset).map(d => d.close_asset);
+      const downX = DAYS.filter(d => d.close_asset < d.open_asset).map(d => d.trade_date);
+      const downY = DAYS.filter(d => d.close_asset < d.open_asset).map(d => d.close_asset);
+      const traces = [];
+
+      if (mode === 'line') {{
+        traces.push({{
+          type: 'scatter',
+          mode: 'lines',
+          x, y: close,
+          line: {{ color: LINE_COLOR, width: 2.6 }},
+          hovertemplate: '日期: %{{x}}<br>期末总资产: %{{y:,.2f}}<extra></extra>',
+          name: '总资产'
+        }});
+        traces.push({{
+          type: 'scatter', mode: 'markers', x: upX, y: upY,
+          marker: {{ color: UP_COLOR, size: 6.5, opacity: .92 }},
+          hovertemplate: '日期: %{{x}}<br>期末总资产: %{{y:,.2f}}<extra></extra>',
+          name: '上涨'
+        }});
+        traces.push({{
+          type: 'scatter', mode: 'markers', x: downX, y: downY,
+          marker: {{ color: DOWN_COLOR, size: 6.5, opacity: .92 }},
+          hovertemplate: '日期: %{{x}}<br>期末总资产: %{{y:,.2f}}<extra></extra>',
+          name: '下跌'
         }});
       }} else {{
-        currentRows.forEach((row) => values.push(row.cum_return * 100));
-      }}
-      const min = Math.min(...values);
-      const max = Math.max(...values);
-      const span = Math.max(max - min, 0.4);
-      const pad = Math.max(span * 0.12, 0.08);
-      return [min - pad, max + pad];
-    }}
-
-    function chooseMode(relayout, graphDiv = null) {{
-      return visibleRows(relayout, graphDiv).length <= SHORT_WINDOW_THRESHOLD ? 'candlestick' : 'line';
-    }}
-
-    function buildTrace(mode) {{
-      if (mode === 'candlestick') {{
-        return {{
+        traces.push({{
           type: 'candlestick',
-          x: rows.map(r => r.date),
-          open: rows.map(r => r.start_cum_return * 100),
-          close: rows.map(r => r.cum_return * 100),
-          high: rows.map(r => Math.max(r.start_cum_return, r.cum_return) * 100),
-          low: rows.map(r => Math.min(r.start_cum_return, r.cum_return) * 100),
-          customdata: rows.map((r, idx) => [idx, r.daily_return * 100, r.final_total_asset]),
-          increasing: {{ line: {{ color: '#d92d20', width: 1.4 }}, fillcolor: '#d92d20' }},
-          decreasing: {{ line: {{ color: '#1570ef', width: 1.4 }}, fillcolor: '#1570ef' }},
+          x, open, high, low, close,
           whiskerwidth: 0,
-          hovertemplate: [
-            '日期: %{{x}}',
-            '开盘累计收益率: %{{open:.2f}}%',
-            '收盘累计收益率: %{{close:.2f}}%',
-            '日收益率: %{{customdata[1]:.2f}}%',
-            '期末总资产: %{{customdata[2]:,.2f}}',
-            '<extra></extra>'
-          ].join('<br>')
-        }};
+          increasing: {{ line: {{ color: UP_COLOR, width: 1.2 }}, fillcolor: UP_COLOR }},
+          decreasing: {{ line: {{ color: DOWN_COLOR, width: 1.2 }}, fillcolor: DOWN_COLOR }},
+          hovertemplate: '日期: %{{x}}<br>期初总资产: %{{open:,.2f}}<br>期末总资产: %{{close:,.2f}}<extra></extra>',
+          name: '日资产K'
+        }});
       }}
-      return {{
-        type: 'scatter',
-        mode: 'lines',
-        x: rows.map(r => r.date),
-        y: rows.map(r => r.cum_return * 100),
-        customdata: rows.map((r, idx) => [idx, r.daily_return * 100, r.final_total_asset]),
-        line: {{ color: '#175cd3', width: 2.5, shape: 'spline', smoothing: 0.8 }},
-        hovertemplate: [
-          '日期: %{{x}}',
-          '累计收益率: %{{y:.2f}}%',
-          '日收益率: %{{customdata[1]:.2f}}%',
-          '期末总资产: %{{customdata[2]:,.2f}}',
-          '<extra></extra>'
-        ].join('<br>')
-      }};
+
+      const sel = selectedDay();
+      traces.push({{
+        type: 'scatter', mode: 'markers',
+        x: [sel.trade_date], y: [sel.close_asset],
+        marker: {{ size: 13, color: 'rgba(226,232,240,.92)', line: {{ width: 2, color: ACCENT }} }},
+        hoverinfo: 'skip', showlegend: false,
+        name: '选中'
+      }});
+      return traces;
     }}
 
-    function buildLayout(mode, relayout, graphDiv = null) {{
+    function buildChartLayout(mode) {{
+      const sel = selectedDay();
       return {{
-        margin: {{ l: 68, r: 24, t: 28, b: 64 }},
-        hovermode: 'x unified',
-        dragmode: 'zoom',
-        showlegend: false,
         paper_bgcolor: 'rgba(0,0,0,0)',
         plot_bgcolor: 'rgba(0,0,0,0)',
+        margin: {{ l: 58, r: 22, t: 22, b: 54 }},
+        showlegend: false,
+        hovermode: 'x unified',
+        dragmode: 'zoom',
         xaxis: {{
-          title: '交易日',
-          rangeslider: {{ visible: true }},
+          type: 'date',
           showgrid: false,
-          range: relayout?.['xaxis.range[0]'] ? [relayout['xaxis.range[0]'], relayout['xaxis.range[1]']] : undefined
+          zeroline: false,
+          tickfont: {{ color: '#9CA3AF' }},
+          showspikes: true,
+          spikecolor: 'rgba(148,163,184,.35)',
+          spikethickness: 1,
+          spikesnap: 'cursor',
+          rangeslider: {{
+            visible: true,
+            thickness: 0.12,
+            bgcolor: 'rgba(15,23,42,.88)',
+            bordercolor: 'rgba(148,163,184,.18)',
+            borderwidth: 1
+          }},
+          range: currentRange || undefined,
         }},
         yaxis: {{
-          title: mode === 'candlestick' ? '累计收益率 K 线 (%)' : '累计收益率 (%)',
-          ticksuffix: '%',
-          gridcolor: 'rgba(148, 163, 184, 0.18)',
-          zerolinecolor: 'rgba(148, 163, 184, 0.25)',
-          range: computeYRange(relayout, mode, graphDiv),
-          fixedrange: false
-        }}
+          title: {{ text: '总资产', font: {{ color: '#9CA3AF', size: 12 }} }},
+          tickfont: {{ color: '#9CA3AF' }},
+          gridcolor: 'rgba(148,163,184,.10)',
+          zeroline: false,
+          separatethousands: true,
+          tickformat: ',.0f'
+        }},
+        shapes: [{{
+          type: 'line', xref: 'x', yref: 'paper',
+          x0: sel.trade_date, x1: sel.trade_date,
+          y0: 0, y1: 1,
+          line: {{ color: 'rgba(122,162,247,.55)', width: 1.25, dash: 'dot' }}
+        }}],
+        annotations: [{{
+          x: sel.trade_date, y: sel.close_asset,
+          xref: 'x', yref: 'y',
+          text: `选中: ${{sel.trade_date}}`,
+          showarrow: true,
+          arrowhead: 2,
+          ax: 40,
+          ay: -40,
+          font: {{ size: 11, color: '#E5E7EB' }},
+          bgcolor: 'rgba(15,23,42,.92)',
+          bordercolor: 'rgba(122,162,247,.36)',
+          borderwidth: 1,
+          borderpad: 6,
+          arrowcolor: 'rgba(122,162,247,.58)'
+        }}]
       }};
     }}
 
-    function renderChart(relayout = null) {{
-      const graphDiv = document.getElementById('chart');
-      const mode = chooseMode(relayout, graphDiv);
-      const trace = buildTrace(mode);
-      const layout = buildLayout(mode, relayout, graphDiv);
-      return Plotly.react(graphDiv, [trace], layout, {{ responsive: true, displaylogo: false }});
+    function renderChart(force = false) {{
+      const mode = modeForRange();
+      document.getElementById('chart-hint').textContent = mode === 'line'
+        ? `当前窗口共 ${{visibleCount()}} 个交易日，已切换为折线视图。`
+        : `当前窗口共 ${{visibleCount()}} 个交易日，使用无影线日K视图。`;
+
+      const traces = buildChartTraces(mode);
+      const layout = buildChartLayout(mode);
+      const config = {{ responsive: true, displaylogo: false, scrollZoom: true }};
+      Plotly.react('chart', traces, layout, config).then(() => {{
+        gd = document.getElementById('chart');
+        if (force || currentMode == null) bindChartEvents();
+      }});
+      currentMode = mode;
     }}
 
-    updateSummary();
-    updateDetail(rows.length - 1);
-    document.getElementById('detail-back').addEventListener('click', showSummaryPane);
+    function bindChartEvents() {{
+      if (!gd || gd.__eventsBound) return;
+      gd.__eventsBound = true;
 
-    renderChart().then((plot) => {{
-      plot.on('plotly_click', (event) => {{
-        if (!event.points || !event.points.length) return;
-        const idx = event.points[0].customdata?.[0];
-        if (idx === undefined) return;
-        updateDetail(idx);
+      gd.on('plotly_click', (ev) => {{
+        if (!ev || !ev.points || !ev.points.length) return;
+        const p = ev.points[0];
+        if (typeof p.pointIndex === 'number') {{
+          selectedIndex = p.pointIndex;
+        }} else if (p.x) {{
+          selectedIndex = closestIndexByDate(p.x);
+        }}
+        renderInfoCards();
+        renderDetailTable();
+        renderChart(false);
       }});
 
-      plot.on('plotly_relayout', (event) => {{
-        if (syncLock) return;
-        if (event['xaxis.autorange']) {{
-          syncLock = true;
-          renderChart(null).then(() => {{ syncLock = false; }});
+      gd.on('plotly_relayout', (ev) => {{
+        if (!ev) return;
+        let nextRange = currentRange;
+        if (Array.isArray(ev['xaxis.range'])) {{
+          nextRange = ev['xaxis.range'];
+        }} else if (ev['xaxis.range[0]'] && ev['xaxis.range[1]']) {{
+          nextRange = [ev['xaxis.range[0]'], ev['xaxis.range[1]']];
+        }} else if (ev['xaxis.autorange']) {{
+          nextRange = null;
+        }} else {{
           return;
         }}
-        if (!event['xaxis.range[0]'] && !event['xaxis.range[1]']) return;
-        syncLock = true;
-        renderChart(event).then(() => {{ syncLock = false; }});
+
+        const prevMode = currentMode;
+        currentRange = nextRange;
+        const nextMode = modeForRange();
+        if (prevMode !== nextMode) {{
+          renderChart(false);
+        }}
       }});
-    }});
+    }}
+
+    function setupButtons() {{
+      document.querySelectorAll('.action-btn').forEach(btn => {{
+        btn.addEventListener('click', () => {{
+          currentDetail = btn.dataset.detail;
+          renderDetailTable();
+          detailOpen(true);
+        }});
+      }});
+      document.getElementById('back-btn').addEventListener('click', () => detailOpen(false));
+    }}
+
+    function boot() {{
+      document.getElementById('page-title').textContent = APP_TITLE;
+      renderInfoCards();
+      renderDetailTable();
+      renderChart(true);
+      setupButtons();
+    }}
+
+    boot();
   </script>
 </body>
 </html>
 """
 
 
-def main() -> None:
-    parser = argparse.ArgumentParser(description="Generate an interactive HTML viewer for backtest daily json outputs")
-    parser.add_argument("--backtest-dir", required=True, help="directory containing daily backtest json files")
-    parser.add_argument("--out-file", default="", help="output html file path; defaults to <backtest-dir>/backtest_report.html")
-    parser.add_argument("--title", default="Backtest Daily Return Viewer")
-    args = parser.parse_args()
+def write_html_file(html: str, output_html: Path | None) -> Path:
+    if output_html is not None:
+        output_html.parent.mkdir(parents=True, exist_ok=True)
+        output_html.write_text(html, encoding="utf-8")
+        return output_html
 
-    backtest_dir = Path(args.backtest_dir)
-    out_file = Path(args.out_file) if args.out_file else backtest_dir / "backtest_report.html"
-    rows = _load_backtest_rows(backtest_dir)
-    html_text = _build_html(rows, args.title)
-    out_file.write_text(html_text, encoding="utf-8")
-    print(f"saved {out_file}")
+    tmp_dir = Path(tempfile.mkdtemp(prefix="backtest_viz_"))
+    out = tmp_dir / "backtest_visualizer.html"
+    out.write_text(html, encoding="utf-8")
+    return out
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(description="Backtest visualizer")
+    parser.add_argument("--backtest-dir", required=True, help="Directory containing daily json files")
+    parser.add_argument("--title", default="Backtest Visualizer", help="Page title")
+    parser.add_argument("--output-html", default="", help="Optional path to save the generated html")
+    parser.add_argument("--no-open", action="store_true", help="Generate html but do not open browser")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    backtest_dir = Path(args.backtest_dir).expanduser().resolve()
+    if not backtest_dir.exists() or not backtest_dir.is_dir():
+        print(f"[ERROR] backtest-dir does not exist or is not a directory: {backtest_dir}", file=sys.stderr)
+        return 2
+
+    try:
+        days = load_backtest_records(backtest_dir)
+        html = build_html(days, args.title)
+        output_path = write_html_file(html, Path(args.output_html).expanduser().resolve() if args.output_html else None)
+    except Exception as exc:
+        print(f"[ERROR] {exc}", file=sys.stderr)
+        return 1
+
+    print(f"Generated HTML: {output_path}")
+    if not args.no_open:
+        webbrowser.open(output_path.as_uri())
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    raise SystemExit(main())
