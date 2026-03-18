@@ -32,18 +32,6 @@ class FlowContext:
     flow_by_date: dict[str, np.ndarray]
 
 
-@dataclass
-class WorkerContext:
-    device: torch.device
-    model: MultiScaleRegressor
-    data_dir: str
-    asof_dates: list[str]
-    infer_batch_size: int
-
-
-_WORKER_CONTEXT: WorkerContext | None = None
-
-
 def _iter_progress(iterable, total: int, show_progress: bool, desc: str):
     if show_progress and tqdm is not None:
         return tqdm(iterable, total=total, desc=desc)
@@ -183,6 +171,60 @@ def _flow_window_from_context(ctx: FlowContext | None, asof: str) -> tuple[np.nd
     return flow_x, np.ones((30,), dtype=np.uint8), True
 
 
+def _build_feature_shard(data_dir: str, code: str, asof_dates: list[str], out_dir: str) -> dict[str, Any]:
+    flow_ctx = _build_flow_context(Path(data_dir), code)
+    n = len(asof_dates)
+    payload = {
+        "code": code,
+        "asof_dates": np.asarray(asof_dates, dtype=object),
+        "x_micro": np.zeros((n, 48, 6), dtype=np.float32),
+        "x_mezzo": np.zeros((n, 40, 6), dtype=np.float32),
+        "x_macro": np.zeros((n, 30, 6), dtype=np.float32),
+        "mask_micro": np.zeros((n, 48), dtype=np.uint8),
+        "mask_mezzo": np.zeros((n, 40), dtype=np.uint8),
+        "mask_macro": np.zeros((n, 30), dtype=np.uint8),
+        "flow_x": np.zeros((n, 30, 4), dtype=np.float32),
+        "flow_mask": np.zeros((n, 30), dtype=np.uint8),
+        "tensor_ok": np.zeros((n,), dtype=np.bool_),
+        "flow_ok": np.zeros((n,), dtype=np.bool_),
+        "sample_ok": np.zeros((n,), dtype=np.bool_),
+        "reason": np.empty((n,), dtype=object),
+    }
+
+    for idx, asof in enumerate(asof_dates):
+        dp = build_multiscale_tensors(data_dir, code, asof)
+        flow_x, flow_mask, flow_ok = _flow_window_from_context(flow_ctx, asof)
+        tensor_ok = bool(dp.dp_ok)
+        sample_ok = bool(tensor_ok and flow_ok)
+
+        payload["tensor_ok"][idx] = tensor_ok
+        payload["flow_ok"][idx] = bool(flow_ok)
+        payload["sample_ok"][idx] = sample_ok
+
+        if not sample_ok:
+            if not tensor_ok and not flow_ok:
+                payload["reason"][idx] = "tensor_and_flow_invalid"
+            elif not tensor_ok:
+                payload["reason"][idx] = "tensor_invalid"
+            else:
+                payload["reason"][idx] = "flow_invalid"
+            continue
+
+        payload["x_micro"][idx] = dp.X_micro.astype(np.float32)
+        payload["x_mezzo"][idx] = dp.X_mezzo.astype(np.float32)
+        payload["x_macro"][idx] = dp.X_macro.astype(np.float32)
+        payload["mask_micro"][idx] = dp.mask_micro.astype(np.uint8)
+        payload["mask_mezzo"][idx] = dp.mask_mezzo.astype(np.uint8)
+        payload["mask_macro"][idx] = dp.mask_macro.astype(np.uint8)
+        payload["flow_x"][idx] = flow_x
+        payload["flow_mask"][idx] = flow_mask.astype(np.uint8)
+        payload["reason"][idx] = "ok"
+
+    shard_path = Path(out_dir) / f"{code}.npz"
+    np.savez_compressed(shard_path, **payload)
+    return {"code": code, "path": str(shard_path), "rows": n}
+
+
 def _build_model(
     device: torch.device,
     checkpoint: str,
@@ -207,137 +249,63 @@ def _build_model(
     return model
 
 
-def _init_worker(
-    data_dir: str,
-    asof_dates: list[str],
-    checkpoint: str,
-    hidden_dim: int,
-    num_heads: int,
-    dropout: float,
-    use_seq_context: bool,
-    enable_dynamic_threshold: bool,
-    enable_free_branch: bool,
-    infer_batch_size: int,
-) -> None:
-    global _WORKER_CONTEXT
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = _build_model(
-        device=device,
-        checkpoint=checkpoint,
-        hidden_dim=hidden_dim,
-        num_heads=num_heads,
-        dropout=dropout,
-        use_seq_context=use_seq_context,
-        enable_dynamic_threshold=enable_dynamic_threshold,
-        enable_free_branch=enable_free_branch,
-    )
-    _WORKER_CONTEXT = WorkerContext(
-        device=device,
-        model=model,
-        data_dir=data_dir,
-        asof_dates=list(asof_dates),
-        infer_batch_size=max(1, int(infer_batch_size)),
-    )
+def _infer_from_feature_shard(model: MultiScaleRegressor, device: torch.device, shard_path: Path, infer_batch_size: int) -> pd.DataFrame:
+    shard = np.load(shard_path, allow_pickle=True)
+    code = str(shard["code"].item() if np.ndim(shard["code"]) == 0 else shard["code"][0])
+    asof_dates = shard["asof_dates"].astype(str)
+    sample_ok = shard["sample_ok"].astype(bool)
+    reasons = shard["reason"].astype(object)
 
-
-def _infer_one_code(code: str) -> pd.DataFrame:
-    global _WORKER_CONTEXT
-    if _WORKER_CONTEXT is None:
-        raise RuntimeError("worker context is not initialized")
-
-    ctx = _WORKER_CONTEXT
-    flow_ctx = _build_flow_context(Path(ctx.data_dir), code)
     recs: list[dict[str, Any]] = []
-    feats: list[tuple[str, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]] = []
-
-    for asof in ctx.asof_dates:
-        dp = build_multiscale_tensors(ctx.data_dir, code, asof)
-        flow_x, flow_mask, flow_ok = _flow_window_from_context(flow_ctx, asof)
-        tensor_ok = bool(dp.dp_ok)
-        sample_ok = bool(tensor_ok and flow_ok)
-        if not sample_ok:
-            reason = "ok"
-            if not tensor_ok and not flow_ok:
-                reason = "tensor_and_flow_invalid"
-            elif not tensor_ok:
-                reason = "tensor_invalid"
-            elif not flow_ok:
-                reason = "flow_invalid"
-            recs.append(
-                {
-                    "code": code,
-                    "asof_date": asof,
-                    "yhat": np.nan,
-                    "tensor_ok": tensor_ok,
-                    "flow_ok": bool(flow_ok),
-                    "sample_ok": sample_ok,
-                    "reason": reason,
+    valid_idx = np.flatnonzero(sample_ok)
+    if len(valid_idx) > 0:
+        with torch.inference_mode():
+            for start in range(0, len(valid_idx), infer_batch_size):
+                idxs = valid_idx[start : start + infer_batch_size]
+                batch = {
+                    "x_micro": torch.from_numpy(np.ascontiguousarray(shard["x_micro"][idxs], dtype=np.float32)).to(device),
+                    "x_mezzo": torch.from_numpy(np.ascontiguousarray(shard["x_mezzo"][idxs], dtype=np.float32)).to(device),
+                    "x_macro": torch.from_numpy(np.ascontiguousarray(shard["x_macro"][idxs], dtype=np.float32)).to(device),
+                    "mask_micro": torch.from_numpy(np.ascontiguousarray(shard["mask_micro"][idxs])).to(torch.bool).to(device),
+                    "mask_mezzo": torch.from_numpy(np.ascontiguousarray(shard["mask_mezzo"][idxs])).to(torch.bool).to(device),
+                    "mask_macro": torch.from_numpy(np.ascontiguousarray(shard["mask_macro"][idxs])).to(torch.bool).to(device),
+                    "flow_x": torch.from_numpy(np.ascontiguousarray(shard["flow_x"][idxs], dtype=np.float32)).to(device),
+                    "flow_mask": torch.from_numpy(np.ascontiguousarray(shard["flow_mask"][idxs])).to(torch.bool).to(device),
                 }
-            )
-            continue
-        feats.append(
-            (
-                asof,
-                dp.X_micro.astype(np.float32),
-                dp.X_mezzo.astype(np.float32),
-                dp.X_macro.astype(np.float32),
-                dp.mask_micro.astype(np.uint8),
-                dp.mask_mezzo.astype(np.uint8),
-                dp.mask_macro.astype(np.uint8),
-                flow_x,
-                flow_mask.astype(np.uint8),
-            )
-        )
+                y_hat, _ = model(batch)
+                scores = y_hat.detach().cpu().numpy().reshape(-1)
+                for j, row_idx in enumerate(idxs):
+                    recs.append(
+                        {
+                            "code": code,
+                            "asof_date": str(asof_dates[row_idx]),
+                            "yhat": float(scores[j]),
+                            "tensor_ok": bool(shard["tensor_ok"][row_idx]),
+                            "flow_ok": bool(shard["flow_ok"][row_idx]),
+                            "sample_ok": True,
+                            "reason": "ok",
+                        }
+                    )
 
-    with torch.inference_mode():
-        for start in range(0, len(feats), ctx.infer_batch_size):
-            chunk = feats[start : start + ctx.infer_batch_size]
-            if not chunk:
-                continue
-            asof_chunk = [x[0] for x in chunk]
-            batch = {
-                "x_micro": torch.from_numpy(np.stack([x[1] for x in chunk], axis=0)).to(ctx.device),
-                "x_mezzo": torch.from_numpy(np.stack([x[2] for x in chunk], axis=0)).to(ctx.device),
-                "x_macro": torch.from_numpy(np.stack([x[3] for x in chunk], axis=0)).to(ctx.device),
-                "mask_micro": torch.from_numpy(np.stack([x[4] for x in chunk], axis=0)).to(torch.bool).to(ctx.device),
-                "mask_mezzo": torch.from_numpy(np.stack([x[5] for x in chunk], axis=0)).to(torch.bool).to(ctx.device),
-                "mask_macro": torch.from_numpy(np.stack([x[6] for x in chunk], axis=0)).to(torch.bool).to(ctx.device),
-                "flow_x": torch.from_numpy(np.stack([x[7] for x in chunk], axis=0)).to(ctx.device),
-                "flow_mask": torch.from_numpy(np.stack([x[8] for x in chunk], axis=0)).to(torch.bool).to(ctx.device),
-            }
-            y_hat, _ = ctx.model(batch)
-            scores = y_hat.detach().to("cpu").numpy().reshape(-1)
-            for i, asof in enumerate(asof_chunk):
-                recs.append(
-                    {
-                        "code": code,
-                        "asof_date": asof,
-                        "yhat": float(scores[i]),
-                        "tensor_ok": True,
-                        "flow_ok": True,
-                        "sample_ok": True,
-                        "reason": "ok",
-                    }
-                )
-
-    df = pd.DataFrame(recs)
-    if df.empty:
-        df = pd.DataFrame(
+    invalid_idx = np.flatnonzero(~sample_ok)
+    for row_idx in invalid_idx:
+        recs.append(
             {
-                "code": [code],
-                "asof_date": [None],
-                "yhat": [np.nan],
-                "tensor_ok": [False],
-                "flow_ok": [False],
-                "sample_ok": [False],
-                "reason": ["empty"],
+                "code": code,
+                "asof_date": str(asof_dates[row_idx]),
+                "yhat": np.nan,
+                "tensor_ok": bool(shard["tensor_ok"][row_idx]),
+                "flow_ok": bool(shard["flow_ok"][row_idx]),
+                "sample_ok": False,
+                "reason": str(reasons[row_idx]),
             }
         )
-    return df.sort_values("asof_date").reset_index(drop=True)
+
+    return pd.DataFrame(recs).sort_values("asof_date").reset_index(drop=True)
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Build offline backtest batches/scores")
+    parser = argparse.ArgumentParser(description="Build offline backtest features and score shards")
     parser.add_argument("--data-dir", required=True)
     parser.add_argument("--checkpoint", required=True)
     parser.add_argument("--out-dir", required=True)
@@ -360,6 +328,10 @@ def main() -> None:
     data_dir = Path(args.data_dir)
     out_dir = Path(args.out_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
+    feature_dir = out_dir / "feature_shards"
+    score_dir = out_dir / "score_shards"
+    feature_dir.mkdir(parents=True, exist_ok=True)
+    score_dir.mkdir(parents=True, exist_ok=True)
 
     calendar_dates = _read_calendar_dates(data_dir)
     val_shards = _expand_paths(args.val_shards or [])
@@ -372,18 +344,23 @@ def main() -> None:
     if not codes:
         raise ValueError("no stock folders with required parquet files found")
 
-    requested_workers = max(1, int(args.num_workers))
-    has_cuda = torch.cuda.is_available()
-    if has_cuda and requested_workers > 1:
-        print("[warn] CUDA detected; forcing --num-workers=1 to avoid multi-process GPU inference contention.")
-    num_workers = 1 if has_cuda else requested_workers
+    num_workers = max(1, int(args.num_workers))
 
-    shard_dir = out_dir / "score_shards"
-    shard_dir.mkdir(parents=True, exist_ok=True)
+    feature_jobs = [(str(data_dir), code, asof_dates, str(feature_dir)) for code in codes]
+    if num_workers <= 1:
+        iterator = _iter_progress(feature_jobs, total=len(feature_jobs), show_progress=bool(args.show_progress), desc="building feature shards")
+        for job in iterator:
+            _build_feature_shard(*job)
+    else:
+        with ProcessPoolExecutor(max_workers=num_workers) as ex:
+            futures = {ex.submit(_build_feature_shard, *job): job[1] for job in feature_jobs}
+            progress_iter = _iter_progress(as_completed(futures), total=len(futures), show_progress=bool(args.show_progress), desc="building feature shards")
+            for fut in progress_iter:
+                fut.result()
 
-    init_kwargs = dict(
-        data_dir=str(data_dir),
-        asof_dates=asof_dates,
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    model = _build_model(
+        device=device,
         checkpoint=str(args.checkpoint),
         hidden_dim=int(args.hidden_dim),
         num_heads=int(args.num_heads),
@@ -391,39 +368,17 @@ def main() -> None:
         use_seq_context=bool(args.use_seq_context),
         enable_dynamic_threshold=bool(args.enable_dynamic_threshold),
         enable_free_branch=bool(args.enable_free_branch),
-        infer_batch_size=int(args.infer_batch_size),
     )
 
-    if num_workers <= 1:
-        _init_worker(**init_kwargs)
-        iterator = _iter_progress(codes, total=len(codes), show_progress=bool(args.show_progress), desc="building backtest shards")
-        for code in iterator:
-            df = _infer_one_code(code)
-            df.to_parquet(shard_dir / f"{code}.parquet", index=False)
-    else:
-        initargs = (
-            init_kwargs["data_dir"],
-            init_kwargs["asof_dates"],
-            init_kwargs["checkpoint"],
-            init_kwargs["hidden_dim"],
-            init_kwargs["num_heads"],
-            init_kwargs["dropout"],
-            init_kwargs["use_seq_context"],
-            init_kwargs["enable_dynamic_threshold"],
-            init_kwargs["enable_free_branch"],
-            init_kwargs["infer_batch_size"],
-        )
-        with ProcessPoolExecutor(max_workers=num_workers, initializer=_init_worker, initargs=initargs) as ex:
-            futures = {ex.submit(_infer_one_code, code): code for code in codes}
-            progress_iter = _iter_progress(as_completed(futures), total=len(futures), show_progress=bool(args.show_progress), desc="building backtest shards")
-            for fut in progress_iter:
-                code = futures[fut]
-                df = fut.result()
-                df.to_parquet(shard_dir / f"{code}.parquet", index=False)
+    feature_paths = sorted(feature_dir.glob("*.npz"))
+    infer_iter = _iter_progress(feature_paths, total=len(feature_paths), show_progress=bool(args.show_progress), desc="inferring score shards")
+    for shard_path in infer_iter:
+        df = _infer_from_feature_shard(model, device, shard_path, max(1, int(args.infer_batch_size)))
+        df.to_parquet(score_dir / f"{shard_path.stem}.parquet", index=False)
 
     scores_path: str | None = None
     if bool(args.merge_scores):
-        merged = pd.concat([pd.read_parquet(p) for p in sorted(shard_dir.glob("*.parquet"))], ignore_index=True)
+        merged = pd.concat([pd.read_parquet(p) for p in sorted(score_dir.glob("*.parquet"))], ignore_index=True)
         merged_path = out_dir / "scores.parquet"
         merged.to_parquet(merged_path, index=False)
         scores_path = str(merged_path.resolve())
@@ -432,16 +387,17 @@ def main() -> None:
     meta = {
         "codes": len(codes),
         "asof_dates": len(asof_dates),
-        "score_shards": str(shard_dir.resolve()),
+        "feature_shards": str(feature_dir.resolve()),
+        "score_shards": str(score_dir.resolve()),
         "scores": scores_path,
         "merge_scores": bool(args.merge_scores),
-        "requested_num_workers": requested_workers,
-        "effective_num_workers": num_workers,
-        "cuda_detected": has_cuda,
+        "feature_num_workers": num_workers,
+        "inference_device": str(device),
     }
     (out_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
 
-    print(f"saved score_shards: {shard_dir}")
+    print(f"saved feature_shards: {feature_dir}")
+    print(f"saved score_shards: {score_dir}")
     print(f"saved meta: {out_dir / 'meta.json'}")
 
 
