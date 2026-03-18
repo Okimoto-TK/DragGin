@@ -12,9 +12,13 @@ def _write_day(path: Path, day: str, asof: str, initial: float, final: float) ->
         "asof_date": asof,
         "initial_total_asset": initial,
         "final_total_asset": final,
-        "initial_positions": [],
-        "final_positions": [],
-        "buy_records": [],
+        "initial_holding_amount": initial * 0.4,
+        "initial_cash": initial * 0.6,
+        "final_holding_amount": final * 0.5,
+        "final_cash": final * 0.5,
+        "initial_positions": [{"code": "000001.SZ", "qty": 100, "cost": 10.0, "float_pnl": 20.0}],
+        "final_positions": [{"code": "000001.SZ", "qty": 100, "cost": 10.0, "float_pnl": 30.0}],
+        "buy_records": [{"code": "000001.SZ", "qty": 100, "cost": 10.1}],
         "sell_records": [],
     }
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -28,20 +32,25 @@ def test_load_backtest_rows_computes_returns(tmp_path: Path) -> None:
 
     assert [row["date"] for row in rows] == ["2024-01-02", "2024-01-03"]
     assert rows[0]["daily_return"] == pytest.approx(0.1)
+    assert rows[0]["start_cum_return"] == pytest.approx(0.0)
     assert rows[0]["cum_return"] == pytest.approx(0.1)
     assert rows[1]["daily_return"] == pytest.approx(0.1)
+    assert rows[1]["start_cum_return"] == pytest.approx(0.1)
     assert rows[1]["cum_return"] == pytest.approx(0.21)
 
 
-def test_build_html_contains_plot_and_sidebar_data(tmp_path: Path) -> None:
+def test_build_html_contains_adaptive_plot_and_structured_sidebar(tmp_path: Path) -> None:
     _write_day(tmp_path / "20240102.json", "2024-01-02", "2024-01-01", 1000.0, 1100.0)
     rows = _load_backtest_rows(tmp_path)
 
     html = _build_html(rows, "My Backtest")
 
-    assert "Plotly.newPlot" in html
-    assert "当日明细" in html
-    assert "2024-01-02" in html
+    assert "SHORT_WINDOW_THRESHOLD" in html
+    assert "type: 'candlestick'" in html
+    assert "renderChart(event)" in html
+    assert "资产摘要" in html
+    assert "期初持仓" in html
+    assert "trade-card" in html
     assert "My Backtest" in html
     assert "backtest_report.html" not in html
 
@@ -71,3 +80,4 @@ def test_main_writes_html_report(tmp_path: Path, monkeypatch) -> None:
     text = out_file.read_text(encoding="utf-8")
     assert "Demo" in text
     assert "2024-01-02" in text
+    assert "累计收益率 K 线" in text
