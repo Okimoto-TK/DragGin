@@ -147,16 +147,32 @@ def _build_html(rows: list[dict[str, Any]], title: str) -> str:
         <div id=\"chart\"></div>
       </section>
     </div>
-    <aside class=\"sidebar\">
-      <h2 class=\"sidebar-title\">当日明细</h2>
-      <p class=\"sidebar-subtitle\">默认展示最后一个交易日。点击图上的任意点或柱体，可在这里查看结构化的交易摘要、持仓变化与买卖记录。</p>
-      <div class=\"detail-grid\">
-        <div class=\"panel detail-card\"><div class=\"label\">交易日</div><div class=\"value\" id=\"detail-date\"></div></div>
-        <div class=\"panel detail-card\"><div class=\"label\">asof_date</div><div class=\"value\" id=\"detail-asof\"></div></div>
-        <div class=\"panel detail-card\"><div class=\"label\">日收益率</div><div class=\"value\" id=\"detail-daily-return\"></div></div>
-        <div class=\"panel detail-card\"><div class=\"label\">累计收益率</div><div class=\"value\" id=\"detail-cum-return\"></div></div>
+    <aside class="sidebar">
+      <h2 class="sidebar-title">当日明细</h2>
+      <p class="sidebar-subtitle">默认展示最后一个交易日。点击图上的任意点或柱体，可在这里查看结构化的交易摘要、持仓变化与买卖记录。</p>
+      <div class="sidebar-stage">
+        <div class="sidebar-track" id="sidebar-track">
+          <section class="sidebar-pane">
+            <div class="detail-grid">
+              <div class="panel detail-card"><div class="label">交易日</div><div class="value" id="detail-date"></div></div>
+              <div class="panel detail-card"><div class="label">asof_date</div><div class="value" id="detail-asof"></div></div>
+              <div class="panel detail-card"><div class="label">日收益率</div><div class="value" id="detail-daily-return"></div></div>
+              <div class="panel detail-card"><div class="label">累计收益率</div><div class="value" id="detail-cum-return"></div></div>
+            </div>
+            <div id="detail-summary"></div>
+            <div class="section-button-grid" id="section-buttons"></div>
+          </section>
+          <section class="sidebar-pane">
+            <div class="detail-shell">
+              <div class="detail-header">
+                <button class="back-button" id="detail-back" type="button">← 返回</button>
+                <div class="detail-panel-title" id="detail-panel-title">详情</div>
+              </div>
+              <div id="detail-panel-content"></div>
+            </div>
+          </section>
+        </div>
       </div>
-      <div id=\"detail-content\"></div>
     </aside>
   </div>
   <script>
@@ -178,7 +194,7 @@ def _build_html(rows: list[dict[str, Any]], title: str) -> str:
         .replace(/&/g, '&amp;')
         .replace(/</g, '&lt;')
         .replace(/>/g, '&gt;')
-        .replace(/\"/g, '&quot;')
+        .replace(/"/g, '&quot;')
         .replace(/'/g, '&#39;');
     }}
 
@@ -189,47 +205,47 @@ def _build_html(rows: list[dict[str, Any]], title: str) -> str:
     }}
 
     function sectionHtml(title, innerHtml) {{
-      return `<section class=\"section\"><h3 class=\"section-title\">${{title}}</h3>${{innerHtml}}</section>`;
+      return `<section class="section"><h3 class="section-title">${{title}}</h3>${{innerHtml}}</section>`;
     }}
 
     function metricCard(label, value, cls='') {{
-      return `<div class=\"panel metric-card\"><div class=\"label\">${{escapeHtml(label)}}</div><div class=\"value ${{cls}}\">${{escapeHtml(value)}}</div></div>`;
+      return `<div class="panel metric-card"><div class="label">${{escapeHtml(label)}}</div><div class="value ${{cls}}">${{escapeHtml(value)}}</div></div>`;
     }}
 
     function emptyState(text) {{
-      return `<div class=\"empty\">${{escapeHtml(text)}}</div>`;
+      return `<div class="empty">${{escapeHtml(text)}}</div>`;
     }}
 
     function recordCard(record, kindLabel) {{
       const items = Object.entries(record || {{}})
         .filter(([key]) => key !== 'code')
         .map(([key, value]) => `
-          <div class=\"kv\">
-            <div class=\"label\">${{escapeHtml(key)}}</div>
-            <div class=\"text\">${{typeof value === 'number' ? escapeHtml(formatMoney(value)) : escapeHtml(String(value))}}</div>
+          <div class="kv">
+            <div class="label">${{escapeHtml(key)}}</div>
+            <div class="text">${{typeof value === 'number' ? escapeHtml(formatMoney(value)) : escapeHtml(String(value))}}</div>
           </div>
         `)
         .join('');
       return `
-        <article class=\"panel trade-card\">
-          <div class=\"trade-card-head\">
-            <div class=\"trade-code\">${{escapeHtml(record.code || '-') }}</div>
-            <span class=\"pill\">${{escapeHtml(kindLabel)}}</span>
+        <article class="panel trade-card">
+          <div class="trade-card-head">
+            <div class="trade-code">${{escapeHtml(record.code || '-')}}</div>
+            <span class="pill">${{escapeHtml(kindLabel)}}</span>
           </div>
-          <div class=\"kv-grid\">${{items}}</div>
+          <div class="kv-grid">${{items}}</div>
         </article>
       `;
     }}
 
     function recordsSection(title, records, emptyText, kindLabel) {{
       if (!records || !records.length) return sectionHtml(title, emptyState(emptyText));
-      return sectionHtml(title, `<div class=\"list\">${{records.map(row => recordCard(row, kindLabel)).join('')}}</div>`);
+      return sectionHtml(title, `<div class="list">${{records.map(row => recordCard(row, kindLabel)).join('')}}</div>`);
     }}
 
-    function buildDetailContent(row) {{
+    function buildSummaryContent(row) {{
       const payload = row.payload || {{}};
-      const summaryHtml = sectionHtml('资产摘要', `
-        <div class=\"metric-grid\">
+      return sectionHtml('资产摘要', `
+        <div class="metric-grid">
           ${{metricCard('期初持仓市值', formatMoney(payload.initial_holding_amount || 0))}}
           ${{metricCard('期初现金', formatMoney(payload.initial_cash || 0))}}
           ${{metricCard('期末持仓市值', formatMoney(payload.final_holding_amount || 0))}}
@@ -238,11 +254,30 @@ def _build_html(rows: list[dict[str, Any]], title: str) -> str:
           ${{metricCard('期末总资产', formatMoney(payload.final_total_asset || row.final_total_asset))}}
         </div>
       `);
-      const initialPosHtml = recordsSection('期初持仓', payload.initial_positions || [], '当日开盘前没有持仓。', '持仓');
-      const sellHtml = recordsSection('卖出记录', payload.sell_records || [], '当日没有卖出记录。', '卖出');
-      const buyHtml = recordsSection('买入记录', payload.buy_records || [], '当日没有买入记录。', '买入');
-      const finalPosHtml = recordsSection('期末持仓', payload.final_positions || [], '当日收盘后没有持仓。', '收盘');
-      return [summaryHtml, initialPosHtml, sellHtml, buyHtml, finalPosHtml].join('');
+    }}
+
+    function buildDrilldownSections(row) {{
+      const payload = row.payload || {{}};
+      return {{
+        initial_positions: {{ title: '期初持仓', html: recordsSection('期初持仓', payload.initial_positions || [], '当日开盘前没有持仓。', '持仓') }},
+        buy_records: {{ title: '买入记录', html: recordsSection('买入记录', payload.buy_records || [], '当日没有买入记录。', '买入') }},
+        sell_records: {{ title: '卖出记录', html: recordsSection('卖出记录', payload.sell_records || [], '当日没有卖出记录。', '卖出') }},
+        final_positions: {{ title: '期末持仓', html: recordsSection('期末持仓', payload.final_positions || [], '当日收盘后没有持仓。', '收盘') }},
+      }};
+    }}
+
+    function buildSectionButtons() {{
+      return [
+        {{ key: 'initial_positions', title: '期初持仓', desc: '查看开盘前已持有的仓位明细。' }},
+        {{ key: 'buy_records', title: '买入', desc: '查看当日新开仓与加仓记录。' }},
+        {{ key: 'sell_records', title: '卖出', desc: '查看当日止盈、止损和调仓卖出。' }},
+        {{ key: 'final_positions', title: '期末持仓', desc: '查看收盘后剩余持仓状态。' }},
+      ].map((item) => `
+        <button class="panel section-button" type="button" data-section-key="${{item.key}}">
+          <div class="section-button-title">${{item.title}}</div>
+          <div class="section-button-desc">${{item.desc}}</div>
+        </button>
+      `).join('');
     }}
 
     function updateSummary() {{
@@ -257,24 +292,50 @@ def _build_html(rows: list[dict[str, Any]], title: str) -> str:
       ret.className = `value ${{cls}}`;
     }}
 
+    function showSummaryPane() {{
+      document.getElementById('sidebar-track').classList.remove('is-detail');
+    }}
+
+    function showSectionPane(title, html) {{
+      document.getElementById('detail-panel-title').textContent = title;
+      document.getElementById('detail-panel-content').innerHTML = html;
+      document.getElementById('sidebar-track').classList.add('is-detail');
+    }}
+
+    function bindSectionButtons(row) {{
+      const sections = buildDrilldownSections(row);
+      document.querySelectorAll('[data-section-key]').forEach((btn) => {{
+        btn.addEventListener('click', () => {{
+          const key = btn.getAttribute('data-section-key');
+          const section = sections[key];
+          if (!section) return;
+          showSectionPane(section.title, section.html);
+        }});
+      }});
+    }}
+
     function updateDetail(idx) {{
       const row = rows[idx];
       document.getElementById('detail-date').textContent = row.date;
       document.getElementById('detail-asof').textContent = row.asof_date || '-';
       setValue('detail-daily-return', formatPct(row.daily_return), row.daily_return >= 0 ? 'positive' : 'negative');
       setValue('detail-cum-return', formatPct(row.cum_return), row.cum_return >= 0 ? 'positive' : 'negative');
-      document.getElementById('detail-content').innerHTML = buildDetailContent(row);
+      document.getElementById('detail-summary').innerHTML = buildSummaryContent(row);
+      document.getElementById('section-buttons').innerHTML = buildSectionButtons();
+      bindSectionButtons(row);
+      showSummaryPane();
     }}
 
     function parseDate(value) {{
       return new Date(`${{value}}T00:00:00`);
     }}
 
-    function getVisibleIndices(relayout) {{
+    function getVisibleIndices(relayout, graphDiv = null) {{
       let start = 0;
       let end = rows.length - 1;
-      const x0 = relayout?.['xaxis.range[0]'] ?? relayout?.xaxis?.range?.[0];
-      const x1 = relayout?.['xaxis.range[1]'] ?? relayout?.xaxis?.range?.[1];
+      const graphRange = graphDiv?.layout?.xaxis?.range || null;
+      const x0 = relayout?.['xaxis.range[0]'] ?? relayout?.xaxis?.range?.[0] ?? graphRange?.[0];
+      const x1 = relayout?.['xaxis.range[1]'] ?? relayout?.xaxis?.range?.[1] ?? graphRange?.[1];
       if (x0 || x1) {{
         const left = x0 ? parseDate(x0) : parseDate(rows[0].date);
         const right = x1 ? parseDate(x1) : parseDate(rows[rows.length - 1].date);
@@ -285,13 +346,13 @@ def _build_html(rows: list[dict[str, Any]], title: str) -> str:
       return [start, end];
     }}
 
-    function visibleRows(relayout) {{
-      const [start, end] = getVisibleIndices(relayout);
+    function visibleRows(relayout, graphDiv = null) {{
+      const [start, end] = getVisibleIndices(relayout, graphDiv);
       return rows.slice(start, end + 1);
     }}
 
-    function computeYRange(relayout, mode) {{
-      const currentRows = visibleRows(relayout);
+    function computeYRange(relayout, mode, graphDiv = null) {{
+      const currentRows = visibleRows(relayout, graphDiv);
       const values = [];
       if (mode === 'candlestick') {{
         currentRows.forEach((row) => {{
@@ -307,8 +368,8 @@ def _build_html(rows: list[dict[str, Any]], title: str) -> str:
       return [min - pad, max + pad];
     }}
 
-    function chooseMode(relayout) {{
-      return visibleRows(relayout).length <= SHORT_WINDOW_THRESHOLD ? 'candlestick' : 'line';
+    function chooseMode(relayout, graphDiv = null) {{
+      return visibleRows(relayout, graphDiv).length <= SHORT_WINDOW_THRESHOLD ? 'candlestick' : 'line';
     }}
 
     function buildTrace(mode) {{
@@ -351,7 +412,7 @@ def _build_html(rows: list[dict[str, Any]], title: str) -> str:
       }};
     }}
 
-    function buildLayout(mode, relayout) {{
+    function buildLayout(mode, relayout, graphDiv = null) {{
       return {{
         margin: {{ l: 68, r: 24, t: 28, b: 64 }},
         hovermode: 'x unified',
@@ -370,21 +431,23 @@ def _build_html(rows: list[dict[str, Any]], title: str) -> str:
           ticksuffix: '%',
           gridcolor: 'rgba(148, 163, 184, 0.18)',
           zerolinecolor: 'rgba(148, 163, 184, 0.25)',
-          range: computeYRange(relayout, mode),
+          range: computeYRange(relayout, mode, graphDiv),
           fixedrange: false
         }}
       }};
     }}
 
     function renderChart(relayout = null) {{
-      const mode = chooseMode(relayout);
+      const graphDiv = document.getElementById('chart');
+      const mode = chooseMode(relayout, graphDiv);
       const trace = buildTrace(mode);
-      const layout = buildLayout(mode, relayout);
-      return Plotly.react('chart', [trace], layout, {{ responsive: true, displaylogo: false }});
+      const layout = buildLayout(mode, relayout, graphDiv);
+      return Plotly.react(graphDiv, [trace], layout, {{ responsive: true, displaylogo: false }});
     }}
 
     updateSummary();
     updateDetail(rows.length - 1);
+    document.getElementById('detail-back').addEventListener('click', showSummaryPane);
 
     renderChart().then((plot) => {{
       plot.on('plotly_click', (event) => {{

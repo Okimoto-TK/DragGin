@@ -49,7 +49,8 @@ def test_build_html_contains_adaptive_plot_and_structured_sidebar(tmp_path: Path
     assert "type: 'candlestick'" in html
     assert "renderChart(event)" in html
     assert "资产摘要" in html
-    assert "期初持仓" in html
+    assert "section-buttons" in html
+    assert "detail-back" in html
     assert "trade-card" in html
     assert "My Backtest" in html
     assert "backtest_report.html" not in html
