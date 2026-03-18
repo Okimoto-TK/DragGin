@@ -452,7 +452,7 @@ def main() -> None:
         for code, score in rank_rows:
             if code in positions or code in sold_today:
                 continue
-            if score < 0.5:
+            if score < 1:
                 break
             if _is_filtered_buy_code(code, st_codes_today):
                 continue
