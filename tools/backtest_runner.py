@@ -119,6 +119,32 @@ def _load_daily_map(data_dir: Path, code: str) -> dict[str, dict[str, float]]:
     return out
 
 
+
+def _load_st_flags(st_dir: Path | None) -> dict[str, set[str]]:
+    if st_dir is None:
+        return {}
+    if not st_dir.exists():
+        raise FileNotFoundError(f"st dir not found: {st_dir}")
+
+    out: dict[str, set[str]] = {}
+    for path in sorted(st_dir.glob("*_stock_st.parquet")):
+        stem = path.stem
+        date_token = stem[:8]
+        if len(date_token) != 8 or not date_token.isdigit():
+            continue
+        df = pd.read_parquet(path, columns=["ts_code"])
+        if "ts_code" not in df.columns:
+            raise ValueError(f"missing ts_code column in {path}")
+        codes = {str(x) for x in df["ts_code"].dropna().astype(str).tolist() if str(x)}
+        out[date_token] = codes
+    return out
+
+
+def _is_filtered_buy_code(code: str, st_codes: set[str]) -> bool:
+    prefix = str(code)[:3]
+    return str(code) in st_codes or prefix in {"300", "688"}
+
+
 def _round_lot_shares(max_cash: float, price: float) -> int:
     if price <= 0 or max_cash <= 0:
         return 0
@@ -285,6 +311,7 @@ def main() -> None:
     parser.add_argument("--val-shards", nargs="+", default=None)
     parser.add_argument("--ts-token", default="")
     parser.add_argument("--initial-cash", type=float, default=1_000_000.0)
+    parser.add_argument("--st-dir", default="", help="directory containing YYYYmmdd_stock_st.parquet files")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -311,6 +338,7 @@ def main() -> None:
     limit_cache: dict[str, dict[str, tuple[float, float]]] = {}
 
     daily_cache = {c: _load_daily_map(data_dir, c) for c in codes}
+    st_flags_by_day = _load_st_flags(Path(args.st_dir) if args.st_dir else None)
 
     cash = float(args.initial_cash)
     positions: dict[str, Position] = {}
@@ -321,6 +349,7 @@ def main() -> None:
         day_trade = day.replace("-", "")
 
         rank_rows = sorted(score_by_date.get(asof, []), key=lambda x: x[1], reverse=True)
+        st_codes_today = st_flags_by_day.get(day_trade, set())
         rank_map = {code: i + 1 for i, (code, _) in enumerate(rank_rows)}
 
         if day_trade not in limit_cache:
@@ -380,9 +409,12 @@ def main() -> None:
             down_limit = float(updn[1])
 
             sell_price: float | None = None
-            # 新卖出规则
+            is_st_stock = code in st_codes_today
+            # ST/*ST 持仓优先在开盘尝试卖出，跌停不可卖。
             if np.isfinite(down_limit) and abs(open_p - down_limit) < 1e-8:
                 sell_price = None
+            elif is_st_stock:
+                sell_price = open_p
             elif rank_map.get(code, 10**9) > 2 * int(args.topk):
                 sell_price = open_p
             elif open_p / pos.cost_per_share < 0.925:
@@ -422,6 +454,8 @@ def main() -> None:
                 continue
             if score < 0.5:
                 break
+            if _is_filtered_buy_code(code, st_codes_today):
+                continue
 
             day_row = daily_cache.get(code, {}).get(day)
             # 缺行情不交易
