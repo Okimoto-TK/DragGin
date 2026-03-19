@@ -10,6 +10,9 @@ __pycache__/
 .Python
 build/
 data/
+!data/.gitkeep
+!src/data/
+!src/data/**
 raw_data/
 develop-eggs/
 dist/
