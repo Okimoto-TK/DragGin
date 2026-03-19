@@ -2,8 +2,9 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 import time
-from concurrent.futures import ThreadPoolExecutor, as_completed
+from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -22,6 +23,7 @@ NAMECHANGE_FIELDS = "ts_code,name,start_date,end_date"
 MAIRUI_TIMEOUT = 30
 DEFAULT_LOOKBACK_TRADING_DAYS = 60
 DEFAULT_MAX_WORKERS = 8
+DEFAULT_5MIN_PROCESS_WORKERS = 8
 
 
 @dataclass(frozen=True)
@@ -31,6 +33,7 @@ class DailyUpdateConfig:
     max_workers: int = DEFAULT_MAX_WORKERS
     request_sleep_seconds: float = 0.0
     refresh_latest: bool = True
+    verbose: bool = False
 
     @property
     def raw_dir(self) -> Path:
@@ -51,6 +54,10 @@ class DailyUpdateConfig:
     @property
     def st_dir(self) -> Path:
         return self.raw_dir / "st"
+
+    @property
+    def min5_cache_dir(self) -> Path:
+        return self.raw_dir / "5min_cache"
 
     @property
     def calendar_path(self) -> Path:
@@ -159,10 +166,16 @@ def _ensure_dirs(config: DailyUpdateConfig) -> None:
     config.min5_dir.mkdir(parents=True, exist_ok=True)
     config.moneyflow_dir.mkdir(parents=True, exist_ok=True)
     config.st_dir.mkdir(parents=True, exist_ok=True)
+    config.min5_cache_dir.mkdir(parents=True, exist_ok=True)
 
 
 def _normalize_date_str(series: pd.Series) -> pd.Series:
     return pd.to_datetime(series, errors="coerce").dt.strftime("%Y%m%d")
+
+
+def _log(config: DailyUpdateConfig, message: str) -> None:
+    if bool(config.verbose):
+        print(f"[update_daily] {message}")
 
 
 def _load_trade_window(pro: TushareClient, lookback_trading_days: int) -> tuple[pd.DataFrame, list[str], str]:
@@ -250,6 +263,7 @@ def _update_daily_files(pro: TushareClient, config: DailyUpdateConfig, target_da
     updated: list[str] = []
     for trade_date in _select_pending_trade_dates(target_dates, config.daily_dir, config.refresh_latest):
         out_path = config.daily_dir / f"{trade_date}.parquet"
+        _log(config, f"updating daily snapshot: {trade_date}")
         _build_daily_snapshot_for_date(pro, trade_date, stock_basic).to_parquet(out_path, index=False)
         updated.append(trade_date)
         if config.request_sleep_seconds > 0:
@@ -275,6 +289,7 @@ def _update_moneyflow_files(pro: TushareClient, config: DailyUpdateConfig, targe
     updated: list[str] = []
     for trade_date in _select_pending_trade_dates(target_dates, config.moneyflow_dir, config.refresh_latest):
         out_path = config.moneyflow_dir / f"{trade_date}.parquet"
+        _log(config, f"updating moneyflow snapshot: {trade_date}")
         _build_moneyflow_snapshot_for_date(pro, trade_date, stock_basic).to_parquet(out_path, index=False)
         updated.append(trade_date)
         if config.request_sleep_seconds > 0:
@@ -334,61 +349,97 @@ def _normalize_mairui_rows(ts_code: str, rows: list[dict[str, Any]], default_tra
     return normalized
 
 
-def _fetch_single_code_5min_range(mairui: MairuiClient, ts_code: str, start_date: str, end_date: str, sleep_seconds: float) -> list[dict[str, Any]]:
+def _fetch_single_code_5min_range_to_cache(
+    ts_code: str,
+    start_date: str,
+    end_date: str,
+    cache_dir: str,
+    sleep_seconds: float,
+    verbose: bool,
+) -> str:
+    mairui = MairuiClient(os.getenv("MAIRUI_LICENCE", "").strip())
     rows = mairui.history_5min_range(ts_code=ts_code, start_date=start_date, end_date=end_date)
     if sleep_seconds > 0:
         time.sleep(sleep_seconds)
-    return _normalize_mairui_rows(ts_code, rows)
+    df = pd.DataFrame(_normalize_mairui_rows(ts_code, rows))
+    out_path = Path(cache_dir) / f"{ts_code}.parquet"
+    df.to_parquet(out_path, index=False)
+    if verbose:
+        print(f"[update_daily] cached 5min range for {ts_code}: {out_path}")
+    return str(out_path)
 
 
-def _build_5min_snapshots_from_increment(mairui: MairuiClient, fetch_dates: list[str], stock_basic: pd.DataFrame, max_workers: int, sleep_seconds: float) -> dict[str, pd.DataFrame]:
+def _merge_5min_cache_to_daily(cache_files: list[Path], fetch_dates: list[str], verbose: bool) -> dict[str, pd.DataFrame]:
+    wanted_dates = set(fetch_dates)
+    by_date: dict[str, list[pd.DataFrame]] = {d: [] for d in fetch_dates}
+    for cache_file in cache_files:
+        df = pd.read_parquet(cache_file)
+        if df.empty or "trade_date" not in df.columns:
+            continue
+        df["trade_date"] = df["trade_date"].astype(str)
+        for trade_date, sub in df.groupby("trade_date", sort=False):
+            trade_date_str = str(trade_date)
+            if trade_date_str in wanted_dates:
+                by_date[trade_date_str].append(sub.copy())
+        if verbose:
+            print(f"[update_daily] merged 5min cache: {cache_file}")
+
+    snapshots: dict[str, pd.DataFrame] = {}
+    for trade_date in fetch_dates:
+        parts = by_date.get(trade_date, [])
+        if parts:
+            df = pd.concat(parts, ignore_index=True)
+            df = df.sort_values([c for c in ["ts_code", "trade_date", "row_no"] if c in df.columns]).reset_index(drop=True)
+        else:
+            df = pd.DataFrame()
+        snapshots[trade_date] = df
+    return snapshots
+
+
+def _update_5min_files(_mairui: MairuiClient, config: DailyUpdateConfig, target_dates: list[str], stock_basic: pd.DataFrame) -> list[str]:
+    fetch_dates = _resolve_5min_incremental_dates(target_dates, config.min5_dir, config.refresh_latest)
     if not fetch_dates:
-        return {}
+        return []
+
     start_date = min(fetch_dates)
     end_date = max(fetch_dates)
-    wanted_dates = set(fetch_dates)
-    ts_codes = sorted(stock_basic["ts_code"].dropna().astype(str).unique().tolist()) if "ts_code" in stock_basic.columns else []
-    by_date: dict[str, list[dict[str, Any]]] = {d: [] for d in fetch_dates}
+    cache_dir = config.min5_cache_dir / f"{start_date}_{end_date}"
+    if cache_dir.exists():
+        shutil.rmtree(cache_dir)
+    cache_dir.mkdir(parents=True, exist_ok=True)
 
-    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
+    ts_codes = sorted(stock_basic["ts_code"].dropna().astype(str).unique().tolist()) if "ts_code" in stock_basic.columns else []
+    _log(config, f"updating 5min snapshots from {start_date} to {end_date} with {DEFAULT_5MIN_PROCESS_WORKERS} processes")
+
+    cache_files: list[Path] = []
+    with ProcessPoolExecutor(max_workers=DEFAULT_5MIN_PROCESS_WORKERS) as executor:
         futures = {
-            executor.submit(_fetch_single_code_5min_range, mairui, ts_code, start_date, end_date, sleep_seconds): ts_code
+            executor.submit(
+                _fetch_single_code_5min_range_to_cache,
+                ts_code,
+                start_date,
+                end_date,
+                str(cache_dir),
+                config.request_sleep_seconds,
+                bool(config.verbose),
+            ): ts_code
             for ts_code in ts_codes
         }
         for fut in as_completed(futures):
             ts_code = futures[fut]
             try:
-                rows = fut.result()
+                cache_files.append(Path(fut.result()))
             except Exception as exc:
                 raise RuntimeError(f"failed to fetch mairui 5min for {ts_code} between {start_date} and {end_date}") from exc
-            for row in rows:
-                trade_date = str(row.get("trade_date", ""))
-                if trade_date in wanted_dates:
-                    by_date[trade_date].append(row)
 
-    snapshots: dict[str, pd.DataFrame] = {}
-    for trade_date in fetch_dates:
-        df = pd.DataFrame(by_date.get(trade_date, []))
-        if not df.empty:
-            df = df.sort_values([c for c in ["ts_code", "trade_date", "row_no"] if c in df.columns]).reset_index(drop=True)
-        snapshots[trade_date] = df
-    return snapshots
+    snapshots = _merge_5min_cache_to_daily(cache_files=sorted(cache_files), fetch_dates=fetch_dates, verbose=bool(config.verbose))
 
-
-def _update_5min_files(mairui: MairuiClient, config: DailyUpdateConfig, target_dates: list[str], stock_basic: pd.DataFrame) -> list[str]:
-    fetch_dates = _resolve_5min_incremental_dates(target_dates, config.min5_dir, config.refresh_latest)
-    snapshots = _build_5min_snapshots_from_increment(
-        mairui=mairui,
-        fetch_dates=fetch_dates,
-        stock_basic=stock_basic,
-        max_workers=config.max_workers,
-        sleep_seconds=config.request_sleep_seconds,
-    )
     updated: list[str] = []
     for trade_date in fetch_dates:
         out_path = config.min5_dir / f"{trade_date}.parquet"
         snapshots.get(trade_date, pd.DataFrame()).to_parquet(out_path, index=False)
         updated.append(trade_date)
+        _log(config, f"wrote 5min snapshot: {out_path}")
     return updated
 
 
@@ -450,6 +501,7 @@ def _update_st_files(pro: TushareClient, config: DailyUpdateConfig, target_dates
     name_history = _build_st_name_history(stock_basic, namechange)
     for trade_date in _select_pending_trade_dates(target_dates, config.st_dir, config.refresh_latest):
         out_path = config.st_dir / f"{trade_date}.parquet"
+        _log(config, f"updating st snapshot: {trade_date}")
         _build_st_snapshot_for_date(trade_date, stock_basic, name_history).to_parquet(out_path, index=False)
         updated.append(trade_date)
     return updated
@@ -461,6 +513,7 @@ def update_daily_market_data(config: DailyUpdateConfig) -> dict[str, Any]:
     mairui = MairuiClient(os.getenv("MAIRUI_LICENCE", "").strip())
 
     calendar, target_dates, anchor_date = _load_trade_window(tushare, config.lookback_trading_days)
+    _log(config, f"anchor trade date: {anchor_date}; target dates: {len(target_dates)}")
     stock_basic = _write_calendar_and_stock_basic(config, calendar, tushare.stock_basic(), target_dates)
 
     daily_pending = _select_pending_trade_dates(target_dates, config.daily_dir, config.refresh_latest)
