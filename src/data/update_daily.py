@@ -129,20 +129,23 @@ class MairuiClient:
         self.session = requests.Session()
 
     def history_5min(self, ts_code: str, trade_date: str) -> list[dict[str, Any]]:
+        return self.history_5min_range(ts_code=ts_code, start_date=trade_date, end_date=trade_date)
+
+    def history_5min_range(self, ts_code: str, start_date: str, end_date: str) -> list[dict[str, Any]]:
         url = f"https://api.mairuiapi.com/hsstock/history/{ts_code}/5/n/{self.licence}"
-        response = self.session.get(url, params={"st": trade_date, "et": trade_date}, timeout=self.timeout)
+        response = self.session.get(url, params={"st": start_date, "et": end_date}, timeout=self.timeout)
         response.raise_for_status()
         payload = response.json()
         if isinstance(payload, dict):
             if str(payload.get("code", "")) not in {"0", "200", ""}:
-                raise RuntimeError(f"mairui returned error for {ts_code} {trade_date}: {json.dumps(payload, ensure_ascii=False)}")
+                raise RuntimeError(f"mairui returned error for {ts_code} {start_date}-{end_date}: {json.dumps(payload, ensure_ascii=False)}")
             data = payload.get("data", [])
         elif isinstance(payload, list):
             data = payload
         else:
-            raise RuntimeError(f"unexpected mairui payload type for {ts_code} {trade_date}: {type(payload)!r}")
+            raise RuntimeError(f"unexpected mairui payload type for {ts_code} {start_date}-{end_date}: {type(payload)!r}")
         if not isinstance(data, list):
-            raise RuntimeError(f"unexpected mairui data field for {ts_code} {trade_date}")
+            raise RuntimeError(f"unexpected mairui data field for {ts_code} {start_date}-{end_date}")
         return [dict(row) for row in data if isinstance(row, dict)]
 
 
@@ -279,9 +282,50 @@ def _update_moneyflow_files(pro: TushareClient, config: DailyUpdateConfig, targe
     return updated
 
 
-def _normalize_mairui_rows(ts_code: str, trade_date: str, rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def _existing_trade_dates(out_dir: Path) -> list[str]:
+    dates: list[str] = []
+    for path in sorted(out_dir.glob("*.parquet")):
+        stem = path.stem
+        if len(stem) == 8 and stem.isdigit():
+            dates.append(stem)
+    return dates
+
+
+def _resolve_5min_incremental_dates(target_dates: list[str], out_dir: Path, refresh_latest: bool) -> list[str]:
+    if not target_dates:
+        return []
+    existing_dates = _existing_trade_dates(out_dir)
+    latest_target = target_dates[-1]
+    if not existing_dates:
+        return target_dates
+
+    latest_existing = max(existing_dates)
+    fetch_dates = [d for d in target_dates if d > latest_existing]
+    if refresh_latest and latest_existing == latest_target:
+        fetch_dates.append(latest_target)
+    return sorted(set(fetch_dates))
+
+
+def _extract_trade_date_from_5min_row(row: dict[str, Any], default_trade_date: str | None = None) -> str | None:
+    for key in ["trade_date", "date", "day", "dt", "datetime", "time", "tm", "d", "t"]:
+        value = row.get(key)
+        if value is None:
+            continue
+        ts = pd.to_datetime(value, errors="coerce")
+        if pd.notna(ts):
+            return ts.strftime("%Y%m%d")
+        digits = "".join(ch for ch in str(value) if ch.isdigit())
+        if len(digits) >= 8:
+            return digits[:8]
+    return default_trade_date
+
+
+def _normalize_mairui_rows(ts_code: str, rows: list[dict[str, Any]], default_trade_date: str | None = None) -> list[dict[str, Any]]:
     normalized: list[dict[str, Any]] = []
     for idx, row in enumerate(rows):
+        trade_date = _extract_trade_date_from_5min_row(row, default_trade_date=default_trade_date)
+        if not trade_date:
+            continue
         item = dict(row)
         item.setdefault("ts_code", ts_code)
         item["trade_date"] = trade_date
@@ -290,42 +334,60 @@ def _normalize_mairui_rows(ts_code: str, trade_date: str, rows: list[dict[str, A
     return normalized
 
 
-def _fetch_single_code_5min(mairui: MairuiClient, ts_code: str, trade_date: str, sleep_seconds: float) -> list[dict[str, Any]]:
-    rows = mairui.history_5min(ts_code, trade_date)
+def _fetch_single_code_5min_range(mairui: MairuiClient, ts_code: str, start_date: str, end_date: str, sleep_seconds: float) -> list[dict[str, Any]]:
+    rows = mairui.history_5min_range(ts_code=ts_code, start_date=start_date, end_date=end_date)
     if sleep_seconds > 0:
         time.sleep(sleep_seconds)
-    return _normalize_mairui_rows(ts_code, trade_date, rows)
+    return _normalize_mairui_rows(ts_code, rows)
 
 
-def _build_5min_snapshot_for_date(mairui: MairuiClient, trade_date: str, stock_basic: pd.DataFrame, max_workers: int, sleep_seconds: float) -> pd.DataFrame:
-    # 增量维度按日期管理；由于 Mairui 的 5min 历史接口是按股票查询，这里在单个交易日内聚合全市场快照。
+def _build_5min_snapshots_from_increment(mairui: MairuiClient, fetch_dates: list[str], stock_basic: pd.DataFrame, max_workers: int, sleep_seconds: float) -> dict[str, pd.DataFrame]:
+    if not fetch_dates:
+        return {}
+    start_date = min(fetch_dates)
+    end_date = max(fetch_dates)
+    wanted_dates = set(fetch_dates)
     ts_codes = sorted(stock_basic["ts_code"].dropna().astype(str).unique().tolist()) if "ts_code" in stock_basic.columns else []
-    rows: list[dict[str, Any]] = []
+    by_date: dict[str, list[dict[str, Any]]] = {d: [] for d in fetch_dates}
+
     with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
-        futures = {executor.submit(_fetch_single_code_5min, mairui, ts_code, trade_date, sleep_seconds): ts_code for ts_code in ts_codes}
+        futures = {
+            executor.submit(_fetch_single_code_5min_range, mairui, ts_code, start_date, end_date, sleep_seconds): ts_code
+            for ts_code in ts_codes
+        }
         for fut in as_completed(futures):
             ts_code = futures[fut]
             try:
-                rows.extend(fut.result())
+                rows = fut.result()
             except Exception as exc:
-                raise RuntimeError(f"failed to fetch mairui 5min for {ts_code} on {trade_date}") from exc
-    df = pd.DataFrame(rows)
-    if not df.empty:
-        df = df.sort_values([c for c in ["ts_code", "trade_date", "row_no"] if c in df.columns]).reset_index(drop=True)
-    return df
+                raise RuntimeError(f"failed to fetch mairui 5min for {ts_code} between {start_date} and {end_date}") from exc
+            for row in rows:
+                trade_date = str(row.get("trade_date", ""))
+                if trade_date in wanted_dates:
+                    by_date[trade_date].append(row)
+
+    snapshots: dict[str, pd.DataFrame] = {}
+    for trade_date in fetch_dates:
+        df = pd.DataFrame(by_date.get(trade_date, []))
+        if not df.empty:
+            df = df.sort_values([c for c in ["ts_code", "trade_date", "row_no"] if c in df.columns]).reset_index(drop=True)
+        snapshots[trade_date] = df
+    return snapshots
 
 
 def _update_5min_files(mairui: MairuiClient, config: DailyUpdateConfig, target_dates: list[str], stock_basic: pd.DataFrame) -> list[str]:
+    fetch_dates = _resolve_5min_incremental_dates(target_dates, config.min5_dir, config.refresh_latest)
+    snapshots = _build_5min_snapshots_from_increment(
+        mairui=mairui,
+        fetch_dates=fetch_dates,
+        stock_basic=stock_basic,
+        max_workers=config.max_workers,
+        sleep_seconds=config.request_sleep_seconds,
+    )
     updated: list[str] = []
-    for trade_date in _select_pending_trade_dates(target_dates, config.min5_dir, config.refresh_latest):
+    for trade_date in fetch_dates:
         out_path = config.min5_dir / f"{trade_date}.parquet"
-        _build_5min_snapshot_for_date(
-            mairui=mairui,
-            trade_date=trade_date,
-            stock_basic=stock_basic,
-            max_workers=config.max_workers,
-            sleep_seconds=config.request_sleep_seconds,
-        ).to_parquet(out_path, index=False)
+        snapshots.get(trade_date, pd.DataFrame()).to_parquet(out_path, index=False)
         updated.append(trade_date)
     return updated
 
@@ -403,7 +465,7 @@ def update_daily_market_data(config: DailyUpdateConfig) -> dict[str, Any]:
 
     daily_pending = _select_pending_trade_dates(target_dates, config.daily_dir, config.refresh_latest)
     moneyflow_pending = _select_pending_trade_dates(target_dates, config.moneyflow_dir, config.refresh_latest)
-    min5_pending = _select_pending_trade_dates(target_dates, config.min5_dir, config.refresh_latest)
+    min5_pending = _resolve_5min_incremental_dates(target_dates, config.min5_dir, config.refresh_latest)
     st_pending = _select_pending_trade_dates(target_dates, config.st_dir, config.refresh_latest)
 
     daily_updated = _update_daily_files(tushare, config, target_dates, stock_basic)
