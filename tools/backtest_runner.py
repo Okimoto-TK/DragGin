@@ -479,7 +479,13 @@ def main() -> None:
             if np.isfinite(up_limit) and abs(open_p - up_limit) < 1e-8:
                 continue
 
-            qty = _round_lot_shares(min(per_position_cap, cash), open_p)
+            def ln_coe(coe):
+                if coe < 1:
+                    return coe
+                else:
+                    return 1 + math.log(coe)
+
+            qty = _round_lot_shares(min(per_position_cap * ln_coe(score), cash), open_p)
             if qty < 100:
                 continue
 
