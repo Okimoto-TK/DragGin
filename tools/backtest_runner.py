@@ -17,6 +17,8 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.infer import build_score_by_date_with_ffill, load_offline_scores
+
 
 COMMISSION_RATE = 1e-4
 COMMISSION_MIN = 5.0
@@ -233,49 +235,6 @@ def _print_day_summary(payload: dict[str, Any]) -> None:
     print("=" * 88)
 
 
-def _load_offline_scores(score_dir: Path) -> pd.DataFrame:
-    score_file = score_dir / "scores.parquet"
-    if score_file.exists():
-        df = pd.read_parquet(score_file)
-    else:
-        shard_dir = score_dir / "score_shards"
-        files = sorted(shard_dir.glob("*.parquet"))
-        if not files:
-            raise FileNotFoundError(f"cannot find offline score outputs in: {score_dir}")
-        df = pd.concat([pd.read_parquet(p) for p in files], ignore_index=True)
-    need_cols = {"code", "asof_date", "yhat"}
-    if not need_cols.issubset(set(df.columns)):
-        raise ValueError(f"offline score missing columns: {need_cols - set(df.columns)}")
-    df = df.copy()
-    df["code"] = df["code"].astype(str)
-    df["asof_date"] = pd.to_datetime(df["asof_date"], errors="coerce").dt.strftime("%Y-%m-%d")
-    df["yhat"] = pd.to_numeric(df["yhat"], errors="coerce")
-    df = df.dropna(subset=["code", "asof_date"])
-    return df.sort_values(["code", "asof_date"]).reset_index(drop=True)
-
-
-def _build_score_by_date_with_ffill(asof_dates: list[str], codes: list[str], score_df: pd.DataFrame) -> dict[str, list[tuple[str, float]]]:
-    # 对每只股票按日期 forward fill，停牌等导致当日缺失 yhat 时延续旧信号。
-    grouped: dict[str, list[tuple[str, float]]] = {}
-    for code, sub in score_df.groupby("code", sort=False):
-        pairs = [(str(d), float(v)) for d, v in zip(sub["asof_date"].tolist(), sub["yhat"].tolist()) if np.isfinite(v)]
-        if pairs:
-            grouped[str(code)] = pairs
-
-    score_by_date: dict[str, list[tuple[str, float]]] = {d: [] for d in asof_dates}
-    for code in codes:
-        hist = grouped.get(code, [])
-        ptr = 0
-        cur: float | None = None
-        for d in asof_dates:
-            while ptr < len(hist) and hist[ptr][0] <= d:
-                cur = hist[ptr][1]
-                ptr += 1
-            if cur is not None:
-                score_by_date[d].append((code, cur))
-    return score_by_date
-
-
 def _mark_price(day_row: dict[str, float] | None, field: str, fallback: float) -> float:
     if day_row is None:
         return fallback
@@ -332,8 +291,8 @@ def main() -> None:
     if not codes:
         raise ValueError("no stock folders with required parquet files found")
 
-    score_df = _load_offline_scores(score_dir)
-    score_by_date = _build_score_by_date_with_ffill(asof_dates=asof_dates, codes=codes, score_df=score_df)
+    score_df = load_offline_scores(score_dir)
+    score_by_date = build_score_by_date_with_ffill(asof_dates=asof_dates, codes=codes, score_df=score_df)
 
     token = args.ts_token or str(os.environ.get("TUSHARE_TOKEN", ""))
     pro = ts.pro_api(token) if token else None
