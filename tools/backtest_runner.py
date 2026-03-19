@@ -345,20 +345,19 @@ def main() -> None:
     cash = float(args.initial_cash)
     positions: dict[str, Position] = {}
     prev_final_holding_amount = 0.0
-    prev_holding_count = int(args.topk)
     prev_confidence = 1.0
+    target_n = int(args.topk)
 
     for t_idx, asof in enumerate(asof_dates):
         day = val_dates[t_idx + 1]
         day_trade = day.replace("-", "")
-
         rank_rows = sorted(score_by_date.get(asof, []), key=lambda x: x[1], reverse=True)
         st_codes_today = st_flags_by_day.get(day_trade, set())
         score_map = {code: float(score) for code, score in rank_rows}
         if t_idx == 0:
             target_n = int(args.topk)
         else:
-            target_n = int(round(prev_holding_count * prev_confidence))
+            target_n = int(round(target_n * prev_confidence))
             target_n = max(1, min(int(args.topk), target_n))
 
         if day_trade not in limit_cache:
@@ -532,9 +531,9 @@ def main() -> None:
         prev_holding_count = len(final_pos_details)
         if prev_holding_count > 0:
             win_count = sum(1 for row in final_pos_details if float(row.get("float_pnl", 0.0)) > 0.0)
-            prev_confidence = float(win_count) / float(prev_holding_count)
+            prev_confidence = float(win_count) / float(prev_holding_count - win_count)
         else:
-            prev_confidence = 0.0
+            prev_confidence = 1
 
         payload = {
             "asof_date": asof,
