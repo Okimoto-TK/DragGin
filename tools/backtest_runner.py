@@ -531,7 +531,7 @@ def main() -> None:
         prev_holding_count = len(final_pos_details)
         if prev_holding_count > 0:
             win_count = sum(1 for row in final_pos_details if float(row.get("float_pnl", 0.0)) > 0.0)
-            prev_confidence = float(win_count) / float(prev_holding_count - win_count)
+            prev_confidence = 0.5 * pow(4, float(win_count) / float(prev_holding_count))
         else:
             prev_confidence = 1
 
