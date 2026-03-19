@@ -207,6 +207,18 @@ def _need_refresh(path: Path, refresh_latest: bool, latest_trade_date: str) -> b
     return False
 
 
+def _select_pending_trade_dates(target_dates: list[str], out_dir: Path, refresh_latest: bool) -> list[str]:
+    if not target_dates:
+        return []
+    latest_trade_date = target_dates[-1]
+    pending: list[str] = []
+    for trade_date in target_dates:
+        out_path = out_dir / f"{trade_date}.parquet"
+        if _need_refresh(out_path, refresh_latest, latest_trade_date):
+            pending.append(trade_date)
+    return pending
+
+
 def _merge_daily_and_adj(daily_df: pd.DataFrame, adj_df: pd.DataFrame, trade_date: str, stock_basic: pd.DataFrame) -> pd.DataFrame:
     daily = daily_df.copy() if daily_df is not None else pd.DataFrame()
     adj = adj_df.copy() if adj_df is not None else pd.DataFrame()
@@ -225,41 +237,42 @@ def _merge_daily_and_adj(daily_df: pd.DataFrame, adj_df: pd.DataFrame, trade_dat
     return merged.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
 
 
+def _build_daily_snapshot_for_date(pro: TushareClient, trade_date: str, stock_basic: pd.DataFrame) -> pd.DataFrame:
+    daily_df = pro.daily(trade_date)
+    adj_df = pro.adj_factor(trade_date)
+    return _merge_daily_and_adj(daily_df, adj_df, trade_date, stock_basic)
+
+
 def _update_daily_files(pro: TushareClient, config: DailyUpdateConfig, target_dates: list[str], stock_basic: pd.DataFrame) -> list[str]:
     updated: list[str] = []
-    latest = target_dates[-1]
-    for trade_date in target_dates:
+    for trade_date in _select_pending_trade_dates(target_dates, config.daily_dir, config.refresh_latest):
         out_path = config.daily_dir / f"{trade_date}.parquet"
-        if not _need_refresh(out_path, config.refresh_latest, latest):
-            continue
-        daily_df = pro.daily(trade_date)
-        adj_df = pro.adj_factor(trade_date)
-        merged = _merge_daily_and_adj(daily_df, adj_df, trade_date, stock_basic)
-        merged.to_parquet(out_path, index=False)
+        _build_daily_snapshot_for_date(pro, trade_date, stock_basic).to_parquet(out_path, index=False)
         updated.append(trade_date)
         if config.request_sleep_seconds > 0:
             time.sleep(config.request_sleep_seconds)
     return updated
 
 
-def _update_moneyflow_files(pro: TushareClient, config: DailyUpdateConfig, target_dates: list[str], stock_basic: pd.DataFrame) -> list[str]:
-    updated: list[str] = []
-    latest = target_dates[-1]
+def _build_moneyflow_snapshot_for_date(pro: TushareClient, trade_date: str, stock_basic: pd.DataFrame) -> pd.DataFrame:
+    df = pro.moneyflow(trade_date)
+    if df is None:
+        df = pd.DataFrame(columns=MONEYFLOW_FIELDS.split(","))
     stock_cols = [c for c in ["ts_code", "name", "symbol", "industry", "market"] if c in stock_basic.columns]
     stock_view = stock_basic[stock_cols] if stock_cols else pd.DataFrame(columns=["ts_code"])
-    for trade_date in target_dates:
+    if not df.empty:
+        df["trade_date"] = _normalize_date_str(df["trade_date"])
+        if not stock_view.empty:
+            df = df.merge(stock_view, on="ts_code", how="left")
+        df = df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
+    return df
+
+
+def _update_moneyflow_files(pro: TushareClient, config: DailyUpdateConfig, target_dates: list[str], stock_basic: pd.DataFrame) -> list[str]:
+    updated: list[str] = []
+    for trade_date in _select_pending_trade_dates(target_dates, config.moneyflow_dir, config.refresh_latest):
         out_path = config.moneyflow_dir / f"{trade_date}.parquet"
-        if not _need_refresh(out_path, config.refresh_latest, latest):
-            continue
-        df = pro.moneyflow(trade_date)
-        if df is None:
-            df = pd.DataFrame(columns=MONEYFLOW_FIELDS.split(","))
-        if not df.empty:
-            df["trade_date"] = _normalize_date_str(df["trade_date"])
-            if not stock_view.empty:
-                df = df.merge(stock_view, on="ts_code", how="left")
-            df = df.sort_values(["ts_code", "trade_date"]).reset_index(drop=True)
-        df.to_parquet(out_path, index=False)
+        _build_moneyflow_snapshot_for_date(pro, trade_date, stock_basic).to_parquet(out_path, index=False)
         updated.append(trade_date)
         if config.request_sleep_seconds > 0:
             time.sleep(config.request_sleep_seconds)
@@ -284,30 +297,35 @@ def _fetch_single_code_5min(mairui: MairuiClient, ts_code: str, trade_date: str,
     return _normalize_mairui_rows(ts_code, trade_date, rows)
 
 
+def _build_5min_snapshot_for_date(mairui: MairuiClient, trade_date: str, stock_basic: pd.DataFrame, max_workers: int, sleep_seconds: float) -> pd.DataFrame:
+    # 增量维度按日期管理；由于 Mairui 的 5min 历史接口是按股票查询，这里在单个交易日内聚合全市场快照。
+    ts_codes = sorted(stock_basic["ts_code"].dropna().astype(str).unique().tolist()) if "ts_code" in stock_basic.columns else []
+    rows: list[dict[str, Any]] = []
+    with ThreadPoolExecutor(max_workers=max(1, max_workers)) as executor:
+        futures = {executor.submit(_fetch_single_code_5min, mairui, ts_code, trade_date, sleep_seconds): ts_code for ts_code in ts_codes}
+        for fut in as_completed(futures):
+            ts_code = futures[fut]
+            try:
+                rows.extend(fut.result())
+            except Exception as exc:
+                raise RuntimeError(f"failed to fetch mairui 5min for {ts_code} on {trade_date}") from exc
+    df = pd.DataFrame(rows)
+    if not df.empty:
+        df = df.sort_values([c for c in ["ts_code", "trade_date", "row_no"] if c in df.columns]).reset_index(drop=True)
+    return df
+
+
 def _update_5min_files(mairui: MairuiClient, config: DailyUpdateConfig, target_dates: list[str], stock_basic: pd.DataFrame) -> list[str]:
     updated: list[str] = []
-    latest = target_dates[-1]
-    ts_codes = sorted(stock_basic["ts_code"].dropna().astype(str).unique().tolist()) if "ts_code" in stock_basic.columns else []
-    for trade_date in target_dates:
+    for trade_date in _select_pending_trade_dates(target_dates, config.min5_dir, config.refresh_latest):
         out_path = config.min5_dir / f"{trade_date}.parquet"
-        if not _need_refresh(out_path, config.refresh_latest, latest):
-            continue
-        rows: list[dict[str, Any]] = []
-        with ThreadPoolExecutor(max_workers=max(1, config.max_workers)) as executor:
-            futures = {
-                executor.submit(_fetch_single_code_5min, mairui, ts_code, trade_date, config.request_sleep_seconds): ts_code
-                for ts_code in ts_codes
-            }
-            for fut in as_completed(futures):
-                ts_code = futures[fut]
-                try:
-                    rows.extend(fut.result())
-                except Exception as exc:
-                    raise RuntimeError(f"failed to fetch mairui 5min for {ts_code} on {trade_date}") from exc
-        df = pd.DataFrame(rows)
-        if not df.empty:
-            df = df.sort_values([c for c in ["ts_code", "trade_date", "row_no"] if c in df.columns]).reset_index(drop=True)
-        df.to_parquet(out_path, index=False)
+        _build_5min_snapshot_for_date(
+            mairui=mairui,
+            trade_date=trade_date,
+            stock_basic=stock_basic,
+            max_workers=config.max_workers,
+            sleep_seconds=config.request_sleep_seconds,
+        ).to_parquet(out_path, index=False)
         updated.append(trade_date)
     return updated
 
@@ -344,7 +362,7 @@ def _build_st_name_history(stock_basic: pd.DataFrame, namechange: pd.DataFrame) 
     return history
 
 
-def _build_st_rows_for_date(trade_date: str, stock_basic: pd.DataFrame, name_history: dict[str, list[tuple[pd.Timestamp, str]]]) -> pd.DataFrame:
+def _build_st_snapshot_for_date(trade_date: str, stock_basic: pd.DataFrame, name_history: dict[str, list[tuple[pd.Timestamp, str]]]) -> pd.DataFrame:
     if stock_basic.empty:
         return pd.DataFrame(columns=["trade_date", "ts_code", "name", "is_st"])
 
@@ -360,28 +378,17 @@ def _build_st_rows_for_date(trade_date: str, stock_basic: pd.DataFrame, name_his
                 effective_name = str(name).strip()
             else:
                 break
-        rows.append(
-            {
-                "trade_date": trade_date,
-                "ts_code": ts_code,
-                "name": effective_name,
-                "is_st": _is_st_name(effective_name),
-            }
-        )
+        rows.append({"trade_date": trade_date, "ts_code": ts_code, "name": effective_name, "is_st": _is_st_name(effective_name)})
     return pd.DataFrame(rows).sort_values(["ts_code"]).reset_index(drop=True)
 
 
 def _update_st_files(pro: TushareClient, config: DailyUpdateConfig, target_dates: list[str], stock_basic: pd.DataFrame) -> list[str]:
     updated: list[str] = []
-    latest = target_dates[-1]
-    namechange = pro.namechange(end_date=latest)
+    namechange = pro.namechange(end_date=target_dates[-1])
     name_history = _build_st_name_history(stock_basic, namechange)
-    for trade_date in target_dates:
+    for trade_date in _select_pending_trade_dates(target_dates, config.st_dir, config.refresh_latest):
         out_path = config.st_dir / f"{trade_date}.parquet"
-        if not _need_refresh(out_path, config.refresh_latest, latest):
-            continue
-        df = _build_st_rows_for_date(trade_date, stock_basic, name_history)
-        df.to_parquet(out_path, index=False)
+        _build_st_snapshot_for_date(trade_date, stock_basic, name_history).to_parquet(out_path, index=False)
         updated.append(trade_date)
     return updated
 
@@ -394,6 +401,11 @@ def update_daily_market_data(config: DailyUpdateConfig) -> dict[str, Any]:
     calendar, target_dates, anchor_date = _load_trade_window(tushare, config.lookback_trading_days)
     stock_basic = _write_calendar_and_stock_basic(config, calendar, tushare.stock_basic(), target_dates)
 
+    daily_pending = _select_pending_trade_dates(target_dates, config.daily_dir, config.refresh_latest)
+    moneyflow_pending = _select_pending_trade_dates(target_dates, config.moneyflow_dir, config.refresh_latest)
+    min5_pending = _select_pending_trade_dates(target_dates, config.min5_dir, config.refresh_latest)
+    st_pending = _select_pending_trade_dates(target_dates, config.st_dir, config.refresh_latest)
+
     daily_updated = _update_daily_files(tushare, config, target_dates, stock_basic)
     moneyflow_updated = _update_moneyflow_files(tushare, config, target_dates, stock_basic)
     min5_updated = _update_5min_files(mairui, config, target_dates, stock_basic)
@@ -404,6 +416,10 @@ def update_daily_market_data(config: DailyUpdateConfig) -> dict[str, Any]:
         "anchor_trade_date": anchor_date,
         "target_trade_dates": target_dates,
         "lookback_trading_days": int(config.lookback_trading_days),
+        "daily_pending": daily_pending,
+        "moneyflow_pending": moneyflow_pending,
+        "min5_pending": min5_pending,
+        "st_pending": st_pending,
         "daily_updated": daily_updated,
         "moneyflow_updated": moneyflow_updated,
         "min5_updated": min5_updated,
