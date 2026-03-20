@@ -17,7 +17,7 @@ if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
 from src.feat.build_multiscale_tensor import build_multiscale_tensors
-from src.train.runner import MultiScaleRegressor
+from src.infer import build_model, infer_from_feature_shard, merge_score_shards
 
 try:
     from tqdm.auto import tqdm
@@ -225,85 +225,6 @@ def _build_feature_shard(data_dir: str, code: str, asof_dates: list[str], out_di
     return {"code": code, "path": str(shard_path), "rows": n}
 
 
-def _build_model(
-    device: torch.device,
-    checkpoint: str,
-    hidden_dim: int,
-    num_heads: int,
-    dropout: float,
-    use_seq_context: bool,
-    enable_dynamic_threshold: bool,
-    enable_free_branch: bool,
-) -> MultiScaleRegressor:
-    model = MultiScaleRegressor(
-        hidden_dim=int(hidden_dim),
-        num_heads=int(num_heads),
-        dropout=float(dropout),
-        use_seq_context=bool(use_seq_context),
-        enable_dynamic_threshold=bool(enable_dynamic_threshold),
-        enable_free_branch=bool(enable_free_branch),
-    ).to(device)
-    ckpt = torch.load(checkpoint, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt)
-    model.eval()
-    return model
-
-
-def _infer_from_feature_shard(model: MultiScaleRegressor, device: torch.device, shard_path: Path, infer_batch_size: int) -> pd.DataFrame:
-    shard = np.load(shard_path, allow_pickle=True)
-    code = str(shard["code"].item() if np.ndim(shard["code"]) == 0 else shard["code"][0])
-    asof_dates = shard["asof_dates"].astype(str)
-    sample_ok = shard["sample_ok"].astype(bool)
-    reasons = shard["reason"].astype(object)
-
-    recs: list[dict[str, Any]] = []
-    valid_idx = np.flatnonzero(sample_ok)
-    if len(valid_idx) > 0:
-        with torch.inference_mode():
-            for start in range(0, len(valid_idx), infer_batch_size):
-                idxs = valid_idx[start : start + infer_batch_size]
-                batch = {
-                    "x_micro": torch.from_numpy(np.ascontiguousarray(shard["x_micro"][idxs], dtype=np.float32)).to(device),
-                    "x_mezzo": torch.from_numpy(np.ascontiguousarray(shard["x_mezzo"][idxs], dtype=np.float32)).to(device),
-                    "x_macro": torch.from_numpy(np.ascontiguousarray(shard["x_macro"][idxs], dtype=np.float32)).to(device),
-                    "mask_micro": torch.from_numpy(np.ascontiguousarray(shard["mask_micro"][idxs])).to(torch.bool).to(device),
-                    "mask_mezzo": torch.from_numpy(np.ascontiguousarray(shard["mask_mezzo"][idxs])).to(torch.bool).to(device),
-                    "mask_macro": torch.from_numpy(np.ascontiguousarray(shard["mask_macro"][idxs])).to(torch.bool).to(device),
-                    "flow_x": torch.from_numpy(np.ascontiguousarray(shard["flow_x"][idxs], dtype=np.float32)).to(device),
-                    "flow_mask": torch.from_numpy(np.ascontiguousarray(shard["flow_mask"][idxs])).to(torch.bool).to(device),
-                }
-                y_hat, _ = model(batch)
-                scores = y_hat.detach().cpu().numpy().reshape(-1)
-                for j, row_idx in enumerate(idxs):
-                    recs.append(
-                        {
-                            "code": code,
-                            "asof_date": str(asof_dates[row_idx]),
-                            "yhat": float(scores[j]),
-                            "tensor_ok": bool(shard["tensor_ok"][row_idx]),
-                            "flow_ok": bool(shard["flow_ok"][row_idx]),
-                            "sample_ok": True,
-                            "reason": "ok",
-                        }
-                    )
-
-    invalid_idx = np.flatnonzero(~sample_ok)
-    for row_idx in invalid_idx:
-        recs.append(
-            {
-                "code": code,
-                "asof_date": str(asof_dates[row_idx]),
-                "yhat": np.nan,
-                "tensor_ok": bool(shard["tensor_ok"][row_idx]),
-                "flow_ok": bool(shard["flow_ok"][row_idx]),
-                "sample_ok": False,
-                "reason": str(reasons[row_idx]),
-            }
-        )
-
-    return pd.DataFrame(recs).sort_values("asof_date").reset_index(drop=True)
-
-
 def main() -> None:
     parser = argparse.ArgumentParser(description="Build offline backtest features and score shards")
     parser.add_argument("--data-dir", required=True)
@@ -359,7 +280,7 @@ def main() -> None:
                 fut.result()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-    model = _build_model(
+    model = build_model(
         device=device,
         checkpoint=str(args.checkpoint),
         hidden_dim=int(args.hidden_dim),
@@ -373,12 +294,12 @@ def main() -> None:
     feature_paths = sorted(feature_dir.glob("*.npz"))
     infer_iter = _iter_progress(feature_paths, total=len(feature_paths), show_progress=bool(args.show_progress), desc="inferring score shards")
     for shard_path in infer_iter:
-        df = _infer_from_feature_shard(model, device, shard_path, max(1, int(args.infer_batch_size)))
+        df = infer_from_feature_shard(model, device, shard_path, max(1, int(args.infer_batch_size)))
         df.to_parquet(score_dir / f"{shard_path.stem}.parquet", index=False)
 
     scores_path: str | None = None
     if bool(args.merge_scores):
-        merged = pd.concat([pd.read_parquet(p) for p in sorted(score_dir.glob("*.parquet"))], ignore_index=True)
+        merged = merge_score_shards(score_dir)
         merged_path = out_dir / "scores.parquet"
         merged.to_parquet(merged_path, index=False)
         scores_path = str(merged_path.resolve())
