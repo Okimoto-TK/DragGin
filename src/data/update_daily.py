@@ -344,18 +344,37 @@ def _load_suspend_map(suspend_dir: Path, target_dates: list[str]) -> dict[str, s
     return out
 
 
-def _compute_code_open_windows(stock_basic: pd.DataFrame, target_dates: list[str], suspend_map: dict[str, set[str]]) -> dict[str, tuple[str, str]]:
-    windows: dict[str, tuple[str, str]] = {}
+def _compute_code_open_dates(stock_basic: pd.DataFrame, target_dates: list[str], suspend_map: dict[str, set[str]]) -> dict[str, list[str]]:
+    code_dates: dict[str, list[str]] = {}
     if not target_dates or stock_basic.empty:
-        return windows
+        return code_dates
     all_codes = stock_basic["ts_code"].dropna().astype(str).tolist() if "ts_code" in stock_basic.columns else []
     for code in all_codes:
         open_dates = [d for d in target_dates if code not in suspend_map.get(d, set())]
         if not open_dates:
             continue
-        tail = open_dates[-REAL_OPEN_LOOKBACK_DAYS:]
-        windows[code] = (tail[0], tail[-1])
-    return windows
+        code_dates[code] = open_dates[-REAL_OPEN_LOOKBACK_DAYS:]
+    return code_dates
+
+
+def _select_pending_5min_code_windows(
+    config: DailyUpdateConfig,
+    code_open_dates: dict[str, list[str]],
+) -> dict[str, tuple[str, str]]:
+    pending: dict[str, tuple[str, str]] = {}
+    for code, open_dates in code_open_dates.items():
+        if not open_dates:
+            continue
+        code_dir = config.min5_dir / code
+        missing_dates: list[str] = []
+        latest_trade_date = open_dates[-1]
+        for trade_date in open_dates:
+            out_path = code_dir / f"{trade_date}.csv"
+            if _need_refresh(out_path, config.refresh_latest, latest_trade_date):
+                missing_dates.append(trade_date)
+        if missing_dates:
+            pending[code] = (missing_dates[0], missing_dates[-1])
+    return pending
 
 
 def _extract_trade_date_from_5min_row(row: dict[str, Any], default_trade_date: str | None = None) -> str | None:
@@ -522,7 +541,8 @@ def update_daily_market_data(config: DailyUpdateConfig) -> dict[str, Any]:
     suspend_pending = _select_pending_trade_dates(target_dates, config.suspend_dir, config.refresh_latest)
     suspend_updated = _update_suspend_files(tushare, config, target_dates, stock_basic)
     suspend_map = _load_suspend_map(config.suspend_dir, target_dates)
-    code_windows = _compute_code_open_windows(stock_basic, target_dates, suspend_map)
+    code_open_dates = _compute_code_open_dates(stock_basic, target_dates, suspend_map)
+    code_windows = _select_pending_5min_code_windows(config, code_open_dates)
 
     daily_pending = _select_pending_trade_dates(target_dates, config.daily_dir, config.refresh_latest)
     moneyflow_pending = _select_pending_trade_dates(target_dates, config.moneyflow_dir, config.refresh_latest)
@@ -550,6 +570,7 @@ def update_daily_market_data(config: DailyUpdateConfig) -> dict[str, Any]:
         "st_updated": st_updated,
         "stock_basic_rows": int(len(stock_basic)),
         "code_windows": {k: {"L": v[0], "T": v[1]} for k, v in code_windows.items()},
+        "code_open_dates": code_open_dates,
     }
     config.meta_path.write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
     return meta
