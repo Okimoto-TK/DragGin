@@ -24,7 +24,7 @@ NAMECHANGE_FIELDS = "ts_code,name,start_date,end_date"
 MAIRUI_TIMEOUT = 30
 DEFAULT_LOOKBACK_TRADING_DAYS = 120
 REAL_OPEN_LOOKBACK_DAYS = 60
-DEFAULT_5MIN_PROCESS_WORKERS = 8
+DEFAULT_5MIN_PROCESS_WORKERS = 16
 
 
 @dataclass(frozen=True)
@@ -370,7 +370,7 @@ def _select_pending_5min_code_windows(
         latest_trade_date = open_dates[-1]
         for trade_date in open_dates:
             out_path = code_dir / f"{trade_date}.csv"
-            if _need_refresh(out_path, config.refresh_latest, latest_trade_date):
+            if _need_refresh(out_path, False, latest_trade_date):
                 missing_dates.append(trade_date)
         if missing_dates:
             pending[code] = (missing_dates[0], missing_dates[-1])
