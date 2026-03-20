@@ -67,6 +67,7 @@ def main() -> None:
     parser.add_argument("--ts-token", default="")
     parser.add_argument("--initial-cash", type=float, default=1_000_000.0)
     parser.add_argument("--st-dir", default="", help="directory containing YYYYmmdd_stock_st.parquet files")
+    parser.add_argument("--verbose", action="store_true")
     args = parser.parse_args()
 
     data_dir = Path(args.data_dir)
@@ -104,7 +105,7 @@ def main() -> None:
         pro=pro,
         st_dir=Path(args.st_dir) if args.st_dir else None,
         out_dir=out_dir,
-        print_summary=True,
+        verbose=bool(args.verbose),
     )
 
 

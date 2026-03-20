@@ -215,7 +215,7 @@ def run_trade_simulation(
     pro: Any | None = None,
     st_dir: Path | None = None,
     out_dir: Path | None = None,
-    print_summary: bool = True,
+    verbose: bool = True,
 ) -> list[dict[str, Any]]:
     codes = resolve_codes(data_dir)
     if not codes:
@@ -390,7 +390,7 @@ def run_trade_simulation(
             out_path = out_dir / f"{day_trade}.json"
             out_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"saved {out_path}")
-        if print_summary:
+        if verbose:
             print_day_summary(payload)
 
     return outputs

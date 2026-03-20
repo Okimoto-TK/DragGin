@@ -194,7 +194,7 @@ def _run_trade(args: argparse.Namespace) -> None:
         pro=pro,
         st_dir=data_dir / "raw" / "st",
         out_dir=position_dir,
-        print_summary=True,
+        verbose=bool(args.verbose),
     )
     meta = {
         "update_meta": update_meta,
