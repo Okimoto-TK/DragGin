@@ -16,7 +16,7 @@ def main() -> None:
 
     update_daily = subparsers.add_parser("update-daily", help="Update raw daily market data cache under ./data")
     update_daily.add_argument("--data-dir", default="data")
-    update_daily.add_argument("--lookback-trading-days", type=int, default=60)
+    update_daily.add_argument("--lookback-trading-days", type=int, default=120)
     update_daily.add_argument("--sleep", type=float, default=0.0)
     update_daily.add_argument("--verbose", action="store_true")
     update_daily.add_argument("--no-refresh-latest", action="store_true")
