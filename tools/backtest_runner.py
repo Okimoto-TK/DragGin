@@ -259,6 +259,62 @@ def _apply_adj_factor_before_open(pos: Position, day_row: dict[str, float] | Non
     pos.last_adj_factor = float(adj_today)
 
 
+def _is_buy_candidate(
+    code: str,
+    score: float,
+    day_row: dict[str, float] | None,
+    st_codes_today: set[str],
+    day_limits: dict[str, tuple[float, float]],
+    buy_gate: float,
+) -> bool:
+    if score <= float(buy_gate):
+        return False
+    if _is_filtered_buy_code(code, st_codes_today):
+        return False
+    if day_row is None:
+        return False
+    open_p = float(day_row.get("open", math.nan))
+    if (not np.isfinite(open_p)) or open_p <= 0:
+        return False
+    up_limit = float(day_limits.get(code, (math.nan, math.nan))[0])
+    return (not np.isfinite(up_limit)) or abs(open_p - up_limit) >= 1e-8
+
+
+def _calc_hypothetical_prev_confidence(
+    rank_rows: list[tuple[str, float]],
+    day: str,
+    daily_cache: dict[str, dict[str, dict[str, float]]],
+    st_codes_today: set[str],
+    day_limits: dict[str, tuple[float, float]],
+    buy_gate: float,
+    topk: int,
+) -> float:
+    candidates: list[tuple[str, dict[str, float]]] = []
+    for code, score in rank_rows:
+        day_row = daily_cache.get(code, {}).get(day)
+        if not _is_buy_candidate(code, score, day_row, st_codes_today, day_limits, buy_gate):
+            continue
+        assert day_row is not None
+        candidates.append((code, day_row))
+        if len(candidates) >= max(1, int(topk)):
+            break
+
+    if not candidates:
+        return 1.0
+
+    win_count = 0
+    for _, day_row in candidates:
+        open_p = float(day_row.get("open", math.nan))
+        close_p = _mark_price(day_row, "close", open_p)
+        qty = 100.0
+        gross = open_p * qty
+        cost_total = gross + _commission(gross)
+        market_value = close_p * qty
+        if market_value - cost_total > 0.0:
+            win_count += 1
+    return 0.5 * pow(4, float(win_count) / float(len(candidates)))
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Model backtest runner (offline scores)")
     parser.add_argument("--data-dir", required=True)
@@ -420,23 +476,14 @@ def main() -> None:
         for code, score in rank_rows:
             if code in positions or code in sold_today:
                 continue
-            if score <= float(args.buy_gate):
-                break
-            if _is_filtered_buy_code(code, st_codes_today):
-                continue
 
             day_row = daily_cache.get(code, {}).get(day)
-            # 缺行情不交易
-            if day_row is None:
+            if not _is_buy_candidate(code, score, day_row, st_codes_today, limit_cache[day_trade], float(args.buy_gate)):
+                if score <= float(args.buy_gate):
+                    break
                 continue
+            assert day_row is not None
             open_p = float(day_row.get("open", math.nan))
-            if (not np.isfinite(open_p)) or open_p <= 0:
-                continue
-
-            updn = limit_cache[day_trade].get(code, (math.nan, math.nan))
-            up_limit = float(updn[0])
-            if np.isfinite(up_limit) and abs(open_p - up_limit) < 1e-8:
-                continue
 
             def ln_coe(coe):
                 if coe < 1:
@@ -493,12 +540,15 @@ def main() -> None:
 
         final_total_asset = cash + final_holding_amount
         prev_final_holding_amount = final_holding_amount
-        prev_holding_count = len(final_pos_details)
-        if prev_holding_count > 0:
-            win_count = sum(1 for row in final_pos_details if float(row.get("float_pnl", 0.0)) > 0.0)
-            prev_confidence = 0.5 * pow(4, float(win_count) / float(prev_holding_count))
-        else:
-            prev_confidence = 1
+        prev_confidence = _calc_hypothetical_prev_confidence(
+            rank_rows=rank_rows,
+            day=day,
+            daily_cache=daily_cache,
+            st_codes_today=st_codes_today,
+            day_limits=limit_cache[day_trade],
+            buy_gate=float(args.buy_gate),
+            topk=int(args.topk),
+        )
 
         payload = {
             "asof_date": asof,
