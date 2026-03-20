@@ -5,9 +5,10 @@ import json
 import os
 import shutil
 import sys
-import tempfile
+from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+
 import pandas as pd
 import torch
 import tushare as ts
@@ -18,7 +19,6 @@ if str(ROOT) not in sys.path:
 
 from src.data import DailyUpdateConfig, update_daily_market_data
 from src.infer import (
-    Position,
     build_model,
     infer_from_feature_shard,
     load_daily_map,
@@ -29,26 +29,168 @@ from src.infer import (
     run_trade_simulation,
 )
 from tools.build_backtest_batches import _build_feature_shard
-from tools.preprocess_data import preprocess
+from tools.preprocess_data import _normalize_5min, _normalize_daily, _normalize_moneyflow
 
 
-def _symlink_or_copy(src: Path, dst: Path) -> None:
-    if dst.exists() or dst.is_symlink():
-        dst.unlink()
+_UPDATE_DAILY_DAILY_COLUMNS = [
+    "ts_code",
+    "trade_date",
+    "open",
+    "high",
+    "low",
+    "close",
+    "adj_factor",
+    "vol",
+    "amount",
+    "pct_chg",
+]
+
+_UPDATE_DAILY_MONEYFLOW_COLUMNS = [
+    "ts_code",
+    "trade_date",
+    "buy_lg_vol",
+    "sell_lg_vol",
+    "buy_elg_vol",
+    "sell_elg_vol",
+    "net_mf_vol",
+    "net_mf_amount",
+]
+
+
+def _read_parquet_columns(path: Path, columns: list[str]) -> pd.DataFrame:
     try:
-        os.symlink(src, dst)
-    except OSError:
-        if src.is_file():
-            shutil.copy2(src, dst)
-        else:
-            raise
+        return pd.read_parquet(path, columns=columns)
+    except Exception:
+        return pd.read_parquet(path)
 
 
-def _build_processed_dataset_from_update_daily(data_dir: Path, processed_dir: Path, num_workers: int) -> Path:
+
+def _canonicalize_update_daily_daily(df: pd.DataFrame) -> pd.DataFrame:
+    raw = df.copy()
+    if "ts_code" in raw.columns and "code" not in raw.columns:
+        raw = raw.rename(columns={"ts_code": "code"})
+    if "vol" in raw.columns and "volume" not in raw.columns:
+        raw = raw.rename(columns={"vol": "volume"})
+    return _normalize_daily(raw)
+
+
+
+def _canonicalize_update_daily_moneyflow(df: pd.DataFrame) -> pd.DataFrame:
+    raw = df.copy()
+    if "ts_code" not in raw.columns and "code" in raw.columns:
+        raw = raw.rename(columns={"code": "ts_code"})
+    return _normalize_moneyflow(raw)
+
+
+
+def _canonicalize_update_daily_5min(df: pd.DataFrame, code_hint: str) -> pd.DataFrame:
+    raw = df.copy()
+    aliases = {
+        "ts_code": "code",
+        "symbol": "code",
+        "tm": "time",
+        "datetime": "trade_time",
+        "dt": "trade_time",
+        "o": "open",
+        "h": "high",
+        "l": "low",
+        "c": "close",
+        "v": "vol",
+    }
+    for src, dst in aliases.items():
+        if src in raw.columns and dst not in raw.columns:
+            raw = raw.rename(columns={src: dst})
+    if "code" not in raw.columns:
+        raw["code"] = str(code_hint)
+    else:
+        raw["code"] = raw["code"].fillna(str(code_hint)).astype(str)
+        raw.loc[raw["code"].str.len() == 0, "code"] = str(code_hint)
+    return _normalize_5min(raw)
+
+
+
+def _write_processed_code_frames(processed_dir: Path, payloads: dict[str, dict[str, list[pd.DataFrame]]]) -> list[str]:
+    written_codes: list[str] = []
+    for code in sorted(payloads):
+        code_dir = processed_dir / code
+        code_dir.mkdir(parents=True, exist_ok=True)
+        daily_parts = payloads[code].get("daily", [])
+        min5_parts = payloads[code].get("5min", [])
+        moneyflow_parts = payloads[code].get("moneyflow", [])
+        if not daily_parts or not min5_parts or not moneyflow_parts:
+            continue
+
+        daily_df = pd.concat(daily_parts, ignore_index=True)
+        daily_df["volume"] = pd.to_numeric(daily_df["volume"], errors="coerce")
+        daily_df = daily_df.dropna(subset=["trade_date", "volume"])
+        daily_df = daily_df[daily_df["volume"] > 0]
+        daily_df = daily_df.sort_values("trade_date").drop_duplicates(subset=["trade_date"], keep="last").reset_index(drop=True)
+        if daily_df.empty:
+            continue
+        valid_trade_dates = set(daily_df["trade_date"].tolist())
+        daily_df.to_parquet(code_dir / "daily.parquet", index=False)
+
+        min5_df = pd.concat(min5_parts, ignore_index=True)
+        min5_df = min5_df[min5_df["trade_date"].isin(valid_trade_dates)].copy()
+        min5_df = min5_df.sort_values("dt").reset_index(drop=True)
+        if min5_df.empty:
+            continue
+        min5_df.to_parquet(code_dir / "5min.parquet", index=False)
+
+        moneyflow_df = pd.concat(moneyflow_parts, ignore_index=True)
+        moneyflow_df = moneyflow_df[moneyflow_df["trade_date"].isin(valid_trade_dates)].copy()
+        moneyflow_df = moneyflow_df.sort_values("trade_date").drop_duplicates(subset=["trade_date"], keep="last").reset_index(drop=True)
+        if moneyflow_df.empty:
+            continue
+        moneyflow_df.to_parquet(code_dir / "moneyflow.parquet", index=False)
+        written_codes.append(code)
+    return written_codes
+
+
+
+def _build_breakpoints_from_st_snapshots(st_dir: Path, processed_dir: Path) -> None:
+    if not st_dir.exists():
+        return
+    prev_state: dict[str, int] = {}
+    break_dates_by_code: dict[str, list[str]] = defaultdict(list)
+    for path in sorted(st_dir.glob("*.parquet")):
+        trade_date = path.stem[:8]
+        if len(trade_date) != 8 or not trade_date.isdigit():
+            continue
+        df = pd.read_parquet(path)
+        if "ts_code" not in df.columns:
+            continue
+        state_col = "is_st" if "is_st" in df.columns else None
+        if state_col is None and "name" in df.columns:
+            names = df["name"].astype(str).str.strip().str.upper()
+            df = df.assign(is_st=(names.str.startswith("ST") | names.str.startswith("*ST")).astype(int))
+            state_col = "is_st"
+        if state_col is None:
+            continue
+        current_state = {
+            str(row["ts_code"]): int(row[state_col])
+            for _, row in df[["ts_code", state_col]].dropna(subset=["ts_code"]).iterrows()
+            if str(row["ts_code"])
+        }
+        for code, state in current_state.items():
+            if code in prev_state and prev_state[code] != state:
+                break_dates_by_code[code].append(pd.to_datetime(trade_date).strftime("%Y-%m-%d"))
+        prev_state = current_state
+
+    for code, break_dates in break_dates_by_code.items():
+        code_dir = processed_dir / code
+        if not code_dir.exists() or not (code_dir / "daily.parquet").exists():
+            continue
+        pd.DataFrame({"break_date": sorted(set(break_dates))}).to_parquet(code_dir / "breakpoints.parquet", index=False)
+
+
+
+def _build_processed_dataset_from_update_daily(data_dir: Path, processed_dir: Path) -> Path:
     raw_dir = data_dir / "raw"
     daily_dir = raw_dir / "daily"
     moneyflow_dir = raw_dir / "moneyflow"
     min5_dir = raw_dir / "5min"
+    st_dir = raw_dir / "st"
     if not daily_dir.exists() or not moneyflow_dir.exists() or not min5_dir.exists():
         raise FileNotFoundError(f"update-daily raw outputs are incomplete under {raw_dir}")
 
@@ -56,19 +198,41 @@ def _build_processed_dataset_from_update_daily(data_dir: Path, processed_dir: Pa
         shutil.rmtree(processed_dir)
     processed_dir.mkdir(parents=True, exist_ok=True)
 
-    with tempfile.TemporaryDirectory(prefix="trader_raw_flat_", dir=str(data_dir)) as tmp_dir:
-        flat_dir = Path(tmp_dir)
-        for path in sorted(daily_dir.glob("*.parquet")):
-            _symlink_or_copy(path, flat_dir / path.name)
-        for path in sorted(moneyflow_dir.glob("*.parquet")):
-            _symlink_or_copy(path, flat_dir / f"{path.stem}_mf.parquet")
-        for code_dir in sorted(min5_dir.iterdir()):
-            if not code_dir.is_dir():
-                continue
-            for path in sorted(code_dir.glob("*.csv")):
-                _symlink_or_copy(path, flat_dir / f"{code_dir.name}_{path.name}")
-        preprocess(flat_dir, processed_dir, max_workers=max(1, int(num_workers)))
+    payloads: dict[str, dict[str, list[pd.DataFrame]]] = defaultdict(lambda: {"daily": [], "5min": [], "moneyflow": []})
+    all_calendar_dates: set[pd.Timestamp] = set()
 
+    for path in sorted(daily_dir.glob("*.parquet")):
+        df = _canonicalize_update_daily_daily(_read_parquet_columns(path, _UPDATE_DAILY_DAILY_COLUMNS))
+        if df.empty:
+            continue
+        for code, sub in df.groupby("code", sort=False):
+            payloads[str(code)]["daily"].append(sub.reset_index(drop=True))
+        all_calendar_dates.update(pd.to_datetime(df["trade_date"], errors="coerce").dropna().tolist())
+
+    for path in sorted(moneyflow_dir.glob("*.parquet")):
+        df = _canonicalize_update_daily_moneyflow(_read_parquet_columns(path, _UPDATE_DAILY_MONEYFLOW_COLUMNS))
+        if df.empty:
+            continue
+        for code, sub in df.groupby("code", sort=False):
+            payloads[str(code)]["moneyflow"].append(sub.reset_index(drop=True))
+
+    for code_dir in sorted(min5_dir.iterdir()):
+        if not code_dir.is_dir():
+            continue
+        code_hint = code_dir.name
+        for path in sorted(code_dir.glob("*.csv")):
+            df = pd.read_csv(path, low_memory=False)
+            norm = _canonicalize_update_daily_5min(df, code_hint=code_hint)
+            if norm.empty:
+                continue
+            payloads[str(code_hint)]["5min"].append(norm.reset_index(drop=True))
+
+    written_codes = _write_processed_code_frames(processed_dir, payloads)
+    if all_calendar_dates:
+        pd.DataFrame({"trade_date": sorted(all_calendar_dates)}).to_parquet(processed_dir / "calendar.parquet", index=False)
+    _build_breakpoints_from_st_snapshots(st_dir, processed_dir)
+    if not written_codes:
+        raise ValueError("no usable processed code data was built from update-daily outputs")
     return processed_dir
 
 
@@ -127,7 +291,7 @@ def _run_trade(args: argparse.Namespace) -> None:
     feature_dir.mkdir(parents=True, exist_ok=True)
     score_dir.mkdir(parents=True, exist_ok=True)
 
-    _build_processed_dataset_from_update_daily(data_dir, processed_dir, max(1, int(args.num_workers)))
+    _build_processed_dataset_from_update_daily(data_dir, processed_dir)
     calendar_dates = read_calendar_dates(processed_dir)
     if len(calendar_dates) < 2:
         raise ValueError("trade requires at least 2 processed trading dates")
