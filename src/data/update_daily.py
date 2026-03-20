@@ -339,14 +339,13 @@ def _compute_code_open_windows(stock_basic: pd.DataFrame, target_dates: list[str
     windows: dict[str, tuple[str, str]] = {}
     if not target_dates or stock_basic.empty:
         return windows
-    anchor_date = target_dates[-1]
     all_codes = stock_basic["ts_code"].dropna().astype(str).tolist() if "ts_code" in stock_basic.columns else []
     for code in all_codes:
         open_dates = [d for d in target_dates if code not in suspend_map.get(d, set())]
         if not open_dates:
             continue
         tail = open_dates[-REAL_OPEN_LOOKBACK_DAYS:]
-        windows[code] = (tail[0], anchor_date)
+        windows[code] = (tail[0], tail[-1])
     return windows
 
 
