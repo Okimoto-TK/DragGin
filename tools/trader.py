@@ -32,6 +32,11 @@ from tools.build_backtest_batches import _build_feature_shard
 from tools.preprocess_data import _normalize_5min, _normalize_daily, _normalize_moneyflow
 
 
+def _vlog(verbose: bool, message: str) -> None:
+    if bool(verbose):
+        print(f"[trader] {message}")
+
+
 _UPDATE_DAILY_DAILY_COLUMNS = [
     "ts_code",
     "trade_date",
@@ -109,7 +114,7 @@ def _canonicalize_update_daily_5min(df: pd.DataFrame, code_hint: str) -> pd.Data
 
 
 
-def _write_processed_code_frames(processed_dir: Path, payloads: dict[str, dict[str, list[pd.DataFrame]]]) -> list[str]:
+def _write_processed_code_frames(processed_dir: Path, payloads: dict[str, dict[str, list[pd.DataFrame]]], verbose: bool) -> list[str]:
     written_codes: list[str] = []
     for code in sorted(payloads):
         code_dir = processed_dir / code
@@ -144,11 +149,12 @@ def _write_processed_code_frames(processed_dir: Path, payloads: dict[str, dict[s
             continue
         moneyflow_df.to_parquet(code_dir / "moneyflow.parquet", index=False)
         written_codes.append(code)
+        _vlog(verbose, f"wrote processed code data for {code}: daily={len(daily_df)} 5min={len(min5_df)} moneyflow={len(moneyflow_df)}")
     return written_codes
 
 
 
-def _build_breakpoints_from_st_snapshots(st_dir: Path, processed_dir: Path) -> None:
+def _build_breakpoints_from_st_snapshots(st_dir: Path, processed_dir: Path, verbose: bool) -> None:
     if not st_dir.exists():
         return
     prev_state: dict[str, int] = {}
@@ -182,15 +188,17 @@ def _build_breakpoints_from_st_snapshots(st_dir: Path, processed_dir: Path) -> N
         if not code_dir.exists() or not (code_dir / "daily.parquet").exists():
             continue
         pd.DataFrame({"break_date": sorted(set(break_dates))}).to_parquet(code_dir / "breakpoints.parquet", index=False)
+        _vlog(verbose, f"wrote breakpoints for {code}: {len(set(break_dates))} dates")
 
 
 
-def _build_processed_dataset_from_update_daily(data_dir: Path, processed_dir: Path) -> Path:
+def _build_processed_dataset_from_update_daily(data_dir: Path, processed_dir: Path, verbose: bool) -> Path:
     raw_dir = data_dir / "raw"
     daily_dir = raw_dir / "daily"
     moneyflow_dir = raw_dir / "moneyflow"
     min5_dir = raw_dir / "5min"
     st_dir = raw_dir / "st"
+    _vlog(verbose, f"building processed dataset from {raw_dir}")
     if not daily_dir.exists() or not moneyflow_dir.exists() or not min5_dir.exists():
         raise FileNotFoundError(f"update-daily raw outputs are incomplete under {raw_dir}")
 
@@ -227,10 +235,11 @@ def _build_processed_dataset_from_update_daily(data_dir: Path, processed_dir: Pa
                 continue
             payloads[str(code_hint)]["5min"].append(norm.reset_index(drop=True))
 
-    written_codes = _write_processed_code_frames(processed_dir, payloads)
+    written_codes = _write_processed_code_frames(processed_dir, payloads, verbose=verbose)
     if all_calendar_dates:
         pd.DataFrame({"trade_date": sorted(all_calendar_dates)}).to_parquet(processed_dir / "calendar.parquet", index=False)
-    _build_breakpoints_from_st_snapshots(st_dir, processed_dir)
+    _build_breakpoints_from_st_snapshots(st_dir, processed_dir, verbose=verbose)
+    _vlog(verbose, f"processed dataset ready: codes={len(written_codes)} calendar_dates={len(all_calendar_dates)}")
     if not written_codes:
         raise ValueError("no usable processed code data was built from update-daily outputs")
     return processed_dir
@@ -291,7 +300,7 @@ def _run_trade(args: argparse.Namespace) -> None:
     feature_dir.mkdir(parents=True, exist_ok=True)
     score_dir.mkdir(parents=True, exist_ok=True)
 
-    _build_processed_dataset_from_update_daily(data_dir, processed_dir)
+    _build_processed_dataset_from_update_daily(data_dir, processed_dir, verbose=bool(args.verbose))
     calendar_dates = read_calendar_dates(processed_dir)
     if len(calendar_dates) < 2:
         raise ValueError("trade requires at least 2 processed trading dates")
@@ -303,6 +312,7 @@ def _run_trade(args: argparse.Namespace) -> None:
         raise ValueError("no stock folders with required parquet files found after preprocessing")
 
     feature_jobs = [(str(processed_dir), code, [asof_date], str(feature_dir)) for code in codes]
+    _vlog(bool(args.verbose), f"building feature shards: codes={len(feature_jobs)} asof={asof_date}")
     if int(args.num_workers) <= 1:
         for job in feature_jobs:
             _build_feature_shard(*job)
@@ -313,6 +323,7 @@ def _run_trade(args: argparse.Namespace) -> None:
                 fut.result()
 
     feature_paths = sorted(feature_dir.glob("*.npz"))
+    _vlog(bool(args.verbose), f"feature shards ready: {len(feature_paths)}")
     infer_workers = max(1, int(args.infer_workers or args.num_workers))
     worker_args = dict(
         checkpoint=str(args.checkpoint),
@@ -325,6 +336,7 @@ def _run_trade(args: argparse.Namespace) -> None:
         infer_batch_size=max(1, int(args.infer_batch_size)),
         score_dir=str(score_dir),
     )
+    _vlog(bool(args.verbose), f"running CPU inference: shards={len(feature_paths)} workers={infer_workers}")
     if infer_workers <= 1:
         for shard_path in feature_paths:
             _infer_feature_shard_cpu_worker(str(shard_path), **worker_args)
@@ -335,6 +347,7 @@ def _run_trade(args: argparse.Namespace) -> None:
                 fut.result()
 
     score_df = merge_score_shards(score_dir)
+    _vlog(bool(args.verbose), f"score shards merged: rows={len(score_df)}")
     score_by_date = {asof_date: [(str(row["code"]), float(row["yhat"])) for _, row in score_df.iterrows() if pd.notna(row["yhat"])]}
 
     daily_cache = {code: load_daily_map(processed_dir, code) for code in codes}
@@ -343,8 +356,10 @@ def _run_trade(args: argparse.Namespace) -> None:
     else:
         latest_position_date, initial_cash, initial_positions = None, float(args.init), {}
 
+    _vlog(bool(args.verbose), "loading initial state")
     token = str(os.environ.get("TUSHARE_TOKEN", "")).strip()
     pro = ts.pro_api(token) if token else None
+    _vlog(bool(args.verbose), f"executing trade step: asof={asof_date} trade_date={trade_date} topk={int(args.topk)}")
     payloads = run_trade_simulation(
         data_dir=processed_dir,
         score_by_date=score_by_date,
