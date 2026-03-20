@@ -8,6 +8,7 @@ import sys
 from collections import defaultdict
 from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
+from typing import Any
 
 import pandas as pd
 import torch
@@ -53,12 +54,15 @@ _UPDATE_DAILY_DAILY_COLUMNS = [
 _UPDATE_DAILY_MONEYFLOW_COLUMNS = [
     "ts_code",
     "trade_date",
-    "buy_lg_vol",
-    "sell_lg_vol",
-    "buy_elg_vol",
-    "sell_elg_vol",
-    "net_mf_vol",
-    "net_mf_amount",
+    "buy_sm_vol", "buy_sm_amount",
+    "sell_sm_vol", "sell_sm_amount",
+    "buy_md_vol", "buy_md_amount",
+    "sell_md_vol", "sell_md_amount",
+    "buy_lg_vol", "buy_lg_amount",
+    "sell_lg_vol", "sell_lg_amount",
+    "buy_elg_vol", "buy_elg_amount",
+    "sell_elg_vol", "sell_elg_amount",
+    "net_mf_vol", "net_mf_amount",
 ]
 
 
@@ -72,46 +76,120 @@ def _read_parquet_columns(path: Path, columns: list[str]) -> pd.DataFrame:
 
 def _canonicalize_update_daily_daily(df: pd.DataFrame) -> pd.DataFrame:
     raw = df.copy()
+
     if "ts_code" in raw.columns and "code" not in raw.columns:
         raw = raw.rename(columns={"ts_code": "code"})
     if "vol" in raw.columns and "volume" not in raw.columns:
         raw = raw.rename(columns={"vol": "volume"})
-    return _normalize_daily(raw)
+
+    if "code" not in raw.columns:
+        raise ValueError("daily data missing required column: code/ts_code")
+    if "trade_date" not in raw.columns:
+        raise ValueError("daily data missing required column: trade_date")
+
+    raw["code"] = raw["code"].astype(str)
+    raw["trade_date"] = pd.to_datetime(
+        raw["trade_date"].astype(str),
+        format="%Y%m%d",
+        errors="coerce",
+    ).dt.strftime("%Y-%m-%d")
+
+    value_cols = ["open", "high", "low", "close", "volume", "adj_factor"]
+    missing = [c for c in value_cols if c not in raw.columns]
+    if missing:
+        raise ValueError(f"daily data missing required columns: {missing}")
+
+    out = raw[["code", "trade_date", "open", "high", "low", "close", "volume", "adj_factor"]].copy()
+
+    for col in value_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    out = out.sort_values(["code", "trade_date"]).reset_index(drop=True)
+    return _normalize_daily(out)
 
 
 
 def _canonicalize_update_daily_moneyflow(df: pd.DataFrame) -> pd.DataFrame:
     raw = df.copy()
-    if "ts_code" not in raw.columns and "code" in raw.columns:
-        raw = raw.rename(columns={"code": "ts_code"})
-    return _normalize_moneyflow(raw)
+    if "ts_code" in raw.columns and "code" not in raw.columns:
+        raw = raw.rename(columns={"ts_code": "code"})
+
+    if "code" not in raw.columns:
+        raise ValueError("moneyflow data missing required column: code/ts_code")
+    if "trade_date" not in raw.columns:
+        raise ValueError("moneyflow data missing required column: trade_date")
+
+    raw["code"] = raw["code"].astype(str)
+    raw["trade_date"] = pd.to_datetime(raw["trade_date"].astype(str), format="%Y%m%d", errors="coerce").dt.strftime("%Y-%m-%d")
+
+    value_cols = [
+        "buy_sm_vol", "buy_sm_amount",
+        "sell_sm_vol", "sell_sm_amount",
+        "buy_md_vol", "buy_md_amount",
+        "sell_md_vol", "sell_md_amount",
+        "buy_lg_vol", "buy_lg_amount",
+        "sell_lg_vol", "sell_lg_amount",
+        "buy_elg_vol", "buy_elg_amount",
+        "sell_elg_vol", "sell_elg_amount",
+        "net_mf_vol", "net_mf_amount",
+    ]
+
+    missing = [c for c in value_cols if c not in raw.columns]
+    if missing:
+        raise ValueError(f"moneyflow data missing required columns: {missing}")
+
+    out = raw[["code", "trade_date", *value_cols]].copy()
+
+    for col in value_cols:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+
+    out = out.sort_values(["code", "trade_date"]).reset_index(drop=True)
+    return _normalize_moneyflow(out)
 
 
 
 def _canonicalize_update_daily_5min(df: pd.DataFrame, code_hint: str) -> pd.DataFrame:
     raw = df.copy()
-    aliases = {
-        "ts_code": "code",
-        "symbol": "code",
-        "tm": "time",
-        "datetime": "trade_time",
-        "dt": "trade_time",
-        "o": "open",
-        "h": "high",
-        "l": "low",
-        "c": "close",
-        "v": "vol",
-    }
-    for src, dst in aliases.items():
-        if src in raw.columns and dst not in raw.columns:
-            raw = raw.rename(columns={src: dst})
+
+    if "ts_code" in raw.columns and "code" not in raw.columns:
+        raw = raw.rename(columns={"ts_code": "code"})
+    if "t" in raw.columns and "dt" not in raw.columns:
+        raw = raw.rename(columns={"t": "dt"})
+    if "o" in raw.columns and "open" not in raw.columns:
+        raw = raw.rename(columns={"o": "open"})
+    if "h" in raw.columns and "high" not in raw.columns:
+        raw = raw.rename(columns={"h": "high"})
+    if "l" in raw.columns and "low" not in raw.columns:
+        raw = raw.rename(columns={"l": "low"})
+    if "c" in raw.columns and "close" not in raw.columns:
+        raw = raw.rename(columns={"c": "close"})
+    if "v" in raw.columns and "volume" not in raw.columns:
+        raw = raw.rename(columns={"v": "volume"})
+
     if "code" not in raw.columns:
         raw["code"] = str(code_hint)
     else:
         raw["code"] = raw["code"].fillna(str(code_hint)).astype(str)
-        raw.loc[raw["code"].str.len() == 0, "code"] = str(code_hint)
-    return _normalize_5min(raw)
+        raw.loc[raw["code"].str.strip() == "", "code"] = str(code_hint)
 
+    raw["dt"] = pd.to_datetime(raw["dt"])
+    raw["trade_date"] = raw["dt"].dt.strftime("%Y-%m-%d")
+    raw["time"] = raw["dt"].dt.strftime("%H:%M")
+
+    out = raw[["code", "trade_date", "open", "high", "low", "close", "volume", "dt", "time"]].copy()
+
+    out["code"] = out["code"].astype(str)
+    out["trade_date"] = out["trade_date"].astype(str)
+    out["open"] = pd.to_numeric(out["open"], errors="coerce")
+    out["high"] = pd.to_numeric(out["high"], errors="coerce")
+    out["low"] = pd.to_numeric(out["low"], errors="coerce")
+    out["close"] = pd.to_numeric(out["close"], errors="coerce")
+    out["volume"] = pd.to_numeric(out["volume"], errors="coerce")
+    out["dt"] = pd.to_datetime(out["dt"])
+    out["time"] = out["time"].astype(str)
+
+    out = out.sort_values(["code", "dt"]).reset_index(drop=True)
+    return _normalize_5min(out)
 
 
 def _write_processed_code_frames(processed_dir: Path, payloads: dict[str, dict[str, list[pd.DataFrame]]], verbose: bool) -> list[str]:
@@ -181,7 +259,7 @@ def _build_breakpoints_from_st_snapshots(st_dir: Path, processed_dir: Path, verb
         for code, state in current_state.items():
             if code in prev_state and prev_state[code] != state:
                 break_dates_by_code[code].append(pd.to_datetime(trade_date).strftime("%Y-%m-%d"))
-        prev_state = current_state
+        prev_state.update(current_state)
 
     for code, break_dates in break_dates_by_code.items():
         code_dir = processed_dir / code
@@ -224,7 +302,10 @@ def _build_processed_dataset_from_update_daily(data_dir: Path, processed_dir: Pa
         for code, sub in df.groupby("code", sort=False):
             payloads[str(code)]["moneyflow"].append(sub.reset_index(drop=True))
 
+    count = 0
+    acount = len(sorted(min5_dir.iterdir()))
     for code_dir in sorted(min5_dir.iterdir()):
+        _vlog(verbose, f"{code_dir}: {count}/{acount}")
         if not code_dir.is_dir():
             continue
         code_hint = code_dir.name
@@ -246,7 +327,7 @@ def _build_processed_dataset_from_update_daily(data_dir: Path, processed_dir: Pa
 
 
 
-def _infer_feature_shard_cpu_worker(
+def _infer_feature_shard_worker(
     shard_path: str,
     checkpoint: str,
     hidden_dim: int,
@@ -257,8 +338,9 @@ def _infer_feature_shard_cpu_worker(
     enable_free_branch: bool,
     infer_batch_size: int,
     score_dir: str,
+    device_str: str,
 ) -> str:
-    device = torch.device("cpu")
+    device = torch.device(device_str)
     model = build_model(
         device=device,
         checkpoint=checkpoint,
@@ -269,7 +351,13 @@ def _infer_feature_shard_cpu_worker(
         enable_dynamic_threshold=enable_dynamic_threshold,
         enable_free_branch=enable_free_branch,
     )
-    df = infer_from_feature_shard(model, device, Path(shard_path), max(1, int(infer_batch_size)))
+    model.eval()
+    df = infer_from_feature_shard(
+        model,
+        device,
+        Path(shard_path),
+        max(1, int(infer_batch_size)),
+    )
     out_path = Path(score_dir) / f"{Path(shard_path).stem}.parquet"
     df.to_parquet(out_path, index=False)
     return str(out_path)
@@ -277,19 +365,24 @@ def _infer_feature_shard_cpu_worker(
 
 
 def _run_trade(args: argparse.Namespace) -> None:
+    device_str = str(args.device).strip()
+    if device_str.startswith("cuda") and not torch.cuda.is_available():
+        raise RuntimeError(f"CUDA requested but not available: {device_str}")
     data_dir = Path(args.data_dir)
     position_dir = Path(args.position_dir)
     position_dir.mkdir(parents=True, exist_ok=True)
 
-    update_meta = update_daily_market_data(
-        DailyUpdateConfig(
-            data_dir=data_dir,
-            lookback_trading_days=max(2, int(args.lookback_trading_days)),
-            request_sleep_seconds=max(0.0, float(args.sleep)),
-            refresh_latest=not bool(args.no_refresh_latest),
-            verbose=bool(args.verbose),
+    update_meta: dict[str, Any] | None = None
+    if not args.no_update:
+        update_meta = update_daily_market_data(
+            DailyUpdateConfig(
+                data_dir=data_dir,
+                lookback_trading_days=max(2, int(args.lookback_trading_days)),
+                request_sleep_seconds=max(0.0, float(args.sleep)),
+                refresh_latest=not bool(args.no_refresh_latest),
+                verbose=bool(args.verbose),
+            )
         )
-    )
 
     work_dir = data_dir / "trade_workspace"
     feature_dir = work_dir / "feature_shards"
@@ -306,7 +399,7 @@ def _run_trade(args: argparse.Namespace) -> None:
         raise ValueError("trade requires at least 2 processed trading dates")
     asof_date = calendar_dates[-2]
     trade_date = calendar_dates[-1]
-
+    print(asof_date, trade_date)
     codes = resolve_codes(processed_dir)
     if not codes:
         raise ValueError("no stock folders with required parquet files found after preprocessing")
@@ -339,10 +432,10 @@ def _run_trade(args: argparse.Namespace) -> None:
     _vlog(bool(args.verbose), f"running CPU inference: shards={len(feature_paths)} workers={infer_workers}")
     if infer_workers <= 1:
         for shard_path in feature_paths:
-            _infer_feature_shard_cpu_worker(str(shard_path), **worker_args)
+            _infer_feature_shard_worker(str(shard_path), **worker_args, device_str=device_str)
     else:
         with ProcessPoolExecutor(max_workers=infer_workers) as ex:
-            futures = [ex.submit(_infer_feature_shard_cpu_worker, str(shard_path), **worker_args) for shard_path in feature_paths]
+            futures = [ex.submit(_infer_feature_shard_worker, str(shard_path), **worker_args) for shard_path in feature_paths]
             for fut in as_completed(futures):
                 fut.result()
 
@@ -393,7 +486,7 @@ def main() -> None:
 
     update_daily = subparsers.add_parser("update-daily", help="Update raw daily market data cache under ./data")
     update_daily.add_argument("--data-dir", default="data")
-    update_daily.add_argument("--lookback-trading-days", type=int, default=120)
+    update_daily.add_argument("--lookback-trading-days", type=int, default=150)
     update_daily.add_argument("--sleep", type=float, default=0.0)
     update_daily.add_argument("--verbose", action="store_true")
     update_daily.add_argument("--no-refresh-latest", action="store_true")
@@ -402,22 +495,24 @@ def main() -> None:
     trade.add_argument("--data-dir", default="data")
     trade.add_argument("--position-dir", default="data/position")
     trade.add_argument("--checkpoint", required=True)
-    trade.add_argument("--topk", type=int, default=20)
-    trade.add_argument("--buy-gate", type=float, default=1.0)
-    trade.add_argument("--sell-gate", type=float, default=0.5)
-    trade.add_argument("--lookback-trading-days", type=int, default=120)
+    trade.add_argument("--topk", type=int, default=7)
+    trade.add_argument("--buy-gate", type=float, default=0.75)
+    trade.add_argument("--sell-gate", type=float, default=0.7)
+    trade.add_argument("--lookback-trading-days", type=int, default=150)
     trade.add_argument("--sleep", type=float, default=0.0)
     trade.add_argument("--verbose", action="store_true")
     trade.add_argument("--no-refresh-latest", action="store_true")
-    trade.add_argument("--hidden-dim", type=int, default=320)
+    trade.add_argument("--no-update", action="store_true")
+    trade.add_argument("--hidden-dim", type=int, default=256)
     trade.add_argument("--num-heads", type=int, default=8)
     trade.add_argument("--dropout", type=float, default=0.1)
     trade.add_argument("--use-seq-context", action=argparse.BooleanOptionalAction, default=True)
     trade.add_argument("--enable-dynamic-threshold", action=argparse.BooleanOptionalAction, default=True)
     trade.add_argument("--enable-free-branch", action=argparse.BooleanOptionalAction, default=True)
-    trade.add_argument("--infer-batch-size", type=int, default=512)
-    trade.add_argument("--num-workers", type=int, default=1)
-    trade.add_argument("--infer-workers", type=int, default=0)
+    trade.add_argument("--device", default="cuda", help="inference device, e.g. cuda, cuda:0, cpu")
+    trade.add_argument("--infer-batch-size", type=int, default=8192)
+    trade.add_argument("--num-workers", type=int, default=8)
+    trade.add_argument("--infer-workers", type=int, default=1)
     trade.add_argument("--init", type=float, default=None, help="initial cash; when set, ignore latest position record")
 
     args = parser.parse_args()

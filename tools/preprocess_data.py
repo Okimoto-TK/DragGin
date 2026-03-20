@@ -165,8 +165,6 @@ def _normalize_daily(df: pd.DataFrame) -> pd.DataFrame:
         spread = pd.to_numeric(df["high"], errors="coerce") - pd.to_numeric(df["low"], errors="coerce")
         volume = spread.abs().fillna(0.0) + 1.0
 
-    amount = pd.to_numeric(df["amount"], errors="coerce") if "amount" in df.columns else pd.Series(pd.NA, index=df.index)
-
     out = pd.DataFrame(
         {
             "code": df[code_col],
@@ -176,7 +174,6 @@ def _normalize_daily(df: pd.DataFrame) -> pd.DataFrame:
             "low": df["low"],
             "close": df["close"],
             "volume": volume,
-            "amount": amount,
             "adj_factor": df["adj_factor"],
         }
     )

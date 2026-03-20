@@ -117,12 +117,21 @@ def load_st_flags(st_dir: Path | None) -> dict[str, set[str]]:
         date_token = stem[:8]
         if len(date_token) != 8 or not date_token.isdigit():
             continue
+
         df = pd.read_parquet(path)
         code_col = "ts_code" if "ts_code" in df.columns else ("code" if "code" in df.columns else None)
         if code_col is None:
             raise ValueError(f"missing ts_code/code column in {path}")
+
+        if "is_st" in df.columns:
+            df = df[df["is_st"].fillna(0).astype(int) == 1].copy()
+        elif "name" in df.columns:
+            names = df["name"].astype(str).str.strip().str.upper()
+            df = df[names.str.startswith("ST") | names.str.startswith("*ST")].copy()
+
         codes = {str(x) for x in df[code_col].dropna().astype(str).tolist() if str(x)}
         out[date_token] = codes
+
     return out
 
 
