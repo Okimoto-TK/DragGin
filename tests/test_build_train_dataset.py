@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from src.feat.build_multiscale_tensor import DPResult
+from src.feat.build_multiscale_tensor import C, DPResult
 from src.feat.build_training_dataset import build_train_dataset, build_train_dataset_shards, resolve_asof_dates, resolve_codes
 from src.feat.labels_risk_adj import LabelBundle
 
@@ -13,9 +13,9 @@ def _dp(dp_ok: bool) -> DPResult:
         asof_date="2024-01-02",
         dp_ok=dp_ok,
         reason="",
-        X_micro=np.ones((48, 6), dtype=np.float32),
-        X_mezzo=np.ones((40, 6), dtype=np.float32),
-        X_macro=np.ones((30, 6), dtype=np.float32),
+        X_micro=np.ones((48, C), dtype=np.float32),
+        X_mezzo=np.ones((40, C), dtype=np.float32),
+        X_macro=np.ones((30, C), dtype=np.float32),
         mask_micro=np.ones((48,), dtype=np.uint8),
         mask_mezzo=np.ones((40,), dtype=np.uint8),
         mask_macro=np.ones((30,), dtype=np.uint8),

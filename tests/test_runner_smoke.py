@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import torch
 
+from src.feat.build_multiscale_tensor import C
 from src.infer.runner import build_model
 from src.model.head import masked_huber_loss
 from src.train.runner import (
@@ -60,9 +61,9 @@ def _write_shard(path: Path, n: int = 3, all_loss_mask_false: bool = False) -> s
     shard = {
         "codes": np.array([f"C{i:03d}" for i in range(n)], dtype=object),
         "asof_dates": np.array([(base + np.timedelta64(i, "D")).astype(str) for i in range(n)], dtype=object),
-        "X_micro": rng.normal(size=(n, 48, 6)).astype(np.float32),
-        "X_mezzo": rng.normal(size=(n, 40, 6)).astype(np.float32),
-        "X_macro": rng.normal(size=(n, 30, 6)).astype(np.float32),
+        "X_micro": rng.normal(size=(n, 48, C)).astype(np.float32),
+        "X_mezzo": rng.normal(size=(n, 40, C)).astype(np.float32),
+        "X_macro": rng.normal(size=(n, 30, C)).astype(np.float32),
         "mask_micro": np.ones((n, 48), dtype=bool),
         "mask_mezzo": np.ones((n, 40), dtype=bool),
         "mask_macro": np.ones((n, 30), dtype=bool),
@@ -81,9 +82,9 @@ def _write_shard(path: Path, n: int = 3, all_loss_mask_false: bool = False) -> s
 
 def _synthetic_batch(batch_size: int = 2) -> dict:
     return {
-        "x_micro": torch.randn(batch_size, 48, 6),
-        "x_mezzo": torch.randn(batch_size, 40, 6),
-        "x_macro": torch.randn(batch_size, 30, 6),
+        "x_micro": torch.randn(batch_size, 48, C),
+        "x_mezzo": torch.randn(batch_size, 40, C),
+        "x_macro": torch.randn(batch_size, 30, C),
         "mask_micro": torch.ones(batch_size, 48, dtype=torch.bool),
         "mask_mezzo": torch.ones(batch_size, 40, dtype=torch.bool),
         "mask_macro": torch.ones(batch_size, 30, dtype=torch.bool),
@@ -101,16 +102,16 @@ def test_dataset_and_collate_shapes(tmp_path: Path) -> None:
     ds = NpyShardDataset([shard_path], y_key="y")
 
     sample = ds[0]
-    assert sample["x_micro"].shape == (48, 6)
-    assert sample["x_mezzo"].shape == (40, 6)
-    assert sample["x_macro"].shape == (30, 6)
+    assert sample["x_micro"].shape == (48, C)
+    assert sample["x_mezzo"].shape == (40, C)
+    assert sample["x_macro"].shape == (30, C)
     assert sample["mask_micro"].shape == (48,)
     assert sample["loss_mask"].dtype == torch.bool
 
     batch = collate_batch([ds[0], ds[1]])
-    assert batch["x_micro"].shape == (2, 48, 6)
-    assert batch["x_mezzo"].shape == (2, 40, 6)
-    assert batch["x_macro"].shape == (2, 30, 6)
+    assert batch["x_micro"].shape == (2, 48, C)
+    assert batch["x_mezzo"].shape == (2, 40, C)
+    assert batch["x_macro"].shape == (2, 30, C)
     assert batch["flow_x"].shape == (2, 30, 4)
     assert batch["flow_mask"].shape == (2, 30)
     assert batch["y"].shape == (2,)
@@ -546,9 +547,9 @@ def test_shard_batch_iterator_batch_shapes(tmp_path: Path) -> None:
     iterator = ShardBatchIterator([shard_path], batch_size=2, y_key="y", shuffle=False, buffer=False)
     first_batch = next(iter(iterator))
 
-    assert first_batch["x_micro"].shape == (2, 48, 6)
-    assert first_batch["x_mezzo"].shape == (2, 40, 6)
-    assert first_batch["x_macro"].shape == (2, 30, 6)
+    assert first_batch["x_micro"].shape == (2, 48, C)
+    assert first_batch["x_mezzo"].shape == (2, 40, C)
+    assert first_batch["x_macro"].shape == (2, 30, C)
     assert first_batch["mask_micro"].shape == (2, 48)
     assert first_batch["mask_mezzo"].shape == (2, 40)
     assert first_batch["mask_macro"].shape == (2, 30)
@@ -570,9 +571,9 @@ def test_shard_batch_iterator_multiprocess_shapes(tmp_path: Path) -> None:
         num_workers=2,
     )
     first_batch = next(iter(iterator))
-    assert first_batch["x_micro"].shape == (2, 48, 6)
-    assert first_batch["x_mezzo"].shape == (2, 40, 6)
-    assert first_batch["x_macro"].shape == (2, 30, 6)
+    assert first_batch["x_micro"].shape == (2, 48, C)
+    assert first_batch["x_mezzo"].shape == (2, 40, C)
+    assert first_batch["x_macro"].shape == (2, 30, C)
 
 
 
@@ -588,9 +589,9 @@ def test_shard_batch_iterator_multiprocess_buffer_shapes(tmp_path: Path) -> None
         num_workers=2,
     )
     first_batch = next(iter(iterator))
-    assert first_batch["x_micro"].shape == (2, 48, 6)
-    assert first_batch["x_mezzo"].shape == (2, 40, 6)
-    assert first_batch["x_macro"].shape == (2, 30, 6)
+    assert first_batch["x_micro"].shape == (2, 48, C)
+    assert first_batch["x_mezzo"].shape == (2, 40, C)
+    assert first_batch["x_macro"].shape == (2, 30, C)
 
 
 

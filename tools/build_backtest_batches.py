@@ -16,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
 
+from src.feat.build_multiscale_tensor import C
 from src.feat.build_multiscale_tensor import build_multiscale_tensors
 from src.infer import build_model, infer_from_feature_shard, merge_score_shards
 
@@ -177,9 +178,9 @@ def _build_feature_shard(data_dir: str, code: str, asof_dates: list[str], out_di
     payload = {
         "code": code,
         "asof_dates": np.asarray(asof_dates, dtype=object),
-        "x_micro": np.zeros((n, 48, 6), dtype=np.float32),
-        "x_mezzo": np.zeros((n, 40, 6), dtype=np.float32),
-        "x_macro": np.zeros((n, 30, 6), dtype=np.float32),
+        "x_micro": np.zeros((n, 48, C), dtype=np.float32),
+        "x_mezzo": np.zeros((n, 40, C), dtype=np.float32),
+        "x_macro": np.zeros((n, 30, C), dtype=np.float32),
         "mask_micro": np.zeros((n, 48), dtype=np.uint8),
         "mask_mezzo": np.zeros((n, 40), dtype=np.uint8),
         "mask_macro": np.zeros((n, 30), dtype=np.uint8),

@@ -20,6 +20,7 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau
 from torch.utils.data import Dataset
 from torch.utils.tensorboard import SummaryWriter
 
+from src.feat.build_multiscale_tensor import C
 from src.model.flow import FlowLegendreProjectionEncoder
 from src.model.fusion import MultiScaleFusion
 from src.model.head import RegressionHead, masked_huber_loss
@@ -428,7 +429,7 @@ def _batch_from_shard_chunks(chunks: list[tuple[dict[str, Any], np.ndarray]], y_
 class MultiScaleRegressor(nn.Module):
     def __init__(
         self,
-        in_dim: int = 6,
+        in_dim: int = C,
         hidden_dim: int = 64,
         num_heads: int = 4,
         dropout: float = 0.0,
@@ -536,7 +537,7 @@ class TrainConfig:
     gate_warmup_steps: int = 500
     flow_gate_force_zero_all_steps: bool = False
     y_key: str = "y"
-    in_dim: int = 6
+    in_dim: int = C
     enable_dynamic_threshold: bool = True
     enable_free_branch: bool = True
     init_lambda_micro: float = 1.5
