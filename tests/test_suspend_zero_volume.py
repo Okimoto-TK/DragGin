@@ -6,6 +6,15 @@ from src.feat.build_multiscale_tensor import build_multiscale_tensors
 from src.feat.labels_risk_adj import build_label_for_sample
 
 
+def _limit_df(calendar: list[str]) -> pd.DataFrame:
+    return pd.DataFrame({
+        "trade_date": calendar,
+        "up_limit": [110.0] * len(calendar),
+        "down_limit": [90.0] * len(calendar),
+        "limit_pct": [0.1] * len(calendar),
+    })
+
+
 def _write_base_data(root: Path, code: str, days: int, zero_vol_date: str) -> str:
     start = pd.Timestamp("2024-01-01")
     dates = [start + pd.Timedelta(days=i) for i in range(days)]
@@ -77,6 +86,7 @@ def test_label_ignores_zero_volume_daily_in_trading_calendar() -> None:
     )
 
     asof = calendar[320]
-    res = build_label_for_sample("AAA", asof, calendar, lambda _: df)
+    limit_df = _limit_df(calendar)
+    res = build_label_for_sample("AAA", asof, calendar, lambda _: df, limit_loader=lambda _: limit_df)
 
     assert res.label_ok, res.fail_reason

@@ -37,6 +37,9 @@ def _lb(label_ok: bool, loss_mask: bool) -> LabelBundle:
         exit_close=None,
         vol30=None,
         ret_log=None,
+        limit_pct=0.1,
+        confidence_weight=np.float32(0.8),
+        sample_weight=np.float32(0.9),
         fail_reason=None,
     )
 

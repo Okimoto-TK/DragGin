@@ -7,13 +7,14 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.feat.build_multiscale_tensor import build_calendar_from_daily_filenames, load_daily_data
+from src.feat.build_multiscale_tensor import build_calendar_from_daily_filenames, load_daily_data, load_limit_data
 
 EPS = 1e-6
 ZSCORE_EPS = 1e-8
 VOL_WINDOW = 30
 LABEL_Z_WINDOW = 252
 TANH_K = 5.0
+LIMIT_Y_K = 2.5
 
 
 @dataclass
@@ -31,6 +32,9 @@ class LabelBundle:
     exit_close: float | None
     vol30: float | None
     ret_log: float | None
+    limit_pct: float | None
+    confidence_weight: np.float32
+    sample_weight: np.float32
     fail_reason: str | None
 
 
@@ -44,12 +48,12 @@ class _LabelContext:
     valid_raw_values: tuple[float, ...]
     raw_details_by_index: dict[int, dict]
     raw_fail_by_index: dict[int, str]
-    z_mu_by_valid_pos: tuple[float, ...]
-    z_sd_by_valid_pos: tuple[float, ...]
     asof_to_trading_idx: dict[date, int]
     raw_idx_to_valid_pos: dict[int, int]
     label_ok_by_idx: tuple[bool, ...]
     label_value_by_idx: tuple[float, ...]
+    confidence_weight_by_idx: tuple[float, ...]
+    sample_weight_by_idx: tuple[float, ...]
 
 
 def compute_daily_log_returns(df_daily_sorted: pd.DataFrame) -> pd.Series:
@@ -76,6 +80,9 @@ def _fail(code: str, asof_date: str, dp_ok: bool, reason: str) -> LabelBundle:
         exit_close=None,
         vol30=None,
         ret_log=None,
+        limit_pct=None,
+        confidence_weight=np.float32(0.0),
+        sample_weight=np.float32(0.0),
         fail_reason=reason,
     )
 
@@ -85,7 +92,7 @@ def _compute_raw_label_for_idx(
     calendar_dates: list,
     by_date: pd.DataFrame,
     adj_open_np: np.ndarray,
-    adj_close_np: np.ndarray,
+    limit_pct_np: np.ndarray,
     daily_log_ret: np.ndarray,
     vol30_by_idx: np.ndarray,
     date_to_pos: dict,
@@ -116,37 +123,46 @@ def _compute_raw_label_for_idx(
 
     exit_pos = date_to_pos.get(exit_d)
     if exit_pos is None:
-        return False, None, {}, f"missing exit close on {exit_d.isoformat()}"
-    exit_close = float(adj_close_np[exit_pos])
-    if not np.isfinite(exit_close) or exit_close <= 0:
-        return False, None, {}, f"invalid exit close on {exit_d.isoformat()}"
+        return False, None, {}, f"missing exit open on {exit_d.isoformat()}"
+    exit_open = float(adj_open_np[exit_pos])
+    if not np.isfinite(exit_open) or exit_open <= 0:
+        return False, None, {}, f"invalid exit open on {exit_d.isoformat()}"
 
     _ = daily_log_ret  # precomputed in context for consistency and future reuse
     vol30 = float(vol30_by_idx[idx])
     if not np.isfinite(vol30) or vol30 <= 0:
         return False, None, {}, "vol30 unavailable/invalid"
 
-    ret_log = float(np.log(exit_close / entry_open))
-    y_raw = float(ret_log / (vol30 + EPS))
+    limit_pct = float(limit_pct_np[idx])
+    if not np.isfinite(limit_pct) or limit_pct <= 0:
+        return False, None, {}, f"missing/invalid limit_pct on {asof_d.isoformat()}"
+
+    future_ret_3 = float(exit_open / entry_open - 1.0)
+    y_raw = float(future_ret_3 / (limit_pct * 3.0 + EPS))
+    confidence_weight = float(np.tanh(max(abs(y_raw), 0.0)))
+    sample_weight = float(0.5 + 0.5 * confidence_weight)
     details = {
         "entry_date": entry_d.isoformat(),
         "exit_date": exit_d.isoformat(),
         "entry_open": entry_open,
-        "exit_close": exit_close,
+        "exit_close": exit_open,
         "vol30": vol30,
-        "ret_log": ret_log,
+        "ret_log": future_ret_3,
+        "limit_pct": limit_pct,
+        "confidence_weight": confidence_weight,
+        "sample_weight": sample_weight,
     }
     return True, y_raw, details, None
 
 
-def _precompute_label_arrays(calendar_dates: list, by_date: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
+def _precompute_label_arrays(calendar_dates: list, by_date: pd.DataFrame, limit_by_date: pd.DataFrame) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, dict]:
     n = len(calendar_dates)
     adj_open_np = np.full((n,), np.nan, dtype=np.float64)
-    adj_close_np = np.full((n,), np.nan, dtype=np.float64)
+    limit_pct_np = np.full((n,), np.nan, dtype=np.float64)
     date_to_pos = {d: i for i, d in enumerate(calendar_dates)}
 
     if "adj_factor" not in by_date.columns:
-        return adj_open_np, adj_close_np, np.full((n,), np.nan, dtype=np.float64), np.full((n,), np.nan, dtype=np.float64), date_to_pos
+        return adj_open_np, limit_pct_np, np.full((n,), np.nan, dtype=np.float64), np.full((n,), np.nan, dtype=np.float64), np.full((n,), np.nan, dtype=np.float64), date_to_pos
 
     for i, d in enumerate(calendar_dates):
         if d not in by_date.index:
@@ -159,7 +175,17 @@ def _precompute_label_arrays(calendar_dates: list, by_date: pd.DataFrame) -> tup
         close_v = float(row["close"])
         if np.isfinite(open_v) and open_v > 0:
             adj_open_np[i] = open_v * adj_factor
-        if np.isfinite(close_v) and close_v > 0:
+        if d in limit_by_date.index:
+            limit_pct_np[i] = float(limit_by_date.loc[d, "limit_pct"])
+
+    adj_close_np = np.full((n,), np.nan, dtype=np.float64)
+    for i, d in enumerate(calendar_dates):
+        if d not in by_date.index:
+            continue
+        row = by_date.loc[d]
+        adj_factor = float(row["adj_factor"])
+        close_v = float(row["close"])
+        if np.isfinite(adj_factor) and adj_factor > 0 and np.isfinite(close_v) and close_v > 0:
             adj_close_np[i] = close_v * adj_factor
 
     daily_log_ret = np.full((n,), np.nan, dtype=np.float64)
@@ -170,7 +196,7 @@ def _precompute_label_arrays(calendar_dates: list, by_date: pd.DataFrame) -> tup
         daily_log_ret[1:] = np.where(valid, np.log(curr / prev), np.nan)
     vol30_by_idx = rolling_std_last_n(pd.Series(daily_log_ret), n=VOL_WINDOW).to_numpy(dtype=np.float64)
 
-    return adj_open_np, adj_close_np, daily_log_ret, vol30_by_idx, date_to_pos
+    return adj_open_np, limit_pct_np, adj_close_np, daily_log_ret, vol30_by_idx, date_to_pos
 
 
 
@@ -207,6 +233,11 @@ def _daily_data_cached(data_dir: str, code: str) -> pd.DataFrame:
 
 
 @lru_cache(maxsize=512)
+def _limit_data_cached(data_dir: str, code: str) -> pd.DataFrame:
+    return load_limit_data(data_dir, code)
+
+
+@lru_cache(maxsize=512)
 def _breakpoints_cached(data_dir: str, code: str) -> frozenset:
     return frozenset(_load_breakpoints(data_dir, code))
 
@@ -216,6 +247,12 @@ def _build_label_context(data_dir: str, code: str) -> _LabelContext | None:
     calendar_dates = _calendar_dates_cached(data_dir)
     daily = _daily_data_cached(data_dir, code)
     if daily.empty:
+        return None
+    try:
+        limit_df = _limit_data_cached(data_dir, code)
+    except Exception:
+        return None
+    if limit_df.empty:
         return None
 
     daily = daily.copy()
@@ -227,9 +264,13 @@ def _build_label_context(data_dir: str, code: str) -> _LabelContext | None:
         daily = daily[(daily["volume"] > 0) & np.isfinite(daily["volume"])]
     daily = daily.drop_duplicates(subset=["trade_date"], keep="last").sort_values("trade_date")
     by_date = daily.set_index("trade_date")
+    limit_df = limit_df.copy()
+    limit_df["trade_date"] = pd.to_datetime(limit_df["trade_date"]).dt.date
+    limit_df = limit_df.drop_duplicates(subset=["trade_date"], keep="last").sort_values("trade_date")
+    limit_by_date = limit_df.set_index("trade_date")
 
     trading_calendar_dates = tuple(d for d in calendar_dates if d not in suspended_dates)
-    adj_open_np, adj_close_np, daily_log_ret, vol30_by_idx, date_to_pos = _precompute_label_arrays(list(trading_calendar_dates), by_date)
+    adj_open_np, limit_pct_np, _adj_close_np, daily_log_ret, vol30_by_idx, date_to_pos = _precompute_label_arrays(list(trading_calendar_dates), by_date, limit_by_date)
 
     valid_raw_indices: list[int] = []
     valid_raw_values: list[float] = []
@@ -241,7 +282,7 @@ def _build_label_context(data_dir: str, code: str) -> _LabelContext | None:
             trading_calendar_dates,
             by_date,
             adj_open_np,
-            adj_close_np,
+            limit_pct_np,
             daily_log_ret,
             vol30_by_idx,
             date_to_pos,
@@ -253,44 +294,25 @@ def _build_label_context(data_dir: str, code: str) -> _LabelContext | None:
         else:
             raw_fail_by_index[idx] = fail_reason or "raw label build failed"
 
-    valid_raw_values_np = np.asarray(valid_raw_values, dtype=np.float64)
-    if len(valid_raw_values_np) > 0:
-        csum = np.concatenate(([0.0], np.cumsum(valid_raw_values_np)))
-        csum2 = np.concatenate(([0.0], np.cumsum(valid_raw_values_np * valid_raw_values_np)))
-        mu = np.full((len(valid_raw_values_np),), np.nan, dtype=np.float64)
-        sd = np.full((len(valid_raw_values_np),), np.nan, dtype=np.float64)
-        if len(valid_raw_values_np) > LABEL_Z_WINDOW:
-            ends = np.arange(LABEL_Z_WINDOW, len(valid_raw_values_np), dtype=np.int64)
-            sums = csum[ends] - csum[ends - LABEL_Z_WINDOW]
-            sums2 = csum2[ends] - csum2[ends - LABEL_Z_WINDOW]
-            m = sums / LABEL_Z_WINDOW
-            var = np.maximum(sums2 / LABEL_Z_WINDOW - m * m, 0.0)
-            mu[ends] = m
-            sd[ends] = np.sqrt(var)
-    else:
-        mu = np.asarray([], dtype=np.float64)
-        sd = np.asarray([], dtype=np.float64)
-
     asof_to_trading_idx = {d: i for i, d in enumerate(trading_calendar_dates)}
     raw_idx_to_valid_pos = {idx: pos for pos, idx in enumerate(valid_raw_indices)}
     label_ok_by_idx = np.zeros((len(trading_calendar_dates),), dtype=np.bool_)
     label_value_by_idx = np.zeros((len(trading_calendar_dates),), dtype=np.float32)
+    confidence_weight_by_idx = np.zeros((len(trading_calendar_dates),), dtype=np.float32)
+    sample_weight_by_idx = np.zeros((len(trading_calendar_dates),), dtype=np.float32)
     for pos, idx in enumerate(valid_raw_indices):
         if pos < LABEL_Z_WINDOW:
             continue
         if idx not in raw_details_by_index:
             continue
-        mu_pos = float(mu[pos])
-        sd_pos = float(sd[pos])
-        if (not np.isfinite(mu_pos)) or (not np.isfinite(sd_pos)) or sd_pos <= 0:
-            continue
         y_raw_pos = float(valid_raw_values[pos])
-        y_z_pos = (y_raw_pos - mu_pos) / max(sd_pos, ZSCORE_EPS)
-        y_z_pos = float(TANH_K * np.tanh(y_z_pos / TANH_K))
+        y_z_pos = float(np.tanh(LIMIT_Y_K * y_raw_pos))
         if not np.isfinite(y_z_pos):
             continue
         label_ok_by_idx[idx] = True
         label_value_by_idx[idx] = np.float32(y_z_pos)
+        confidence_weight_by_idx[idx] = np.float32(raw_details_by_index[idx]["confidence_weight"])
+        sample_weight_by_idx[idx] = np.float32(raw_details_by_index[idx]["sample_weight"])
 
     return _LabelContext(
         calendar_dates=calendar_dates,
@@ -301,12 +323,12 @@ def _build_label_context(data_dir: str, code: str) -> _LabelContext | None:
         valid_raw_values=tuple(valid_raw_values),
         raw_details_by_index=raw_details_by_index,
         raw_fail_by_index=raw_fail_by_index,
-        z_mu_by_valid_pos=tuple(mu.tolist()),
-        z_sd_by_valid_pos=tuple(sd.tolist()),
         asof_to_trading_idx=asof_to_trading_idx,
         raw_idx_to_valid_pos=raw_idx_to_valid_pos,
         label_ok_by_idx=tuple(bool(x) for x in label_ok_by_idx.tolist()),
         label_value_by_idx=tuple(float(x) for x in label_value_by_idx.tolist()),
+        confidence_weight_by_idx=tuple(float(x) for x in confidence_weight_by_idx.tolist()),
+        sample_weight_by_idx=tuple(float(x) for x in sample_weight_by_idx.tolist()),
     )
 
 def build_label_for_sample(
@@ -314,6 +336,7 @@ def build_label_for_sample(
     asof_date: str,
     calendar: list[str],
     daily_loader,
+    limit_loader=None,
     dp_ok: bool = True,
     breakpoints: set | None = None,
 ) -> LabelBundle:
@@ -326,6 +349,11 @@ def build_label_for_sample(
     daily = daily_loader(code)
     if daily.empty:
         return _fail(code, asof_date, dp_ok, "daily data unavailable")
+    if limit_loader is None:
+        return _fail(code, asof_date, dp_ok, "limit data unavailable")
+    limit_df = limit_loader(code)
+    if limit_df.empty:
+        return _fail(code, asof_date, dp_ok, "limit data unavailable")
 
     daily = daily.copy()
     daily["trade_date"] = pd.to_datetime(daily["trade_date"]).dt.date
@@ -336,9 +364,15 @@ def build_label_for_sample(
         daily = daily[(daily["volume"] > 0) & np.isfinite(daily["volume"])]
     daily = daily.drop_duplicates(subset=["trade_date"], keep="last").sort_values("trade_date")
     by_date = daily.set_index("trade_date")
+    limit_df = limit_df.copy()
+    limit_df["trade_date"] = pd.to_datetime(limit_df["trade_date"]).dt.date
+    for col in ["up_limit", "down_limit", "limit_pct"]:
+        limit_df[col] = pd.to_numeric(limit_df[col], errors="coerce")
+    limit_df = limit_df.drop_duplicates(subset=["trade_date"], keep="last").sort_values("trade_date")
+    limit_by_date = limit_df.set_index("trade_date")
 
     trading_calendar_dates = [d for d in calendar_dates if d not in suspended_dates]
-    adj_open_np, adj_close_np, daily_log_ret, vol30_by_idx, date_to_pos = _precompute_label_arrays(trading_calendar_dates, by_date)
+    adj_open_np, limit_pct_np, _adj_close_np, daily_log_ret, vol30_by_idx, date_to_pos = _precompute_label_arrays(trading_calendar_dates, by_date, limit_by_date)
     if asof not in trading_calendar_dates:
         return _fail(code, asof_date, dp_ok, "asof date not in trading calendar")
 
@@ -353,7 +387,7 @@ def build_label_for_sample(
         trading_calendar_dates,
         by_date,
         adj_open_np,
-        adj_close_np,
+        limit_pct_np,
         daily_log_ret,
         vol30_by_idx,
         date_to_pos,
@@ -368,7 +402,7 @@ def build_label_for_sample(
             trading_calendar_dates,
             by_date,
             adj_open_np,
-            adj_close_np,
+            limit_pct_np,
             daily_log_ret,
             vol30_by_idx,
             date_to_pos,
@@ -379,16 +413,9 @@ def build_label_for_sample(
     if len(past_raw_values) < LABEL_Z_WINDOW:
         return _fail(code, asof_date, dp_ok, f"insufficient y_raw history for label zscore: need {LABEL_Z_WINDOW}, got {len(past_raw_values)}")
 
-    past_window = np.asarray(past_raw_values[-LABEL_Z_WINDOW:], dtype=np.float64)
-    mu = float(np.mean(past_window))
-    sd = float(np.std(past_window, ddof=0))
-    if (not np.isfinite(mu)) or (not np.isfinite(sd)) or sd <= 0:
-        return _fail(code, asof_date, dp_ok, "label zscore sd invalid (<=0 or non-finite)")
-
-    y_z = (float(y_raw_val) - mu) / max(sd, ZSCORE_EPS)
-    y_z = float(TANH_K * np.tanh(y_z / TANH_K))
+    y_z = float(np.tanh(LIMIT_Y_K * float(y_raw_val)))
     if not np.isfinite(y_z):
-        return _fail(code, asof_date, dp_ok, "label zscore non-finite")
+        return _fail(code, asof_date, dp_ok, "label value non-finite")
 
     label_ok = True
     return LabelBundle(
@@ -405,6 +432,9 @@ def build_label_for_sample(
         exit_close=details["exit_close"],
         vol30=details["vol30"],
         ret_log=details["ret_log"],
+        limit_pct=details["limit_pct"],
+        confidence_weight=np.float32(details["confidence_weight"]),
+        sample_weight=np.float32(details["sample_weight"]),
         fail_reason=None,
     )
 
@@ -424,10 +454,6 @@ def get_label_valid_asof_dates(data_dir: str, code: str) -> tuple[str, ...]:
             continue
         if idx not in context.raw_details_by_index:
             continue
-        mu = float(context.z_mu_by_valid_pos[pos])
-        sd = float(context.z_sd_by_valid_pos[pos])
-        if (not np.isfinite(mu)) or (not np.isfinite(sd)) or sd <= 0:
-            continue
         window_start_idx = max(0, idx - LABEL_Z_WINDOW - VOL_WINDOW)
         if _has_breakpoint_crossing(trading_calendar_dates, window_start_idx, idx + 3, set(context.breakpoints)):
             continue
@@ -438,6 +464,7 @@ def get_label_valid_asof_dates(data_dir: str, code: str) -> tuple[str, ...]:
 def clear_label_worker_cache() -> None:
     _calendar_dates_cached.cache_clear()
     _daily_data_cached.cache_clear()
+    _limit_data_cached.cache_clear()
     _breakpoints_cached.cache_clear()
     _build_label_context.cache_clear()
     get_label_valid_asof_dates.cache_clear()
@@ -452,7 +479,14 @@ def build_label_from_data_dir(
     data_dir_key = str(Path(data_dir).resolve())
     context = _build_label_context(data_dir_key, code)
     if context is None:
-        return _fail(code, asof_date, dp_ok, "daily data unavailable")
+        try:
+            _ = _daily_data_cached(data_dir_key, code)
+            _ = _limit_data_cached(data_dir_key, code)
+        except FileNotFoundError as exc:
+            return _fail(code, asof_date, dp_ok, str(exc))
+        except ValueError as exc:
+            return _fail(code, asof_date, dp_ok, str(exc))
+        return _fail(code, asof_date, dp_ok, "daily/limit data unavailable")
 
     asof = pd.to_datetime(asof_date).date()
     calendar_dates = context.calendar_dates
@@ -480,11 +514,7 @@ def build_label_from_data_dir(
         return _fail(code, asof_date, dp_ok, f"insufficient y_raw history for label zscore: need {LABEL_Z_WINDOW}, got {pos}")
 
     if not context.label_ok_by_idx[idx]:
-        mu = float(context.z_mu_by_valid_pos[pos])
-        sd = float(context.z_sd_by_valid_pos[pos])
-        if (not np.isfinite(mu)) or (not np.isfinite(sd)) or sd <= 0:
-            return _fail(code, asof_date, dp_ok, "label zscore sd invalid (<=0 or non-finite)")
-        return _fail(code, asof_date, dp_ok, "label zscore non-finite")
+        return _fail(code, asof_date, dp_ok, "label value non-finite")
 
     y_raw_val = float(valid_values[pos])
     y_z = float(context.label_value_by_idx[idx])
@@ -504,5 +534,8 @@ def build_label_from_data_dir(
         exit_close=details["exit_close"],
         vol30=details["vol30"],
         ret_log=details["ret_log"],
+        limit_pct=details["limit_pct"],
+        confidence_weight=np.float32(context.confidence_weight_by_idx[idx]),
+        sample_weight=np.float32(context.sample_weight_by_idx[idx]),
         fail_reason=None,
     )

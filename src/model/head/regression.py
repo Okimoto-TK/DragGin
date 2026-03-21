@@ -58,6 +58,8 @@ def masked_huber_loss(
     y_hat: torch.Tensor,
     y_true: torch.Tensor,
     loss_mask: torch.Tensor,
+    sample_weight: torch.Tensor | None = None,
+    confidence_weight: torch.Tensor | None = None,
     delta: float = 1.0,
 ) -> tuple[torch.Tensor, dict]:
     """Compute Huber loss and regression metrics over valid masked entries."""
@@ -76,21 +78,34 @@ def masked_huber_loss(
 
     valid_hat = y_hat[valid_mask]
     valid_true = y_true[valid_mask]
+    valid_sample_weight = (
+        sample_weight[valid_mask].to(dtype=valid_hat.dtype)
+        if sample_weight is not None
+        else torch.ones_like(valid_hat, dtype=valid_hat.dtype)
+    )
+    valid_confidence_weight = (
+        confidence_weight[valid_mask].to(dtype=valid_hat.dtype)
+        if confidence_weight is not None
+        else torch.ones_like(valid_hat, dtype=valid_hat.dtype)
+    )
+    valid_weight = (valid_sample_weight * valid_confidence_weight).clamp_min(0.0)
+    weight_sum = valid_weight.sum().clamp_min(1e-8)
 
     error = valid_hat - valid_true
     abs_err = error.abs()
     quadratic = torch.minimum(abs_err, abs_err.new_tensor(delta))
     linear = abs_err - quadratic
 
-    huber = (0.5 * quadratic.square() + delta * linear).mean()
-    mae = abs_err.mean()
-    mse = error.square().mean()
+    huber = ((0.5 * quadratic.square() + delta * linear) * valid_weight).sum() / weight_sum
+    mae = (abs_err * valid_weight).sum() / weight_sum
+    mse = (error.square() * valid_weight).sum() / weight_sum
 
     metrics = {
         "num_valid": num_valid,
         "huber": huber,
         "mae": mae,
         "mse": mse,
+        "weight_sum": weight_sum,
     }
     return huber, metrics
 
@@ -119,6 +134,15 @@ class RegressionModelHead(nn.Module):
         y_hat: torch.Tensor,
         y_true: torch.Tensor,
         loss_mask: torch.Tensor,
+        sample_weight: torch.Tensor | None = None,
+        confidence_weight: torch.Tensor | None = None,
         delta: float = 1.0,
     ) -> tuple[torch.Tensor, dict]:
-        return masked_huber_loss(y_hat=y_hat, y_true=y_true, loss_mask=loss_mask, delta=delta)
+        return masked_huber_loss(
+            y_hat=y_hat,
+            y_true=y_true,
+            loss_mask=loss_mask,
+            sample_weight=sample_weight,
+            confidence_weight=confidence_weight,
+            delta=delta,
+        )

@@ -10,6 +10,7 @@ from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Any
 
+import numpy as np
 import pandas as pd
 import torch
 import tushare as ts
@@ -64,6 +65,14 @@ _UPDATE_DAILY_MONEYFLOW_COLUMNS = [
     "buy_elg_vol", "buy_elg_amount",
     "sell_elg_vol", "sell_elg_amount",
     "net_mf_vol", "net_mf_amount",
+]
+
+_UPDATE_DAILY_LIMIT_COLUMNS = [
+    "ts_code",
+    "trade_date",
+    "up_limit",
+    "down_limit",
+    "pre_close",
 ]
 
 
@@ -148,6 +157,33 @@ def _canonicalize_update_daily_moneyflow(df: pd.DataFrame) -> pd.DataFrame:
     return _normalize_moneyflow(out)
 
 
+def _canonicalize_update_daily_limit(df: pd.DataFrame) -> pd.DataFrame:
+    raw = df.copy()
+    if "ts_code" in raw.columns and "code" not in raw.columns:
+        raw = raw.rename(columns={"ts_code": "code"})
+
+    if "code" not in raw.columns:
+        raise ValueError("limit data missing required column: code/ts_code")
+    if "trade_date" not in raw.columns:
+        raise ValueError("limit data missing required column: trade_date")
+
+    raw["code"] = raw["code"].astype(str)
+    raw["trade_date"] = pd.to_datetime(raw["trade_date"].astype(str), format="%Y%m%d", errors="coerce").dt.strftime("%Y-%m-%d")
+
+    for col in ["up_limit", "down_limit", "pre_close"]:
+        if col not in raw.columns:
+            raise ValueError(f"limit data missing required column: {col}")
+        raw[col] = pd.to_numeric(raw[col], errors="coerce")
+
+    out = raw[["code", "trade_date", "up_limit", "down_limit", "pre_close"]].copy()
+    valid_pre_close = np.isfinite(out["pre_close"]) & (out["pre_close"] > 0)
+    up_ratio = np.abs(out["up_limit"] / out["pre_close"] - 1.0)
+    down_ratio = np.abs(out["down_limit"] / out["pre_close"] - 1.0)
+    out["limit_pct"] = np.where(valid_pre_close, np.nanmax(np.stack([up_ratio, down_ratio]), axis=0), np.nan)
+    out = out[["code", "trade_date", "up_limit", "down_limit", "limit_pct"]].sort_values(["code", "trade_date"]).reset_index(drop=True)
+    return out
+
+
 
 def _canonicalize_update_daily_5min(df: pd.DataFrame, code_hint: str) -> pd.DataFrame:
     raw = df.copy()
@@ -203,6 +239,7 @@ def _write_processed_code_frames(processed_dir: Path, payloads: dict[str, dict[s
         daily_parts = payloads[code].get("daily", [])
         min5_parts = payloads[code].get("5min", [])
         moneyflow_parts = payloads[code].get("moneyflow", [])
+        limit_parts = payloads[code].get("limit", [])
         if not daily_parts or not min5_parts or not moneyflow_parts:
             continue
 
@@ -229,8 +266,16 @@ def _write_processed_code_frames(processed_dir: Path, payloads: dict[str, dict[s
         if moneyflow_df.empty:
             continue
         moneyflow_df.to_parquet(code_dir / "moneyflow.parquet", index=False)
+        limit_count = 0
+        if limit_parts:
+            limit_df = pd.concat(limit_parts, ignore_index=True)
+            limit_df = limit_df[limit_df["trade_date"].isin(valid_trade_dates)].copy()
+            limit_df = limit_df.sort_values("trade_date").drop_duplicates(subset=["trade_date"], keep="last").reset_index(drop=True)
+            if not limit_df.empty:
+                limit_df.to_parquet(code_dir / "limit.parquet", index=False)
+                limit_count = len(limit_df)
         written_codes.append(code)
-        _vlog(verbose, f"wrote processed code data for {code}: daily={len(daily_df)} 5min={len(min5_df)} moneyflow={len(moneyflow_df)}")
+        _vlog(verbose, f"wrote processed code data for {code}: daily={len(daily_df)} 5min={len(min5_df)} moneyflow={len(moneyflow_df)} limit={limit_count}")
     return written_codes
 
 
@@ -277,6 +322,7 @@ def _build_processed_dataset_from_update_daily(data_dir: Path, processed_dir: Pa
     raw_dir = data_dir / "raw"
     daily_dir = raw_dir / "daily"
     moneyflow_dir = raw_dir / "moneyflow"
+    limit_dir = raw_dir / "stk_limit"
     min5_dir = raw_dir / "5min"
     st_dir = raw_dir / "st"
     _vlog(verbose, f"building processed dataset from {raw_dir}")
@@ -287,7 +333,7 @@ def _build_processed_dataset_from_update_daily(data_dir: Path, processed_dir: Pa
         shutil.rmtree(processed_dir)
     processed_dir.mkdir(parents=True, exist_ok=True)
 
-    payloads: dict[str, dict[str, list[pd.DataFrame]]] = defaultdict(lambda: {"daily": [], "5min": [], "moneyflow": []})
+    payloads: dict[str, dict[str, list[pd.DataFrame]]] = defaultdict(lambda: {"daily": [], "5min": [], "moneyflow": [], "limit": []})
     all_calendar_dates: set[pd.Timestamp] = set()
 
     for path in sorted(daily_dir.glob("*.parquet")):
@@ -304,6 +350,18 @@ def _build_processed_dataset_from_update_daily(data_dir: Path, processed_dir: Pa
             continue
         for code, sub in df.groupby("code", sort=False):
             payloads[str(code)]["moneyflow"].append(sub.reset_index(drop=True))
+
+    if limit_dir.exists():
+        for path in sorted(limit_dir.glob("*.parquet")):
+            try:
+                df = _canonicalize_update_daily_limit(_read_parquet_columns(path, _UPDATE_DAILY_LIMIT_COLUMNS))
+            except Exception as exc:
+                _vlog(verbose, f"skip invalid limit file {path.name}: {exc}")
+                continue
+            if df.empty:
+                continue
+            for code, sub in df.groupby("code", sort=False):
+                payloads[str(code)]["limit"].append(sub.reset_index(drop=True))
 
     count = 0
     acount = len(sorted(min5_dir.iterdir()))

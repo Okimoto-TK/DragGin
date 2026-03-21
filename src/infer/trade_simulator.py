@@ -79,6 +79,25 @@ def load_daily_map(data_dir: Path, code: str) -> dict[str, dict[str, float]]:
     return out
 
 
+def load_limit_map(data_dir: Path, code: str) -> dict[str, dict[str, float]]:
+    p = data_dir / code / "limit.parquet"
+    if not p.exists():
+        return {}
+    df = pd.read_parquet(p, columns=["trade_date", "up_limit", "down_limit", "limit_pct"])
+    df["trade_date"] = pd.to_datetime(df["trade_date"], errors="coerce").dt.strftime("%Y-%m-%d")
+    for col in ["up_limit", "down_limit", "limit_pct"]:
+        df[col] = pd.to_numeric(df[col], errors="coerce")
+    df = df.dropna(subset=["trade_date"]).drop_duplicates("trade_date", keep="last")
+    out: dict[str, dict[str, float]] = {}
+    for _, row in df.iterrows():
+        out[str(row["trade_date"])] = {
+            "up_limit": float(row["up_limit"]) if np.isfinite(row["up_limit"]) else math.nan,
+            "down_limit": float(row["down_limit"]) if np.isfinite(row["down_limit"]) else math.nan,
+            "limit_pct": float(row["limit_pct"]) if np.isfinite(row["limit_pct"]) else math.nan,
+        }
+    return out
+
+
 def load_latest_position_state(position_dir: Path, daily_cache: dict[str, dict[str, dict[str, float]]]) -> tuple[str | None, float, dict[str, Position]]:
     if not position_dir.exists():
         return None, 0.0, {}
@@ -233,8 +252,8 @@ def run_trade_simulation(
     if len(asof_dates) != len(trading_dates):
         raise ValueError("asof_dates and trading_dates must have identical length")
 
-    limit_cache: dict[str, dict[str, tuple[float, float]]] = {}
     daily_cache = {c: load_daily_map(data_dir, c) for c in codes}
+    limit_cache = {c: load_limit_map(data_dir, c) for c in codes}
     st_flags_by_day = load_st_flags(st_dir)
 
     cash = float(initial_cash)
@@ -255,22 +274,6 @@ def run_trade_simulation(
             target_n = int(round(target_n * prev_confidence))
             target_n = max(1, min(int(topk), target_n))
 
-        if day_trade not in limit_cache:
-            lm: dict[str, tuple[float, float]] = {}
-            if pro is not None:
-                try:
-                    ldf = pro.stk_limit(trade_date=day_trade)
-                    if ldf is not None and not ldf.empty:
-                        for _, r in ldf.iterrows():
-                            c = str(r.get("ts_code", ""))
-                            up = float(r.get("up_limit", np.nan))
-                            dn = float(r.get("down_limit", np.nan))
-                            if c:
-                                lm[c] = (up, dn)
-                except Exception:
-                    lm = {}
-            limit_cache[day_trade] = lm
-
         for code, pos in positions.items():
             apply_adj_factor_before_open(pos, daily_cache.get(code, {}).get(day))
 
@@ -280,6 +283,7 @@ def run_trade_simulation(
         init_pos_details: list[dict[str, Any]] = []
         sell_records: list[dict[str, Any]] = []
         buy_records: list[dict[str, Any]] = []
+        skipped_trades: list[dict[str, Any]] = []
         sold_today: set[str] = set()
 
         for code, pos in positions.items():
@@ -294,8 +298,13 @@ def run_trade_simulation(
             open_p = float(day_row.get("open", math.nan))
             if (not np.isfinite(open_p)) or open_p <= 0:
                 continue
-            updn = limit_cache[day_trade].get(code, (math.nan, math.nan))
-            down_limit = float(updn[1])
+            limit_row = limit_cache.get(code, {}).get(day)
+            if limit_row is None:
+                skipped_trades.append({"code": code, "action": "sell", "reason": "missing limit data"})
+                if verbose:
+                    print(f"[trade_simulator] skip sell {code} {day}: missing limit data")
+                continue
+            down_limit = float(limit_row.get("down_limit", math.nan))
             sell_price: float | None = None
             score_today = score_map.get(code, math.nan)
             if np.isfinite(down_limit) and abs(open_p - down_limit) < 1e-8:
@@ -336,8 +345,13 @@ def run_trade_simulation(
             open_p = float(day_row.get("open", math.nan))
             if (not np.isfinite(open_p)) or open_p <= 0:
                 continue
-            updn = limit_cache[day_trade].get(code, (math.nan, math.nan))
-            up_limit = float(updn[0])
+            limit_row = limit_cache.get(code, {}).get(day)
+            if limit_row is None:
+                skipped_trades.append({"code": code, "action": "buy", "reason": "missing limit data"})
+                if verbose:
+                    print(f"[trade_simulator] skip buy {code} {day}: missing limit data")
+                continue
+            up_limit = float(limit_row.get("up_limit", math.nan))
             if np.isfinite(up_limit) and abs(open_p - up_limit) < 1e-8:
                 continue
 
@@ -390,6 +404,7 @@ def run_trade_simulation(
             "initial_positions": init_pos_details,
             "sell_records": sell_records,
             "buy_records": buy_records,
+            "skipped_trades": skipped_trades,
             "final_positions": final_pos_details,
             "final_holding_amount": round(final_holding_amount, 4),
             "final_cash": round(cash, 4),

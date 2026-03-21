@@ -6,6 +6,15 @@ import pandas as pd
 from src.feat.labels_risk_adj import build_label_for_sample
 
 
+def _limit_df(calendar: list[str], limit_pct: float = 0.1) -> pd.DataFrame:
+    return pd.DataFrame({
+        "trade_date": calendar,
+        "up_limit": np.full(len(calendar), 110.0),
+        "down_limit": np.full(len(calendar), 90.0),
+        "limit_pct": np.full(len(calendar), limit_pct),
+    })
+
+
 def _base_df(calendar: list[str]) -> pd.DataFrame:
     n = len(calendar)
     close = 200.0 + np.arange(n) + 0.3 * np.cos(np.arange(n))
@@ -28,13 +37,14 @@ def test_label_ok_false_when_future_prices_missing() -> None:
     asof = calendar[asof_idx]
 
     full = _base_df(calendar)
+    limit_df = _limit_df(calendar)
 
     missing_entry = full[full["trade_date"] != calendar[asof_idx + 1]].reset_index(drop=True)
-    res_entry = build_label_for_sample("AAA", asof, calendar, lambda _: missing_entry)
+    res_entry = build_label_for_sample("AAA", asof, calendar, lambda _: missing_entry, limit_loader=lambda _: limit_df)
     assert not res_entry.label_ok
     assert res_entry.fail_reason is not None
 
     missing_exit = full[full["trade_date"] != calendar[asof_idx + 3]].reset_index(drop=True)
-    res_exit = build_label_for_sample("AAA", asof, calendar, lambda _: missing_exit)
+    res_exit = build_label_for_sample("AAA", asof, calendar, lambda _: missing_exit, limit_loader=lambda _: limit_df)
     assert not res_exit.label_ok
     assert res_exit.fail_reason is not None

@@ -50,6 +50,7 @@ def _write_data_with_breakpoint(root: Path, code: str = "AAA", days: int = 180) 
     code_dir.mkdir(parents=True, exist_ok=True)
     pd.DataFrame(rows_5m).to_parquet(code_dir / "5min.parquet", index=False)
     pd.DataFrame(rows_daily).to_parquet(code_dir / "daily.parquet", index=False)
+    pd.DataFrame({"trade_date": [d.date().isoformat() for d in dates], "up_limit": [110.0] * len(dates), "down_limit": [90.0] * len(dates), "limit_pct": [0.1] * len(dates)}).to_parquet(code_dir / "limit.parquet", index=False)
     pd.DataFrame({"trade_date": [d.date().isoformat() for d in dates]}).to_parquet(root / "calendar.parquet", index=False)
 
     bp_date = (start + pd.Timedelta(days=140)).date().isoformat()

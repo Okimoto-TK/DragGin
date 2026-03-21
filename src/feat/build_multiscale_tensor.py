@@ -149,6 +149,30 @@ def _load_daily_data_cached(data_dir: str, code: str) -> pd.DataFrame:
     return load_daily_data(data_dir, code)
 
 
+def load_limit_data(data_dir: str | Path, code: str) -> pd.DataFrame:
+    file_path = Path(data_dir) / code / "limit.parquet"
+    if not file_path.exists():
+        raise FileNotFoundError(f"limit data unavailable for {code}: {file_path}")
+
+    out = pd.read_parquet(file_path)
+    required = {"trade_date", "up_limit", "down_limit", "limit_pct"}
+    missing = sorted(required.difference(set(out.columns)))
+    if missing:
+        raise ValueError(f"limit data missing required columns for {code}: {missing}")
+
+    out = out[["trade_date", "up_limit", "down_limit", "limit_pct"]].copy()
+    out["trade_date"] = pd.to_datetime(out["trade_date"], errors="coerce").dt.date
+    for col in ["up_limit", "down_limit", "limit_pct"]:
+        out[col] = pd.to_numeric(out[col], errors="coerce")
+    out = out.dropna(subset=["trade_date"]).drop_duplicates(subset=["trade_date"], keep="last").sort_values("trade_date").reset_index(drop=True)
+    return out
+
+
+@lru_cache(maxsize=512)
+def _load_limit_data_cached(data_dir: str, code: str) -> pd.DataFrame:
+    return load_limit_data(data_dir, code)
+
+
 def load_breakpoints(data_dir: str | Path, code: str) -> set[date]:
     file_path = Path(data_dir) / code / "breakpoints.parquet"
     if not file_path.exists():
@@ -440,6 +464,7 @@ def get_tensor_valid_asof_dates(data_dir: str, code: str) -> tuple[str, ...]:
 def clear_tensor_worker_cache() -> None:
     _load_5m_data_cached.cache_clear()
     _load_daily_data_cached.cache_clear()
+    _load_limit_data_cached.cache_clear()
     _load_breakpoints_cached.cache_clear()
     _load_market_calendar_dates.cache_clear()
     _build_tensor_context.cache_clear()

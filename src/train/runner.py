@@ -78,6 +78,8 @@ class NpyShardDataset(Dataset):
             "dp_ok": torch.as_tensor(shard["dp_ok"][row_idx], dtype=torch.bool),
             "label_ok": torch.as_tensor(shard["label_ok"][row_idx], dtype=torch.bool),
             "loss_mask": torch.as_tensor(shard["loss_mask"][row_idx], dtype=torch.bool),
+            "sample_weight": torch.as_tensor(shard.get("sample_weight", np.ones_like(shard["y"]))[row_idx], dtype=torch.float32),
+            "confidence_weight": torch.as_tensor(shard.get("confidence_weight", np.ones_like(shard["y"]))[row_idx], dtype=torch.float32),
         }
 
 
@@ -365,6 +367,8 @@ def collate_batch(samples: list[dict[str, Any]]) -> dict[str, Any]:
         "dp_ok": torch.stack([sample["dp_ok"] for sample in samples], dim=0),
         "label_ok": torch.stack([sample["label_ok"] for sample in samples], dim=0),
         "loss_mask": torch.stack([sample["loss_mask"] for sample in samples], dim=0),
+        "sample_weight": torch.stack([sample["sample_weight"] for sample in samples], dim=0),
+        "confidence_weight": torch.stack([sample["confidence_weight"] for sample in samples], dim=0),
     }
 
 
@@ -386,6 +390,8 @@ def _batch_from_shard_rows(shard: dict[str, Any], rows: np.ndarray, y_key: str) 
         "dp_ok": torch.from_numpy(np.ascontiguousarray(shard["dp_ok"][rows_contig])).to(torch.bool),
         "label_ok": torch.from_numpy(np.ascontiguousarray(shard["label_ok"][rows_contig])).to(torch.bool),
         "loss_mask": torch.from_numpy(np.ascontiguousarray(shard["loss_mask"][rows_contig])).to(torch.bool),
+        "sample_weight": torch.from_numpy(np.ascontiguousarray(shard.get("sample_weight", np.ones_like(shard["y"]))[rows_contig], dtype=np.float32)),
+        "confidence_weight": torch.from_numpy(np.ascontiguousarray(shard.get("confidence_weight", np.ones_like(shard["y"]))[rows_contig], dtype=np.float32)),
     }
 
 
@@ -423,6 +429,8 @@ def _batch_from_shard_chunks(chunks: list[tuple[dict[str, Any], np.ndarray]], y_
         "dp_ok": torch.from_numpy(_cat_contiguous("dp_ok")).to(torch.bool),
         "label_ok": torch.from_numpy(_cat_contiguous("label_ok")).to(torch.bool),
         "loss_mask": torch.from_numpy(_cat_contiguous("loss_mask")).to(torch.bool),
+        "sample_weight": torch.from_numpy(_cat_contiguous("sample_weight", np.float32) if "sample_weight" in shards[0] else np.ones((_cat_contiguous(y_key, np.float32).shape[0],), dtype=np.float32)),
+        "confidence_weight": torch.from_numpy(_cat_contiguous("confidence_weight", np.float32) if "confidence_weight" in shards[0] else np.ones((_cat_contiguous(y_key, np.float32).shape[0],), dtype=np.float32)),
     }
 
 
@@ -1120,7 +1128,13 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                             force_gate_value=force_gate_value,
                             force_flow_gate_value=force_flow_gate_value,
                         )
-                        loss, metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
+                        loss, metrics = masked_huber_loss(
+                            y_hat=y_hat,
+                            y_true=batch["y"],
+                            loss_mask=batch["loss_mask"],
+                            sample_weight=batch.get("sample_weight"),
+                            confidence_weight=batch.get("confidence_weight"),
+                        )
                         gate = aux["fusion"]["gate"]
                         gate_logits = aux["fusion"]["gate_logits"]
                         guided_pool = aux["fusion"]["guided_pool"]
@@ -1417,7 +1431,13 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                             break
                         with autocast(enabled=use_amp):
                             y_hat, aux = model(batch)
-                            val_loss, val_metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
+                            val_loss, val_metrics = masked_huber_loss(
+                                y_hat=y_hat,
+                                y_true=batch["y"],
+                                loss_mask=batch["loss_mask"],
+                                sample_weight=batch.get("sample_weight"),
+                                confidence_weight=batch.get("confidence_weight"),
+                            )
                         gate_stats = _compute_gate_stats(gate=aux["fusion"]["gate"], gate_logits=aux["fusion"]["gate_logits"])
                         num_valid = int(val_metrics["num_valid"])
                         val_num_valid_total += num_valid
@@ -1441,7 +1461,13 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                         batch = _to_device(raw_batch, device, pin_memory=config.pin_memory)
                         with autocast(enabled=use_amp):
                             y_hat, aux = model(batch)
-                            val_loss, val_metrics = masked_huber_loss(y_hat=y_hat, y_true=batch["y"], loss_mask=batch["loss_mask"])
+                            val_loss, val_metrics = masked_huber_loss(
+                                y_hat=y_hat,
+                                y_true=batch["y"],
+                                loss_mask=batch["loss_mask"],
+                                sample_weight=batch.get("sample_weight"),
+                                confidence_weight=batch.get("confidence_weight"),
+                            )
                         gate_stats = _compute_gate_stats(gate=aux["fusion"]["gate"], gate_logits=aux["fusion"]["gate_logits"])
                         num_valid = int(val_metrics["num_valid"])
                         val_num_valid_total += num_valid

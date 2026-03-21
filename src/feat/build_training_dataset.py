@@ -40,6 +40,8 @@ class TrainDatasetBundle:
     dp_ok: np.ndarray
     label_ok: np.ndarray
     loss_mask: np.ndarray
+    sample_weight: np.ndarray
+    confidence_weight: np.ndarray
 
 
 def _empty_bundle() -> TrainDatasetBundle:
@@ -60,6 +62,8 @@ def _empty_bundle() -> TrainDatasetBundle:
         dp_ok=np.zeros((0,), dtype=np.bool_),
         label_ok=np.zeros((0,), dtype=np.bool_),
         loss_mask=np.zeros((0,), dtype=np.bool_),
+        sample_weight=np.zeros((0,), dtype=np.float32),
+        confidence_weight=np.zeros((0,), dtype=np.float32),
     )
 
 
@@ -201,6 +205,8 @@ def _rows_from_code_task(
         dp_ok = np.zeros((n,), dtype=np.bool_)
         label_ok = np.zeros((n,), dtype=np.bool_)
         loss_mask = np.zeros((n,), dtype=np.bool_)
+        sample_weight = np.zeros((n,), dtype=np.float32)
+        confidence_weight = np.zeros((n,), dtype=np.float32)
 
         write_idx = 0
         for asof in selected_asof_dates:
@@ -227,6 +233,8 @@ def _rows_from_code_task(
             dp_ok[write_idx] = bool(dp.dp_ok and flow_ok)
             label_ok[write_idx] = bool(lb.label_ok)
             loss_mask[write_idx] = effective_loss_mask
+            sample_weight[write_idx] = np.float32(lb.sample_weight)
+            confidence_weight[write_idx] = np.float32(lb.confidence_weight)
             write_idx += 1
 
         shard_path = Path(shard_dir) / f"{code}.npy"
@@ -247,6 +255,8 @@ def _rows_from_code_task(
             "dp_ok": dp_ok[:write_idx],
             "label_ok": label_ok[:write_idx],
             "loss_mask": loss_mask[:write_idx],
+            "sample_weight": sample_weight[:write_idx],
+            "confidence_weight": confidence_weight[:write_idx],
         }
         np.save(shard_path, shard_payload, allow_pickle=True)
         return {"path": str(shard_path), "rows": int(write_idx)}
@@ -281,6 +291,8 @@ def _merge_shards(shard_infos: list[dict]) -> TrainDatasetBundle:
         "dp_ok": [],
         "label_ok": [],
         "loss_mask": [],
+        "sample_weight": [],
+        "confidence_weight": [],
     }
     for info in shard_infos:
         if int(info.get("rows", 0)) <= 0:
@@ -309,6 +321,8 @@ def _merge_shards(shard_infos: list[dict]) -> TrainDatasetBundle:
         dp_ok=np.concatenate(parts["dp_ok"]).astype(np.bool_),
         label_ok=np.concatenate(parts["label_ok"]).astype(np.bool_),
         loss_mask=np.concatenate(parts["loss_mask"]).astype(np.bool_),
+        sample_weight=np.concatenate(parts["sample_weight"]).astype(np.float32),
+        confidence_weight=np.concatenate(parts["confidence_weight"]).astype(np.float32),
     )
 
 
@@ -398,4 +412,6 @@ def save_train_dataset(bundle: TrainDatasetBundle, out_npz: str | Path) -> None:
         dp_ok=bundle.dp_ok,
         label_ok=bundle.label_ok,
         loss_mask=bundle.loss_mask,
+        sample_weight=bundle.sample_weight,
+        confidence_weight=bundle.confidence_weight,
     )
