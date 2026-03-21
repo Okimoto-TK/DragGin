@@ -204,7 +204,7 @@ def test_checkpoint_saves_model_hparams(tmp_path: Path) -> None:
 
     ckpt = torch.load(Path(cfg.out_dir) / "checkpoints" / cfg.exp_name / "latest.ckpt", map_location="cpu")
     assert ckpt["model_hparams"] == {
-        "in_dim": 6,
+        "in_dim": C,
         "hidden_dim": 8,
         "num_heads": 2,
         "dropout": 0.0,
