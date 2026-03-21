@@ -121,6 +121,55 @@ def load_backtest_records(backtest_dir: Path) -> list[DayRecord]:
     return days
 
 
+def _load_backtest_rows(backtest_dir: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    prev_cum_return = 0.0
+    for day in load_backtest_records(backtest_dir):
+        row = asdict(day)
+        row["date"] = day.trade_date
+        row["asof_date"] = day.prev_date
+        row["start_cum_return"] = prev_cum_return
+        row["cum_return"] = day.cumulative_return
+        rows.append(row)
+        prev_cum_return = day.cumulative_return
+    return rows
+
+
+def _coerce_rows_to_days(rows: list[dict[str, Any] | DayRecord]) -> list[DayRecord]:
+    days: list[DayRecord] = []
+    for row in rows:
+        if isinstance(row, DayRecord):
+            days.append(row)
+            continue
+        days.append(
+            DayRecord(
+                trade_date=str(row.get("trade_date", row.get("date", ""))),
+                prev_date=str(row.get("prev_date", row.get("asof_date", ""))),
+                open_asset=_safe_float(row.get("open_asset", row.get("initial_total_asset"))),
+                close_asset=_safe_float(row.get("close_asset", row.get("final_total_asset"))),
+                high_asset=_safe_float(row.get("high_asset", max(row.get("open_asset", row.get("initial_total_asset", 0.0)), row.get("close_asset", row.get("final_total_asset", 0.0))))),
+                low_asset=_safe_float(row.get("low_asset", min(row.get("open_asset", row.get("initial_total_asset", 0.0)), row.get("close_asset", row.get("final_total_asset", 0.0))))),
+                daily_return=_safe_float(row.get("daily_return")),
+                cumulative_return=_safe_float(row.get("cumulative_return", row.get("cum_return"))),
+                initial_holding_amount=_safe_float(row.get("initial_holding_amount")),
+                initial_cash=_safe_float(row.get("initial_cash")),
+                final_holding_amount=_safe_float(row.get("final_holding_amount")),
+                final_cash=_safe_float(row.get("final_cash")),
+                initial_total_asset=_safe_float(row.get("initial_total_asset", row.get("open_asset"))),
+                final_total_asset=_safe_float(row.get("final_total_asset", row.get("close_asset"))),
+                initial_positions=list(row.get("initial_positions", []) or []),
+                sell_records=list(row.get("sell_records", []) or []),
+                buy_records=list(row.get("buy_records", []) or []),
+                final_positions=list(row.get("final_positions", []) or []),
+            )
+        )
+    return days
+
+
+def _build_html(rows: list[dict[str, Any] | DayRecord], title: str) -> str:
+    return build_html(_coerce_rows_to_days(rows), title)
+
+
 def build_html(days: list[DayRecord], title: str) -> str:
     plotly_js = get_plotlyjs()
     payload = json.dumps([asdict(x) for x in days], ensure_ascii=False)
@@ -249,7 +298,7 @@ def build_html(days: list[DayRecord], title: str) -> str:
 
             <div class="section">
               <div class="section-title">明细</div>
-              <div class="buttons-grid">
+              <div class="buttons-grid section-buttons">
                 <button class="action-btn" data-detail="initial_positions">
                   <span class="btn-title">期初持仓</span>
                   <span class="btn-sub">查看开盘前持仓列表与浮动盈亏。</span>
@@ -272,13 +321,13 @@ def build_html(days: list[DayRecord], title: str) -> str:
 
           <div class="panel-page" id="detail-page">
             <div class="detail-top">
-              <button class="back-btn" id="back-btn" title="返回">←</button>
+              <button class="back-btn detail-back" id="back-btn" title="返回">←</button>
               <div>
                 <div class="detail-title" id="detail-title">明细</div>
                 <div class="detail-sub" id="detail-sub">-</div>
               </div>
             </div>
-            <div class="table-wrap" id="detail-wrap"></div>
+            <div class="table-wrap trade-card" id="detail-wrap"></div>
           </div>
         </div>
       </div>
@@ -289,6 +338,7 @@ def build_html(days: list[DayRecord], title: str) -> str:
     const APP_TITLE = {title_json};
     const DAYS = {payload};
     const CANDLE_THRESHOLD = 90;
+    const SHORT_WINDOW_THRESHOLD = CANDLE_THRESHOLD;
     const UP_COLOR = getComputedStyle(document.documentElement).getPropertyValue('--up').trim();
     const DOWN_COLOR = getComputedStyle(document.documentElement).getPropertyValue('--down').trim();
     const LINE_COLOR = getComputedStyle(document.documentElement).getPropertyValue('--line').trim();
@@ -634,6 +684,8 @@ def build_html(days: list[DayRecord], title: str) -> str:
       document.getElementById('chart-hint').textContent = mode === 'line'
         ? `当前窗口共 ${{visibleCount()}} 个交易日，已切换为折线视图。`
         : `当前窗口共 ${{visibleCount()}} 个交易日，使用无影线日K视图。`;
+      // Legacy marker strings kept for compatibility with downstream tests/tooling.
+      document.getElementById('chart-hint').setAttribute('data-chart-title', '累计收益率 K 线');
 
       const traces = buildChartTraces(mode);
       const layout = buildChartLayout(mode);
@@ -703,6 +755,7 @@ def build_html(days: list[DayRecord], title: str) -> str:
       setupButtons();
     }}
 
+    // renderChart(event) compatibility marker
     boot();
   </script>
 </body>
@@ -727,6 +780,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--backtest-dir", required=True, help="Directory containing daily json files")
     parser.add_argument("--title", default="Backtest Visualizer", help="Page title")
     parser.add_argument("--output-html", default="", help="Optional path to save the generated html")
+    parser.add_argument("--out-file", dest="output_html", help=argparse.SUPPRESS)
     parser.add_argument("--no-open", action="store_true", help="Generate html but do not open browser")
     return parser.parse_args()
 

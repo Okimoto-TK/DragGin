@@ -5,6 +5,7 @@ import numpy as np
 import pytest
 import torch
 
+from src.infer.runner import build_model
 from src.model.head import masked_huber_loss
 from src.train.runner import (
     MultiScaleRegressor,
@@ -171,6 +172,127 @@ def test_train_one_epoch_smoke(tmp_path: Path) -> None:
 
 
 
+
+
+def test_checkpoint_saves_model_hparams(tmp_path: Path) -> None:
+    train_path = _write_shard(tmp_path / "train_hparams.npy", n=4)
+    val_path = _write_shard(tmp_path / "val_hparams.npy", n=2)
+
+    cfg = TrainConfig(
+        train_shards=[train_path],
+        val_shards=[val_path],
+        batch_size=2,
+        grad_accum_steps=1,
+        num_epochs=1,
+        lr=1e-3,
+        weight_decay=1e-4,
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        exp_name="hparams_ckpt",
+        out_dir=str(tmp_path / "out_hparams"),
+        gate_temperature=0.7,
+        enable_dynamic_threshold=False,
+        enable_free_branch=False,
+        init_lambda_micro=1.1,
+        init_lambda_mezzo=0.9,
+        init_lambda_macro=0.4,
+        use_seq_context=False,
+    )
+    run_training(cfg)
+
+    ckpt = torch.load(Path(cfg.out_dir) / "checkpoints" / cfg.exp_name / "latest.ckpt", map_location="cpu")
+    assert ckpt["model_hparams"] == {
+        "in_dim": 6,
+        "hidden_dim": 8,
+        "num_heads": 2,
+        "dropout": 0.0,
+        "enable_dynamic_threshold": False,
+        "enable_free_branch": False,
+        "init_lambda_micro": 1.1,
+        "init_lambda_mezzo": 0.9,
+        "init_lambda_macro": 0.4,
+        "gate_temperature": 0.7,
+        "use_seq_context": False,
+    }
+
+
+def test_build_model_prefers_checkpoint_hparams(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    train_path = _write_shard(tmp_path / "train_pref.npy", n=4)
+    val_path = _write_shard(tmp_path / "val_pref.npy", n=2)
+
+    cfg = TrainConfig(
+        train_shards=[train_path],
+        val_shards=[val_path],
+        batch_size=2,
+        grad_accum_steps=1,
+        num_epochs=1,
+        lr=1e-3,
+        weight_decay=1e-4,
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        exp_name="pref_ckpt",
+        out_dir=str(tmp_path / "out_pref"),
+        gate_temperature=0.7,
+    )
+    run_training(cfg)
+
+    ckpt_path = Path(cfg.out_dir) / "checkpoints" / cfg.exp_name / "latest.ckpt"
+    with caplog.at_level("WARNING"):
+        model = build_model(device=torch.device("cpu"), checkpoint=str(ckpt_path), gate_temperature=1.0, hidden_dim=16)
+
+    assert model.fusion.gated.gate_temperature == pytest.approx(0.7)
+    assert model.fusion.gated.gate_mlp[-1].out_features == 8
+    assert "Ignoring explicit model arg gate_temperature=1.0" in caplog.text
+    assert "Ignoring explicit model arg hidden_dim=16" in caplog.text
+
+
+def test_build_model_supports_legacy_checkpoint_fallback(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    model = MultiScaleRegressor(
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        enable_dynamic_threshold=False,
+        enable_free_branch=False,
+        gate_temperature=0.7,
+        use_seq_context=False,
+    )
+    legacy_path = tmp_path / "legacy.ckpt"
+    torch.save({"model_state_dict": model.state_dict()}, legacy_path)
+
+    with caplog.at_level("WARNING"):
+        rebuilt = build_model(
+            device=torch.device("cpu"),
+            checkpoint=str(legacy_path),
+            hidden_dim=8,
+            num_heads=2,
+            dropout=0.0,
+            enable_dynamic_threshold=False,
+            enable_free_branch=False,
+            gate_temperature=0.7,
+            use_seq_context=False,
+        )
+
+    assert rebuilt.fusion.gated.gate_temperature == pytest.approx(0.7)
+    assert "does not contain model_hparams" in caplog.text
+
+
+def test_build_model_legacy_checkpoint_warns_when_gate_temperature_missing(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:
+    model = MultiScaleRegressor(hidden_dim=8, num_heads=2)
+    legacy_path = tmp_path / "legacy_default.ckpt"
+    torch.save({"model_state_dict": model.state_dict()}, legacy_path)
+
+    with caplog.at_level("WARNING"):
+        rebuilt = build_model(
+            device=torch.device("cpu"),
+            checkpoint=str(legacy_path),
+            hidden_dim=8,
+            num_heads=2,
+        )
+
+    assert rebuilt.fusion.gated.gate_temperature == pytest.approx(1.0)
+    assert "defaulting to 1.0" in caplog.text
 
 
 def test_gate_std_penalty_zero_when_free_branch_disabled(tmp_path: Path) -> None:
