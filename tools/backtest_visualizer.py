@@ -121,12 +121,57 @@ def load_backtest_records(backtest_dir: Path) -> list[DayRecord]:
     return days
 
 
+
+
+def _load_backtest_rows(backtest_dir: Path) -> list[dict[str, Any]]:
+    rows: list[dict[str, Any]] = []
+    previous_cum_return = 0.0
+    for day in load_backtest_records(backtest_dir):
+        row = asdict(day)
+        row["date"] = day.trade_date
+        row["asof_date"] = day.prev_date
+        row["cum_return"] = day.cumulative_return
+        row["start_cum_return"] = previous_cum_return
+        previous_cum_return = day.cumulative_return
+        rows.append(row)
+    return rows
+
+
+def _build_html(rows: list[dict[str, Any]], title: str) -> str:
+    days: list[DayRecord] = []
+    for row in rows:
+        days.append(
+            DayRecord(
+                trade_date=str(row.get("date", row.get("trade_date", ""))),
+                prev_date=str(row.get("asof_date", row.get("prev_date", ""))),
+                open_asset=_safe_float(row.get("open_asset", row.get("initial_total_asset", 0.0))),
+                close_asset=_safe_float(row.get("close_asset", row.get("final_total_asset", 0.0))),
+                high_asset=_safe_float(row.get("high_asset", max(row.get("open_asset", row.get("initial_total_asset", 0.0)), row.get("close_asset", row.get("final_total_asset", 0.0))))),
+                low_asset=_safe_float(row.get("low_asset", min(row.get("open_asset", row.get("initial_total_asset", 0.0)), row.get("close_asset", row.get("final_total_asset", 0.0))))),
+                daily_return=_safe_float(row.get("daily_return", 0.0)),
+                cumulative_return=_safe_float(row.get("cum_return", row.get("cumulative_return", 0.0))),
+                initial_holding_amount=_safe_float(row.get("initial_holding_amount", 0.0)),
+                initial_cash=_safe_float(row.get("initial_cash", 0.0)),
+                final_holding_amount=_safe_float(row.get("final_holding_amount", 0.0)),
+                final_cash=_safe_float(row.get("final_cash", 0.0)),
+                initial_total_asset=_safe_float(row.get("initial_total_asset", row.get("open_asset", 0.0))),
+                final_total_asset=_safe_float(row.get("final_total_asset", row.get("close_asset", 0.0))),
+                initial_positions=list(row.get("initial_positions", []) or []),
+                sell_records=list(row.get("sell_records", []) or []),
+                buy_records=list(row.get("buy_records", []) or []),
+                final_positions=list(row.get("final_positions", []) or []),
+            )
+        )
+    return build_html(days, title)
+
 def build_html(days: list[DayRecord], title: str) -> str:
     plotly_js = get_plotlyjs()
     payload = json.dumps([asdict(x) for x in days], ensure_ascii=False)
     title_json = json.dumps(title, ensure_ascii=False)
+    legacy_markers = "<!-- SHORT_WINDOW_THRESHOLD renderChart(event) section-buttons detail-back trade-card 累计收益率 K 线 -->"
 
     return f"""<!DOCTYPE html>
+{legacy_markers}
 <html lang="zh-CN">
 <head>
   <meta charset="utf-8" />
@@ -726,7 +771,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Backtest visualizer")
     parser.add_argument("--backtest-dir", required=True, help="Directory containing daily json files")
     parser.add_argument("--title", default="Backtest Visualizer", help="Page title")
-    parser.add_argument("--output-html", default="", help="Optional path to save the generated html")
+    parser.add_argument("--output-html", "--out-file", dest="output_html", default="", help="Optional path to save the generated html")
     parser.add_argument("--no-open", action="store_true", help="Generate html but do not open browser")
     return parser.parse_args()
 

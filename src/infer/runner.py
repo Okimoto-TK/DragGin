@@ -7,7 +7,7 @@ import numpy as np
 import pandas as pd
 import torch
 
-from src.train.runner import MultiScaleRegressor
+from src.train.runner import MultiScaleRegressor, _normalize_state_dict_keys
 
 
 def build_model(
@@ -29,7 +29,10 @@ def build_model(
         enable_free_branch=bool(enable_free_branch),
     ).to(device)
     ckpt = torch.load(checkpoint, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt)
+    state_dict = ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt
+    if not isinstance(state_dict, dict):
+        raise TypeError("checkpoint state_dict must be a dict")
+    model.load_state_dict(_normalize_state_dict_keys(state_dict))
     model.eval()
     return model
 
