@@ -559,13 +559,27 @@ class TrainConfig:
     num_workers: int = 1
     pin_memory: bool = False
     prefetch_cuda: bool = False
-    enable_compile: bool = False
-    compile_mode: str = "reduce-overhead"
     log_every: int = 10
     curve_save_every: int = 100
     hist_every: int = 100
     checkpoint: str | None = None
     save_every: int = 1
+
+
+def _build_model_hparams(config: TrainConfig) -> dict[str, Any]:
+    return {
+        "in_dim": int(config.in_dim),
+        "hidden_dim": int(config.hidden_dim),
+        "num_heads": int(config.num_heads),
+        "dropout": float(config.dropout),
+        "enable_dynamic_threshold": bool(config.enable_dynamic_threshold),
+        "enable_free_branch": bool(config.enable_free_branch),
+        "init_lambda_micro": float(config.init_lambda_micro),
+        "init_lambda_mezzo": float(config.init_lambda_mezzo),
+        "init_lambda_macro": float(config.init_lambda_macro),
+        "gate_temperature": float(config.gate_temperature),
+        "use_seq_context": bool(config.use_seq_context),
+    }
 
 
 def _build_checkpoint_payload(
@@ -577,6 +591,7 @@ def _build_checkpoint_payload(
     scaler: GradScaler,
     history: dict[str, list[dict[str, float | int]]],
     best_val: dict[str, float],
+    model_hparams: dict[str, Any],
     scheduler: ReduceLROnPlateau | None = None,
 ) -> dict[str, Any]:
     return {
@@ -587,6 +602,7 @@ def _build_checkpoint_payload(
         "scaler_state_dict": scaler.state_dict(),
         "history": history,
         "best_val": best_val,
+        "model_hparams": model_hparams,
         "scheduler_state_dict": scheduler.state_dict() if scheduler is not None else None,
     }
 
@@ -933,8 +949,6 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
     model.to(device)
-    if device.type == "cuda" and config.enable_compile and hasattr(torch, "compile"):
-        model = torch.compile(model, mode=config.compile_mode)
 
     gate_lr = _resolve_gate_lr(config)
     gate_last_lr = float(config.lr) * 0.5
@@ -982,6 +996,7 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
     best_val = {"loss": float("inf"), "huber": float("inf"), "mae": float("inf"), "mse": float("inf")}
     latest_ckpt_path = checkpoints_dir / "latest.ckpt"
     best_ckpt_path = checkpoints_dir / "best.ckpt"
+    model_hparams = _build_model_hparams(config)
 
     if config.checkpoint is not None:
         checkpoint_path = Path(config.checkpoint)
@@ -1568,6 +1583,7 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
                 scaler=scaler,
                 history=history,
                 best_val=best_val,
+                model_hparams=model_hparams,
                 scheduler=scheduler,
             )
             _save_checkpoint(latest_ckpt_path, checkpoint_payload)

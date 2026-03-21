@@ -136,8 +136,8 @@ def _canonicalize_update_daily_moneyflow(df: pd.DataFrame) -> pd.DataFrame:
     ]
 
     missing = [c for c in value_cols if c not in raw.columns]
-    if missing:
-        raise ValueError(f"moneyflow data missing required columns: {missing}")
+    for col in missing:
+        raw[col] = 0.0
 
     out = raw[["code", "trade_date", *value_cols]].copy()
 
@@ -156,6 +156,8 @@ def _canonicalize_update_daily_5min(df: pd.DataFrame, code_hint: str) -> pd.Data
         raw = raw.rename(columns={"ts_code": "code"})
     if "t" in raw.columns and "dt" not in raw.columns:
         raw = raw.rename(columns={"t": "dt"})
+    if "trade_time" in raw.columns and "dt" not in raw.columns:
+        raw = raw.rename(columns={"trade_time": "dt"})
     if "o" in raw.columns and "open" not in raw.columns:
         raw = raw.rename(columns={"o": "open"})
     if "h" in raw.columns and "high" not in raw.columns:
@@ -343,6 +345,7 @@ def _infer_feature_shard_worker(
     device_str: str,
 ) -> str:
     device = torch.device(device_str)
+    # Keep explicit args only as fallback for legacy checkpoints without model_hparams.
     model = build_model(
         device=device,
         checkpoint=checkpoint,
@@ -530,6 +533,7 @@ def _infer_feature_shards_worker(
     worker_id: int,
 ) -> str:
     device = torch.device(device_str)
+    # Keep explicit args only as fallback for legacy checkpoints without model_hparams.
     model = build_model(
         device=device,
         checkpoint=checkpoint,
