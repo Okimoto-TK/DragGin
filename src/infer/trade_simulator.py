@@ -136,7 +136,7 @@ def load_st_flags(st_dir: Path | None) -> dict[str, set[str]]:
 
 
 def is_filtered_buy_code(code: str, st_codes: set[str]) -> bool:
-    prefix = str(code)[:3]
+    prefix = str(code)[:1]
     return str(code) in st_codes or prefix in {"9"}
 
 

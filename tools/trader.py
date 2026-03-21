@@ -343,6 +343,7 @@ def _infer_feature_shard_worker(
     device_str: str,
 ) -> str:
     device = torch.device(device_str)
+    # Keep explicit args only as fallback for legacy checkpoints without model_hparams.
     model = build_model(
         device=device,
         checkpoint=checkpoint,
@@ -530,6 +531,7 @@ def _infer_feature_shards_worker(
     worker_id: int,
 ) -> str:
     device = torch.device(device_str)
+    # Keep explicit args only as fallback for legacy checkpoints without model_hparams.
     model = build_model(
         device=device,
         checkpoint=checkpoint,

@@ -66,12 +66,12 @@ def test_backtest_runner_skips_st_and_board_filtered_buys(tmp_path: Path, monkey
     data_dir, score_dir, out_dir, st_dir = _write_common_files(tmp_path, dates)
 
     _write_code_data(data_dir, "000001.SZ", dates, [10.0] * 7, [10.0] * 7)
-    _write_code_data(data_dir, "300001.SZ", dates, [10.0] * 7, [10.0] * 7)
-    _write_code_data(data_dir, "688001.SH", dates, [10.0] * 7, [10.0] * 7)
+    _write_code_data(data_dir, "920001.SZ", dates, [10.0] * 7, [10.0] * 7)
+    _write_code_data(data_dir, "920001.SH", dates, [10.0] * 7, [10.0] * 7)
 
     pd.DataFrame(
         {
-            "code": ["000001.SZ", "300001.SZ", "688001.SH"],
+            "code": ["000001.SZ", "920001.SZ", "920001.SH"],
             "asof_date": ["2024-01-01"] * 3,
             "yhat": [0.8, 0.99, 0.98],
         }
