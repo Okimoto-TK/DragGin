@@ -1,5 +1,6 @@
 import torch
 
+from src.feat.build_multiscale_tensor import C
 from src.model.flow import FlowLegendreProjectionEncoder, WaveletGatedFiLM
 from src.model.wno import WNO1DEncoder
 
@@ -22,9 +23,9 @@ def test_wavelet_gated_film_force_zero_identity() -> None:
 
 
 def test_wno_forward_backward_compat_without_flow() -> None:
-    x = torch.randn(2, 30, 6)
+    x = torch.randn(2, 30, C)
     mask = torch.ones(2, 30)
-    encoder = WNO1DEncoder(in_dim=6, hidden_dim=8)
+    encoder = WNO1DEncoder(in_dim=C, hidden_dim=8)
     h_seq, h_pool, aux = encoder(x, mask)
     assert h_seq.shape == (2, 30, 8)
     assert h_pool.shape == (2, 8)
@@ -32,10 +33,10 @@ def test_wno_forward_backward_compat_without_flow() -> None:
 
 
 def test_wno_with_flow_and_forced_zero_gate_matches_no_flow() -> None:
-    x = torch.randn(2, 30, 6)
+    x = torch.randn(2, 30, C)
     mask = torch.ones(2, 30)
     flow = torch.randn(2, 24)
-    encoder = WNO1DEncoder(in_dim=6, hidden_dim=8)
+    encoder = WNO1DEncoder(in_dim=C, hidden_dim=8)
     out_no = encoder(x, mask)
     out_zero = encoder(x, mask, flow_raw=flow, force_flow_gate_value=0.0)
     assert torch.allclose(out_no[0], out_zero[0], atol=1e-6)

@@ -14,7 +14,9 @@ import pandas as pd
 L_MICRO = 48
 L_MEZZO = 40
 L_MACRO = 30
-C = 6
+Z_DIM = 6
+STRUCT_SHAPE_DIM = 12
+C = Z_DIM + STRUCT_SHAPE_DIM
 RAW_WARMUP = 20
 EPS = 1e-8
 TANH_K = 5.0
@@ -45,6 +47,9 @@ class _TensorContext:
     micro_z: np.ndarray
     mezzo_z: np.ndarray
     macro_z: np.ndarray
+    micro_ss: np.ndarray
+    mezzo_ss: np.ndarray
+    macro_ss: np.ndarray
     asof_to_micro_end: dict[date, int]
     asof_to_mezzo_end: dict[date, int]
     asof_to_macro_idx: dict[date, int]
@@ -270,6 +275,40 @@ def _compute_feature_matrix(df: pd.DataFrame, z_window: int) -> np.ndarray:
     return z.to_numpy(dtype=np.float32)
 
 
+def _compute_struct_shape_features(df: pd.DataFrame, short: int, mid: int, long: int) -> np.ndarray:
+    close = df["close"].astype(np.float64)
+    open_ = df["open"].astype(np.float64)
+    high = df["high"].astype(np.float64)
+    low = df["low"].astype(np.float64)
+    prev_close = close.shift(1)
+
+    ma_short = close.rolling(short, min_periods=short).mean()
+    ma_long = close.rolling(long, min_periods=long).mean()
+    rolling_low_short = low.rolling(short, min_periods=short).min()
+    rolling_high_short = high.rolling(short, min_periods=short).max()
+    rolling_low_long = low.rolling(long, min_periods=long).min()
+    rolling_high_long = high.rolling(long, min_periods=long).max()
+    intrabar_range = high - low
+
+    feats = pd.DataFrame(
+        {
+            "ret_short_raw": np.tanh(4.0 * np.log(close / close.shift(short))),
+            "ret_mid_raw": np.tanh(3.0 * np.log(close / close.shift(mid))),
+            "ma_short_gap": np.tanh(5.0 * (close / ma_short - 1.0)),
+            "ma_long_gap": np.tanh(5.0 * (close / ma_long - 1.0)),
+            "close_rank_short": (close - rolling_low_short) / (rolling_high_short - rolling_low_short + EPS),
+            "close_rank_long": (close - rolling_low_long) / (rolling_high_long - rolling_low_long + EPS),
+            "body_ratio": (close - open_) / (intrabar_range + EPS),
+            "upper_shadow_ratio": (high - np.maximum(open_, close)) / (intrabar_range + EPS),
+            "lower_shadow_ratio": (np.minimum(open_, close) - low) / (intrabar_range + EPS),
+            "close_pos_raw": (close - low) / (intrabar_range + EPS),
+            "gap_raw": np.tanh(6.0 * np.log(open_ / prev_close)),
+            "drawdown_long": np.tanh(4.0 * (close / rolling_high_long - 1.0)),
+        }
+    )
+    return feats.to_numpy(dtype=np.float32)
+
+
 def _has_breakpoint_crossing(dates: list[date], start_idx: int, end_idx: int, breakpoints: set[date]) -> bool:
     if not breakpoints or end_idx <= start_idx:
         return False
@@ -322,11 +361,17 @@ def _build_tensor_context(data_dir: str, code: str) -> _TensorContext | None:
     micro_z = _compute_feature_matrix(m5_adj, W_MICRO)
     mezzo_z = _compute_feature_matrix(m30, W_MEZZO)
     macro_z = _compute_feature_matrix(d1_adj, W_MACRO)
+    micro_ss = _compute_struct_shape_features(m5_adj, short=8, mid=24, long=48)
+    mezzo_ss = _compute_struct_shape_features(m30, short=4, mid=12, long=40)
+    macro_ss = _compute_struct_shape_features(d1_adj, short=5, mid=10, long=20)
 
     return _TensorContext(
         micro_z=micro_z,
         mezzo_z=mezzo_z,
         macro_z=macro_z,
+        micro_ss=micro_ss,
+        mezzo_ss=mezzo_ss,
+        macro_ss=macro_ss,
         asof_to_micro_end=_build_day_end_index(m5_adj, 48),
         asof_to_mezzo_end=_build_day_end_index(m30, 8),
         asof_to_macro_idx={d: i for i, d in enumerate(d1_adj["trade_date"].tolist())},
@@ -337,7 +382,15 @@ def _build_tensor_context(data_dir: str, code: str) -> _TensorContext | None:
     )
 
 
-def _slice_tensor(z: np.ndarray, end_idx: int, L: int, req_z: int, label: str) -> tuple[Optional[np.ndarray], str]:
+def _slice_tensor(
+    z: np.ndarray,
+    end_idx: int,
+    L: int,
+    req_z: int,
+    label: str,
+    *,
+    require_finite: bool = True,
+) -> tuple[Optional[np.ndarray], str]:
     if end_idx + 1 < req_z:
         return None, f"{label}: insufficient zscore warmup/history"
     if end_idx + 1 < L:
@@ -345,7 +398,7 @@ def _slice_tensor(z: np.ndarray, end_idx: int, L: int, req_z: int, label: str) -
     tail = z[end_idx + 1 - L : end_idx + 1]
     if tail.shape[0] != L:
         return None, f"{label}: insufficient zscore warmup/history"
-    if not np.isfinite(tail).all():
+    if require_finite and not np.isfinite(tail).all():
         return None, f"{label}: zscore NaN from strict rolling"
     return tail.astype(np.float32), ""
 
@@ -416,6 +469,11 @@ def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) ->
     x_micro, err = _slice_tensor(context.micro_z, micro_end, L_MICRO, L_MICRO + W_MICRO + RAW_WARMUP, "micro")
     if x_micro is None:
         return empty_result(code, asof_date, err)
+    s_micro, err = _slice_tensor(context.micro_ss, micro_end, L_MICRO, L_MICRO, "micro", require_finite=False)
+    if s_micro is None:
+        return empty_result(code, asof_date, err)
+    s_micro = np.nan_to_num(s_micro, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+    x_micro = np.concatenate([x_micro, s_micro], axis=1).astype(np.float32, copy=False)
 
     mezzo_end = context.asof_to_mezzo_end.get(asof)
     if mezzo_end is None:
@@ -423,6 +481,11 @@ def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) ->
     x_mezzo, err = _slice_tensor(context.mezzo_z, mezzo_end, L_MEZZO, L_MEZZO + W_MEZZO + RAW_WARMUP, "mezzo")
     if x_mezzo is None:
         return empty_result(code, asof_date, err)
+    s_mezzo, err = _slice_tensor(context.mezzo_ss, mezzo_end, L_MEZZO, L_MEZZO, "mezzo", require_finite=False)
+    if s_mezzo is None:
+        return empty_result(code, asof_date, err)
+    s_mezzo = np.nan_to_num(s_mezzo, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+    x_mezzo = np.concatenate([x_mezzo, s_mezzo], axis=1).astype(np.float32, copy=False)
 
     stock_calendar = context.stock_calendar
     idx = context.asof_to_stock_idx.get(asof)
@@ -441,6 +504,11 @@ def build_multiscale_tensors(data_dir: str | Path, code: str, asof_date: str) ->
     x_macro, err = _slice_tensor(context.macro_z, macro_idx, L_MACRO, req_macro, "macro")
     if x_macro is None:
         return empty_result(code, asof_date, err)
+    s_macro, err = _slice_tensor(context.macro_ss, macro_idx, L_MACRO, L_MACRO, "macro", require_finite=False)
+    if s_macro is None:
+        return empty_result(code, asof_date, err)
+    s_macro = np.nan_to_num(s_macro, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+    x_macro = np.concatenate([x_macro, s_macro], axis=1).astype(np.float32, copy=False)
 
     return DPResult(
         code=code,

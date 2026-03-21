@@ -9,6 +9,7 @@ import tempfile
 import numpy as np
 import pandas as pd
 
+from src.feat.build_multiscale_tensor import C
 from src.feat.build_multiscale_tensor import build_calendar_from_daily_filenames
 from src.feat.build_multiscale_tensor import build_multiscale_tensors
 from src.feat.build_multiscale_tensor import clear_tensor_worker_cache
@@ -45,9 +46,9 @@ def _empty_bundle() -> TrainDatasetBundle:
     return TrainDatasetBundle(
         codes=np.asarray([], dtype=object),
         asof_dates=np.asarray([], dtype=object),
-        X_micro=np.zeros((0, 48, 6), dtype=np.float32),
-        X_mezzo=np.zeros((0, 40, 6), dtype=np.float32),
-        X_macro=np.zeros((0, 30, 6), dtype=np.float32),
+        X_micro=np.zeros((0, 48, C), dtype=np.float32),
+        X_mezzo=np.zeros((0, 40, C), dtype=np.float32),
+        X_macro=np.zeros((0, 30, C), dtype=np.float32),
         flow_x=np.zeros((0, 30, 4), dtype=np.float32),
         mask_micro=np.zeros((0, 48), dtype=np.uint8),
         mask_mezzo=np.zeros((0, 40), dtype=np.uint8),
@@ -186,9 +187,9 @@ def _rows_from_code_task(
         n = len(selected_asof_dates)
         codes = np.empty((n,), dtype=object)
         asof_dates = np.empty((n,), dtype=object)
-        X_micro = np.zeros((n, 48, 6), dtype=np.float32)
-        X_mezzo = np.zeros((n, 40, 6), dtype=np.float32)
-        X_macro = np.zeros((n, 30, 6), dtype=np.float32)
+        X_micro = np.zeros((n, 48, C), dtype=np.float32)
+        X_mezzo = np.zeros((n, 40, C), dtype=np.float32)
+        X_macro = np.zeros((n, 30, C), dtype=np.float32)
         flow_x = np.zeros((n, 30, 4), dtype=np.float32)
         mask_micro = np.zeros((n, 48), dtype=np.uint8)
         mask_mezzo = np.zeros((n, 40), dtype=np.uint8)

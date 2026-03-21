@@ -3,7 +3,7 @@ from pathlib import Path
 import numpy as np
 import pandas as pd
 
-from src.feat.build_multiscale_tensor import build_multiscale_tensors
+from src.feat.build_multiscale_tensor import C, build_multiscale_tensors
 
 
 def _write_data(
@@ -80,9 +80,9 @@ def test_strict_c5_c6_warmup(tmp_path: Path) -> None:
     asof2 = _write_data(tmp2, code=code, days=130)
     ok = build_multiscale_tensors(tmp2, code, asof2)
     assert ok.dp_ok
-    assert ok.X_micro.shape == (48, 6)
-    assert ok.X_mezzo.shape == (40, 6)
-    assert ok.X_macro.shape == (30, 6)
+    assert ok.X_micro.shape == (48, C)
+    assert ok.X_mezzo.shape == (40, C)
+    assert ok.X_macro.shape == (30, C)
     assert np.all(ok.mask_micro == 1)
     assert np.all(ok.mask_mezzo == 1)
     assert np.all(ok.mask_macro == 1)

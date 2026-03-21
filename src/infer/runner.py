@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 import torch
 
+from src.feat.build_multiscale_tensor import C
 from src.train.runner import MultiScaleRegressor
 
 LOGGER = logging.getLogger(__name__)
@@ -126,7 +127,7 @@ def build_model(
     )
 
     model = MultiScaleRegressor(
-        in_dim=int(model_hparams["in_dim"]) if "in_dim" in model_hparams else 6,
+        in_dim=int(model_hparams["in_dim"]) if "in_dim" in model_hparams else C,
         hidden_dim=int(model_hparams["hidden_dim"]) if "hidden_dim" in model_hparams else 64,
         num_heads=int(model_hparams["num_heads"]) if "num_heads" in model_hparams else 4,
         dropout=float(model_hparams["dropout"]) if "dropout" in model_hparams else 0.0,
