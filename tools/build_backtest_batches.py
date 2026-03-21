@@ -280,6 +280,7 @@ def main() -> None:
                 fut.result()
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    # Legacy CLI args remain as fallback for old checkpoints without model_hparams.
     model = build_model(
         device=device,
         checkpoint=str(args.checkpoint),

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 from typing import Any
 
@@ -9,27 +10,137 @@ import torch
 
 from src.train.runner import MultiScaleRegressor
 
+LOGGER = logging.getLogger(__name__)
+
+_MODEL_HPARAM_KEYS = (
+    "in_dim",
+    "hidden_dim",
+    "num_heads",
+    "dropout",
+    "enable_dynamic_threshold",
+    "enable_free_branch",
+    "init_lambda_micro",
+    "init_lambda_mezzo",
+    "init_lambda_macro",
+    "gate_temperature",
+    "use_seq_context",
+)
+
+
+def _normalize_checkpoint_payload(ckpt: Any) -> tuple[dict[str, Any], dict[str, Any]]:
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        return ckpt, ckpt["model_state_dict"]
+    return {}, ckpt
+
+
+def _resolve_model_hparams(
+    *,
+    checkpoint: str,
+    checkpoint_payload: dict[str, Any],
+    explicit_hparams: dict[str, Any],
+) -> dict[str, Any]:
+    ckpt_hparams_raw = checkpoint_payload.get("model_hparams")
+    resolved: dict[str, Any] = {}
+
+    if isinstance(ckpt_hparams_raw, dict):
+        for key in _MODEL_HPARAM_KEYS:
+            if key in ckpt_hparams_raw and ckpt_hparams_raw[key] is not None:
+                resolved[key] = ckpt_hparams_raw[key]
+        for key, explicit_value in explicit_hparams.items():
+            if explicit_value is None:
+                continue
+            if key in resolved:
+                if resolved[key] != explicit_value:
+                    LOGGER.warning(
+                        "Ignoring explicit model arg %s=%r for checkpoint %s; using checkpoint model_hparams value %r.",
+                        key,
+                        explicit_value,
+                        checkpoint,
+                        resolved[key],
+                    )
+                continue
+            resolved[key] = explicit_value
+
+        if resolved.get("gate_temperature") is None:
+            resolved["gate_temperature"] = 1.0
+            LOGGER.warning(
+                "Checkpoint %s has incomplete model_hparams and no gate_temperature; defaulting to 1.0. "
+                "Behavior may differ from the original training run.",
+                checkpoint,
+            )
+        return resolved
+
+    LOGGER.warning(
+        "Checkpoint %s does not contain model_hparams; falling back to explicit args/defaults. "
+        "Old checkpoints may not preserve gate_temperature and other architecture-sensitive settings exactly.",
+        checkpoint,
+    )
+    for key, explicit_value in explicit_hparams.items():
+        if explicit_value is not None:
+            resolved[key] = explicit_value
+
+    if resolved.get("gate_temperature") is None:
+        resolved["gate_temperature"] = 1.0
+        LOGGER.warning(
+            "Checkpoint %s is legacy and no explicit gate_temperature was provided; defaulting to 1.0. "
+            "Inference/backtest/trader behavior may drift from training.",
+            checkpoint,
+        )
+    return resolved
+
 
 def build_model(
     device: torch.device,
     checkpoint: str,
-    hidden_dim: int,
-    num_heads: int,
-    dropout: float,
-    use_seq_context: bool,
-    enable_dynamic_threshold: bool,
-    enable_free_branch: bool,
+    in_dim: int | None = None,
+    hidden_dim: int | None = None,
+    num_heads: int | None = None,
+    dropout: float | None = None,
+    use_seq_context: bool | None = None,
+    enable_dynamic_threshold: bool | None = None,
+    enable_free_branch: bool | None = None,
+    init_lambda_micro: float | None = None,
+    init_lambda_mezzo: float | None = None,
+    init_lambda_macro: float | None = None,
+    gate_temperature: float | None = None,
 ) -> MultiScaleRegressor:
-    model = MultiScaleRegressor(
-        hidden_dim=int(hidden_dim),
-        num_heads=int(num_heads),
-        dropout=float(dropout),
-        use_seq_context=bool(use_seq_context),
-        enable_dynamic_threshold=bool(enable_dynamic_threshold),
-        enable_free_branch=bool(enable_free_branch),
-    ).to(device)
     ckpt = torch.load(checkpoint, map_location=device)
-    model.load_state_dict(ckpt["model_state_dict"] if isinstance(ckpt, dict) and "model_state_dict" in ckpt else ckpt)
+    checkpoint_payload, model_state_dict = _normalize_checkpoint_payload(ckpt)
+    explicit_hparams = {
+        "in_dim": in_dim,
+        "hidden_dim": hidden_dim,
+        "num_heads": num_heads,
+        "dropout": dropout,
+        "enable_dynamic_threshold": enable_dynamic_threshold,
+        "enable_free_branch": enable_free_branch,
+        "init_lambda_micro": init_lambda_micro,
+        "init_lambda_mezzo": init_lambda_mezzo,
+        "init_lambda_macro": init_lambda_macro,
+        "gate_temperature": gate_temperature,
+        "use_seq_context": use_seq_context,
+    }
+    model_hparams = _resolve_model_hparams(
+        checkpoint=checkpoint,
+        checkpoint_payload=checkpoint_payload,
+        explicit_hparams=explicit_hparams,
+    )
+
+    model = MultiScaleRegressor(
+        in_dim=int(model_hparams["in_dim"]) if "in_dim" in model_hparams else 6,
+        hidden_dim=int(model_hparams["hidden_dim"]) if "hidden_dim" in model_hparams else 64,
+        num_heads=int(model_hparams["num_heads"]) if "num_heads" in model_hparams else 4,
+        dropout=float(model_hparams["dropout"]) if "dropout" in model_hparams else 0.0,
+        enable_dynamic_threshold=(
+            bool(model_hparams["enable_dynamic_threshold"]) if "enable_dynamic_threshold" in model_hparams else True
+        ),
+        enable_free_branch=bool(model_hparams["enable_free_branch"]) if "enable_free_branch" in model_hparams else True,
+        init_lambda_micro=float(model_hparams["init_lambda_micro"]) if "init_lambda_micro" in model_hparams else 1.5,
+        init_lambda_mezzo=float(model_hparams["init_lambda_mezzo"]) if "init_lambda_mezzo" in model_hparams else 0.8,
+        init_lambda_macro=float(model_hparams["init_lambda_macro"]) if "init_lambda_macro" in model_hparams else 0.3,
+        gate_temperature=float(model_hparams["gate_temperature"]),
+        use_seq_context=bool(model_hparams["use_seq_context"]) if "use_seq_context" in model_hparams else True,
+    ).to(device)
+    model.load_state_dict(model_state_dict)
     model.eval()
     return model
 
