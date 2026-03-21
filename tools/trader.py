@@ -22,6 +22,7 @@ from src.data import DailyUpdateConfig, update_daily_market_data
 from src.infer import (
     build_model,
     infer_from_feature_shard,
+    infer_from_feature_shards,
     load_daily_map,
     load_latest_position_state,
     merge_score_shards,
@@ -305,6 +306,7 @@ def _build_processed_dataset_from_update_daily(data_dir: Path, processed_dir: Pa
     count = 0
     acount = len(sorted(min5_dir.iterdir()))
     for code_dir in sorted(min5_dir.iterdir()):
+        count += 1
         _vlog(verbose, f"{code_dir}: {count}/{acount}")
         if not code_dir.is_dir():
             continue
@@ -397,9 +399,16 @@ def _run_trade(args: argparse.Namespace) -> None:
     calendar_dates = read_calendar_dates(processed_dir)
     if len(calendar_dates) < 2:
         raise ValueError("trade requires at least 2 processed trading dates")
-    asof_date = calendar_dates[-2]
-    trade_date = calendar_dates[-1]
-    print(asof_date, trade_date)
+    token = str(os.environ.get("TUSHARE_TOKEN", "")).strip()
+    pro = ts.pro_api(token) if token else None
+    asof_date = calendar_dates[-1]
+    trade_date = pd.to_datetime(
+            pro.trade_cal(exchange="", start_date=asof_date.replace("-", ""), is_open=1)
+            .sort_values("cal_date")
+            .query("cal_date > @asof_date.replace('-', '')")
+            .iloc[0]["cal_date"]
+        ).strftime("%Y-%m-%d")
+    _vlog(verbose=args.verbose, message=f"{asof_date}, {trade_date}")
     codes = resolve_codes(processed_dir)
     if not codes:
         raise ValueError("no stock folders with required parquet files found after preprocessing")
@@ -429,13 +438,42 @@ def _run_trade(args: argparse.Namespace) -> None:
         infer_batch_size=max(1, int(args.infer_batch_size)),
         score_dir=str(score_dir),
     )
-    _vlog(bool(args.verbose), f"running CPU inference: shards={len(feature_paths)} workers={infer_workers}")
+
+    def _chunk_list(items: list[Path], n_chunks: int) -> list[list[Path]]:
+        if not items:
+            return []
+        n_chunks = max(1, min(n_chunks, len(items)))
+        buckets: list[list[Path]] = [[] for _ in range(n_chunks)]
+        for i, item in enumerate(items):
+            buckets[i % n_chunks].append(item)
+        return [b for b in buckets if b]
+
+    grouped_feature_paths = _chunk_list(feature_paths, infer_workers)
+    _vlog(
+        bool(args.verbose),
+        f"running grouped inference: shards={len(feature_paths)} groups={len(grouped_feature_paths)} workers={infer_workers} batch={args.infer_batch_size}",
+    )
+
     if infer_workers <= 1:
-        for shard_path in feature_paths:
-            _infer_feature_shard_worker(str(shard_path), **worker_args, device_str=device_str)
+        for worker_id, group in enumerate(grouped_feature_paths):
+            _infer_feature_shards_worker(
+                [str(p) for p in group],
+                **worker_args,
+                device_str=device_str,
+                worker_id=worker_id,
+            )
     else:
         with ProcessPoolExecutor(max_workers=infer_workers) as ex:
-            futures = [ex.submit(_infer_feature_shard_worker, str(shard_path), **worker_args) for shard_path in feature_paths]
+            futures = [
+                ex.submit(
+                    _infer_feature_shards_worker,
+                    [str(p) for p in group],
+                    **worker_args,
+                    device_str=device_str,
+                    worker_id=worker_id,
+                )
+                for worker_id, group in enumerate(grouped_feature_paths)
+            ]
             for fut in as_completed(futures):
                 fut.result()
 
@@ -450,8 +488,6 @@ def _run_trade(args: argparse.Namespace) -> None:
         latest_position_date, initial_cash, initial_positions = None, float(args.init), {}
 
     _vlog(bool(args.verbose), "loading initial state")
-    token = str(os.environ.get("TUSHARE_TOKEN", "")).strip()
-    pro = ts.pro_api(token) if token else None
     _vlog(bool(args.verbose), f"executing trade step: asof={asof_date} trade_date={trade_date} topk={int(args.topk)}")
     payloads = run_trade_simulation(
         data_dir=processed_dir,
@@ -476,8 +512,45 @@ def _run_trade(args: argparse.Namespace) -> None:
         "position_record": str((position_dir / f"{trade_date.replace('-', '')}.json").resolve()),
     }
     (work_dir / "meta.json").write_text(json.dumps(meta, ensure_ascii=False, indent=2), encoding="utf-8")
-    print(json.dumps({"trade": payloads[-1], "meta": meta}, ensure_ascii=False, indent=2))
+    # print(json.dumps({"trade": payloads[-1], "meta": meta}, ensure_ascii=False, indent=2))
 
+
+def _infer_feature_shards_worker(
+    shard_paths: list[str],
+    checkpoint: str,
+    hidden_dim: int,
+    num_heads: int,
+    dropout: float,
+    use_seq_context: bool,
+    enable_dynamic_threshold: bool,
+    enable_free_branch: bool,
+    infer_batch_size: int,
+    score_dir: str,
+    device_str: str,
+    worker_id: int,
+) -> str:
+    device = torch.device(device_str)
+    model = build_model(
+        device=device,
+        checkpoint=checkpoint,
+        hidden_dim=hidden_dim,
+        num_heads=num_heads,
+        dropout=dropout,
+        use_seq_context=use_seq_context,
+        enable_dynamic_threshold=enable_dynamic_threshold,
+        enable_free_branch=enable_free_branch,
+    )
+    model.eval()
+
+    df = infer_from_feature_shards(
+        model=model,
+        device=device,
+        shard_paths=[Path(p) for p in shard_paths],
+        infer_batch_size=max(1, int(infer_batch_size)),
+    )
+    out_path = Path(score_dir) / f"group_{worker_id:04d}.parquet"
+    df.to_parquet(out_path, index=False)
+    return str(out_path)
 
 
 def main() -> None:

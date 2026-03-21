@@ -22,10 +22,10 @@ ADJ_FACTOR_FIELDS = "ts_code,trade_date,adj_factor"
 MONEYFLOW_FIELDS = "ts_code,trade_date,buy_sm_vol,buy_sm_amount,sell_sm_vol,sell_sm_amount,buy_md_vol,buy_md_amount,sell_md_vol,sell_md_amount,buy_lg_vol,buy_lg_amount,sell_lg_vol,sell_lg_amount,buy_elg_vol,buy_elg_amount,sell_elg_vol,sell_elg_amount,net_mf_vol,net_mf_amount"
 SUSPEND_FIELDS = "ts_code,trade_date,suspend_timing,suspend_type"
 NAMECHANGE_FIELDS = "ts_code,name,start_date,end_date"
-MAIRUI_TIMEOUT = 30
+MAIRUI_TIMEOUT = 5
 DEFAULT_LOOKBACK_TRADING_DAYS = 150
-REAL_OPEN_LOOKBACK_DAYS = 9
-DEFAULT_5MIN_PROCESS_WORKERS = 2
+REAL_OPEN_LOOKBACK_DAYS = 20
+DEFAULT_5MIN_PROCESS_WORKERS = 4
 
 
 @dataclass(frozen=True)
@@ -157,12 +157,12 @@ class MairuiClient:
         return [dict(row) for row in data if isinstance(row, dict)]
 
 
-def _now_utc_date() -> pd.Timestamp:
-    return pd.Timestamp(datetime.now(timezone.utc).date())
+def _now_utcp8_date() -> pd.Timestamp:
+    return pd.Timestamp(datetime.now(zoneinfo.ZoneInfo("Asia/Shanghai")).date())
 
 
-def _now_utc_time() -> pd.Timestamp:
-    return pd.Timestamp(datetime.now(timezone.utc))
+def _now_utcp8_time() -> pd.Timestamp:
+    return pd.Timestamp(datetime.now(zoneinfo.ZoneInfo("Asia/Shanghai")))
 
 
 def _log(config: DailyUpdateConfig, message: str) -> None:
@@ -185,13 +185,14 @@ def _normalize_date_str(series: pd.Series) -> pd.Series:
 
 def _load_trade_window(pro: TushareClient, lookback_trading_days: int) -> tuple[pd.DataFrame, list[str], str]:
     today = datetime.today()
-    if _now_utc_time() < pd.Timestamp(year=today.year, month=today.month, day=today.day, hour=17, minute=0, second=0,
+    if _now_utcp8_time() < pd.Timestamp(year=today.year, month=today.month, day=today.day, hour=17, minute=0, second=0,
                                       microsecond=0, tz=zoneinfo.ZoneInfo("Asia/Shanghai")):
-        end_date = (_now_utc_date() - pd.Timedelta(days=1)).strftime("%Y%m%d")
+        end_date = (_now_utcp8_date() - pd.Timedelta(days=1)).strftime("%Y%m%d")
     else:
-        end_date = _now_utc_date().strftime("%Y%m%d")
-    start_date = (_now_utc_date() - pd.Timedelta(days=max(240, lookback_trading_days * 3))).strftime("%Y%m%d")
+        end_date = _now_utcp8_date().strftime("%Y%m%d")
+    start_date = (_now_utcp8_date() - pd.Timedelta(days=max(240, lookback_trading_days * 3))).strftime("%Y%m%d")
     calendar = pro.trade_calendar(start_date=start_date, end_date=end_date)
+    print(calendar)
     if calendar is None or calendar.empty:
         raise RuntimeError("trade_cal returned no rows")
     cal = calendar.copy()
