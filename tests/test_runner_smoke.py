@@ -6,11 +6,15 @@ import pytest
 import torch
 
 from src.model.head import masked_huber_loss
+from src.infer.runner import build_model
 from src.train.runner import (
     MultiScaleRegressor,
     NpyShardDataset,
     ShardBatchIterator,
     TrainConfig,
+    _build_checkpoint_payload,
+    _normalize_state_dict_keys,
+    _unwrap_model,
     collate_batch,
     run_training,
     _resolve_force_flow_gate_value,
@@ -655,3 +659,122 @@ def test_resolve_force_flow_gate_value_respects_always_zero_switch() -> None:
     assert _resolve_force_flow_gate_value(cfg_warmup_only, global_step=0) == 0.0
     assert _resolve_force_flow_gate_value(cfg_warmup_only, global_step=1999) == 0.0
     assert _resolve_force_flow_gate_value(cfg_warmup_only, global_step=2000) is None
+
+
+def _prefix_orig_mod_state_dict(state_dict: dict[str, torch.Tensor]) -> dict[str, torch.Tensor]:
+    return {f"_orig_mod.{key}": value.clone() for key, value in state_dict.items()}
+
+
+def test_checkpoint_payload_unwraps_orig_mod_prefix() -> None:
+    model = MultiScaleRegressor(hidden_dim=8, num_heads=2)
+
+    class _CompiledWrapper(torch.nn.Module):
+        def __init__(self, inner: torch.nn.Module) -> None:
+            super().__init__()
+            self._orig_mod = inner
+
+        def forward(self, *args, **kwargs):
+            return self._orig_mod(*args, **kwargs)
+
+        def state_dict(self, *args, **kwargs):
+            inner_state = self._orig_mod.state_dict(*args, **kwargs)
+            return {f"_orig_mod.{k}": v for k, v in inner_state.items()}
+
+    wrapped = _CompiledWrapper(model)
+    optimizer = torch.optim.AdamW(model.parameters(), lr=1e-3)
+    scaler = torch.cuda.amp.GradScaler(enabled=False)
+
+    payload = _build_checkpoint_payload(
+        epoch=0,
+        global_step=0,
+        model=wrapped,
+        optimizer=optimizer,
+        scaler=scaler,
+        history={"train": [], "val": []},
+        best_val={"loss": 0.0, "huber": 0.0, "mae": 0.0, "mse": 0.0},
+        scheduler=None,
+    )
+
+    assert _unwrap_model(wrapped) is model
+    assert all(not key.startswith("_orig_mod.") for key in payload["model_state_dict"])
+
+
+def test_normalize_state_dict_keys_removes_orig_mod_prefix() -> None:
+    model = MultiScaleRegressor(hidden_dim=8, num_heads=2)
+    prefixed_state = _prefix_orig_mod_state_dict(model.state_dict())
+
+    normalized = _normalize_state_dict_keys(prefixed_state)
+
+    assert set(normalized) == set(model.state_dict())
+    assert all(not key.startswith("_orig_mod.") for key in normalized)
+
+
+def test_build_model_loads_historical_orig_mod_checkpoint(tmp_path: Path) -> None:
+    model = MultiScaleRegressor(hidden_dim=8, num_heads=2)
+    ckpt_path = tmp_path / "prefixed.ckpt"
+    torch.save({"model_state_dict": _prefix_orig_mod_state_dict(model.state_dict())}, ckpt_path)
+
+    loaded = build_model(
+        device=torch.device("cpu"),
+        checkpoint=str(ckpt_path),
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        use_seq_context=True,
+        enable_dynamic_threshold=True,
+        enable_free_branch=True,
+    )
+
+    for key, value in model.state_dict().items():
+        assert torch.equal(value, loaded.state_dict()[key])
+
+
+def test_resume_from_historical_orig_mod_checkpoint(tmp_path: Path) -> None:
+    train_path = _write_shard(tmp_path / "resume_hist_train.npy", n=6)
+    val_path = _write_shard(tmp_path / "resume_hist_val.npy", n=4)
+
+    out_dir = tmp_path / "out_resume_hist"
+    first_cfg = TrainConfig(
+        train_shards=[train_path],
+        val_shards=[val_path],
+        batch_size=2,
+        grad_accum_steps=1,
+        num_epochs=1,
+        lr=1e-3,
+        weight_decay=1e-4,
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        exp_name="resume_hist_run",
+        out_dir=str(out_dir),
+    )
+    run_training(first_cfg)
+
+    latest_path = out_dir / "checkpoints" / first_cfg.exp_name / "latest.ckpt"
+    ckpt = torch.load(latest_path, map_location="cpu")
+    ckpt["model_state_dict"] = _prefix_orig_mod_state_dict(ckpt["model_state_dict"])
+    hist_path = out_dir / "checkpoints" / first_cfg.exp_name / "historical_prefixed.ckpt"
+    torch.save(ckpt, hist_path)
+
+    second_cfg = TrainConfig(
+        train_shards=[train_path],
+        val_shards=[val_path],
+        batch_size=2,
+        grad_accum_steps=1,
+        num_epochs=1,
+        lr=1e-3,
+        weight_decay=1e-4,
+        hidden_dim=8,
+        num_heads=2,
+        dropout=0.0,
+        exp_name="resume_hist_run",
+        out_dir=str(out_dir),
+        checkpoint=str(hist_path),
+        enable_compile=True,
+    )
+    result = run_training(second_cfg)
+
+    assert result["feedback"]["meta"]["status"] == "ok"
+    resumed_latest = torch.load(latest_path, map_location="cpu")
+    assert all(not key.startswith("_orig_mod.") for key in resumed_latest["model_state_dict"])
+    assert int(resumed_latest["epoch"]) == 1

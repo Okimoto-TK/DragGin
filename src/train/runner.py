@@ -568,6 +568,17 @@ class TrainConfig:
     save_every: int = 1
 
 
+def _unwrap_model(model: nn.Module) -> nn.Module:
+    return model._orig_mod if hasattr(model, "_orig_mod") else model
+
+
+def _normalize_state_dict_keys(state_dict: dict[str, Any]) -> dict[str, Any]:
+    normalized: dict[str, Any] = {}
+    for key, value in state_dict.items():
+        normalized[key[10:] if key.startswith("_orig_mod.") else key] = value
+    return normalized
+
+
 def _build_checkpoint_payload(
     *,
     epoch: int,
@@ -582,7 +593,7 @@ def _build_checkpoint_payload(
     return {
         "epoch": int(epoch),
         "global_step": int(global_step),
-        "model_state_dict": model.state_dict(),
+        "model_state_dict": _unwrap_model(model).state_dict(),
         "optimizer_state_dict": optimizer.state_dict(),
         "scaler_state_dict": scaler.state_dict(),
         "history": history,
@@ -909,7 +920,7 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
             int(val_sample_count),
         )
 
-    model = MultiScaleRegressor(
+    base_model = MultiScaleRegressor(
         in_dim=config.in_dim,
         hidden_dim=config.hidden_dim,
         num_heads=config.num_heads,
@@ -922,9 +933,9 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
         gate_temperature=config.gate_temperature,
         use_seq_context=config.use_seq_context,
     )
-    gate_last_layer = model.fusion.gated.gate_mlp[-1]
+    gate_last_layer = base_model.fusion.gated.gate_mlp[-1]
 
-    gate_reg_enabled = bool(model.fusion.gated.enable_free_branch)
+    gate_reg_enabled = bool(base_model.fusion.gated.enable_free_branch)
 
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     if device.type == "cuda":
@@ -932,9 +943,20 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
         torch.backends.cuda.matmul.allow_tf32 = True
         torch.backends.cudnn.allow_tf32 = True
         torch.set_float32_matmul_precision("high")
-    model.to(device)
+    base_model.to(device)
+
+    checkpoint: dict[str, Any] | None = None
+    if config.checkpoint is not None:
+        checkpoint_path = Path(config.checkpoint)
+        checkpoint = torch.load(checkpoint_path, map_location=device)
+        model_state = checkpoint["model_state_dict"]
+        if not isinstance(model_state, dict):
+            raise TypeError("checkpoint model_state_dict must be a dict")
+        base_model.load_state_dict(_normalize_state_dict_keys(model_state))
+
+    model = base_model
     if device.type == "cuda" and config.enable_compile and hasattr(torch, "compile"):
-        model = torch.compile(model, mode=config.compile_mode)
+        model = torch.compile(base_model, mode=config.compile_mode)
 
     gate_lr = _resolve_gate_lr(config)
     gate_last_lr = float(config.lr) * 0.5
@@ -983,10 +1005,7 @@ def run_training(config: TrainConfig, raise_on_error: bool = True) -> dict[str, 
     latest_ckpt_path = checkpoints_dir / "latest.ckpt"
     best_ckpt_path = checkpoints_dir / "best.ckpt"
 
-    if config.checkpoint is not None:
-        checkpoint_path = Path(config.checkpoint)
-        checkpoint = torch.load(checkpoint_path, map_location=device)
-        model.load_state_dict(checkpoint["model_state_dict"])
+    if checkpoint is not None:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
         scheduler_state = checkpoint.get("scheduler_state_dict")
         if scheduler is not None and isinstance(scheduler_state, dict):
